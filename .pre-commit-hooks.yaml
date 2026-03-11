@@ -1,0 +1,19 @@
+# Pre-commit hooks for zero-downtime-migrations
+# See https://pre-commit.com for more information
+
+- id: zdm
+  name: Zero-Downtime Migrations Linter
+  description: Check Django migrations for PostgreSQL safety issues
+  entry: zdm
+  language: system
+  types: [python]
+  files: .*/migrations/.*\.py$
+  exclude: __init__\.py$
+
+- id: zdm-diff
+  name: Zero-Downtime Migrations Linter (diff mode)
+  description: Check changed Django migrations for PostgreSQL safety issues
+  entry: zdm --diff origin/main
+  language: system
+  pass_filenames: false
+  always_run: true
