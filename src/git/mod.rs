@@ -553,7 +553,7 @@ mod tests {
             .unwrap();
 
         let changes = repo.uncommitted_changes().unwrap();
-        assert!(changes.len() >= 1);
+        assert!(!changes.is_empty());
         // Should see the modified file and/or the new staged file
     }
 

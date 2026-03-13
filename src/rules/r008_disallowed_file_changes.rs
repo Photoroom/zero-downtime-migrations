@@ -91,7 +91,6 @@ mod tests {
     use crate::ast::extractor::MigrationExtractor;
     use crate::config::Config;
     use crate::parser::ParsedMigration;
-    use std::path::PathBuf;
 
     const SIMPLE_MIGRATION: &str = r#"
 from django.db import migrations
@@ -164,8 +163,10 @@ class Migration(migrations.Migration):
         let migration = create_migration();
         let migrations = vec![&migration];
         let other_files = vec![Path::new("app/models.py"), Path::new("config.json")];
-        let mut config = Config::default();
-        config.disallowed_file_patterns = vec!["*.json".to_string()];
+        let config = Config {
+            disallowed_file_patterns: vec!["*.json".to_string()],
+            ..Default::default()
+        };
         let ctx = RuleContext {
             config: &config,
             path: Path::new("."),

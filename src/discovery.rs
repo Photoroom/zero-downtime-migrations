@@ -179,7 +179,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = create_test_structure(&temp);
 
-        let migrations = discover_migrations(&[root.clone()]).unwrap();
+        let migrations = discover_migrations(std::slice::from_ref(&root)).unwrap();
 
         // Should find 4 migrations (excluding __init__.py files)
         assert_eq!(migrations.len(), 4);
@@ -200,7 +200,7 @@ mod tests {
         let root = create_test_structure(&temp);
 
         let file_path = root.join("app1/migrations/0001_initial.py");
-        let migrations = discover_migrations(&[file_path.clone()]).unwrap();
+        let migrations = discover_migrations(std::slice::from_ref(&file_path)).unwrap();
 
         assert_eq!(migrations.len(), 1);
         assert_eq!(migrations[0], file_path);
@@ -258,7 +258,8 @@ mod tests {
 
         // Exclude app1 migrations
         let exclude = vec!["**/app1/**".to_string()];
-        let migrations = discover_migrations_with_exclude(&[root.clone()], &exclude).unwrap();
+        let migrations =
+            discover_migrations_with_exclude(std::slice::from_ref(&root), &exclude).unwrap();
 
         // Should only have migrations from app2 and nested (2 total)
         assert_eq!(migrations.len(), 2);
@@ -276,7 +277,8 @@ mod tests {
 
         // Exclude only 0001_initial.py files
         let exclude = vec!["**/0001_initial.py".to_string()];
-        let migrations = discover_migrations_with_exclude(&[root.clone()], &exclude).unwrap();
+        let migrations =
+            discover_migrations_with_exclude(std::slice::from_ref(&root), &exclude).unwrap();
 
         // Should only have 0002_add_field.py from app1
         assert_eq!(migrations.len(), 1);

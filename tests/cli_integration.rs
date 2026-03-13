@@ -3,6 +3,7 @@
 //! Tests the actual CLI binary with various flag combinations,
 //! verifying exit codes and output formats.
 
+use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
@@ -10,7 +11,7 @@ use tempfile::TempDir;
 
 /// Helper to create a command for the `zdm` binary
 fn zdm() -> Command {
-    Command::cargo_bin("zdm").unwrap()
+    cargo_bin_cmd!("zdm")
 }
 
 /// Helper to create a temp directory with migration files
