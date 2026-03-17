@@ -78,6 +78,59 @@ jobs:
           name: sdist
           path: dist/*.tar.gz
 
+  build-binaries:
+    name: Build binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Rename binary (unix)
+        if: runner.os != 'Windows'
+        run: mv target/${{ matrix.target }}/release/zdm zdm-${{ matrix.target }}
+
+      - name: Rename binary (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: mv target/${{ matrix.target }}/release/zdm.exe zdm-${{ matrix.target }}.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: zdm-${{ matrix.target }}*
+
   publish:
     name: Publish to PyPI
     needs: [build-wheels, build-sdist]
@@ -86,10 +139,18 @@ jobs:
     permissions:
       id-token: write  # For trusted publishing
     steps:
-      - name: Download all artifacts
+      - name: Download wheels
         uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: wheel-*
+          merge-multiple: true
+
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: sdist
           merge-multiple: true
 
       - name: List artifacts
@@ -102,7 +163,7 @@ jobs:
 
   github-release:
     name: Create GitHub Release
-    needs: [build-wheels, build-sdist]
+    needs: [build-wheels, build-sdist, build-binaries]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -117,9 +178,11 @@ jobs:
       - name: Prepare release assets
         run: |
           mkdir -p release
-          # Move wheels
+          # Move wheels and sdist
           find artifacts -name "*.whl" -exec mv {} release/ \;
           find artifacts -name "*.tar.gz" -exec mv {} release/ \;
+          # Move standalone binaries
+          find artifacts -name "zdm-*" -exec mv {} release/ \;
           ls -la release/
 
       - name: Create Release
