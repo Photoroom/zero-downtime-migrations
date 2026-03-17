@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "zero-downtime-migrations"
-version = "0.1.0"
+version = "0.1.1"
 description = "A PostgreSQL migration safety linter for Django"
 readme = "README.md"
 license = { text = "MIT" }
