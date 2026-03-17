@@ -19,11 +19,11 @@ jobs:
           # Linux x86_64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            manylinux: auto
+            manylinux: 2_28
           # Linux ARM64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            manylinux: auto
+            manylinux: 2_28
           # macOS ARM64 (Apple Silicon)
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -48,7 +48,6 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist
           manylinux: ${{ matrix.manylinux || '' }}
-          before-script-linux: yum install -y perl-IPC-Cmd
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
