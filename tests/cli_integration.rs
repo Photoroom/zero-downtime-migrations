@@ -59,15 +59,15 @@ class Migration(migrations.Migration):
 "#;
 
     const WARNING_ONLY_MIGRATION: &str = r#"
-from django.db import migrations, models
+from django.db import migrations
+
+def forwards(apps, schema_editor):
+    pass
 
 class Migration(migrations.Migration):
     dependencies = []
     operations = [
-        migrations.AddConstraint(
-            model_name='product',
-            constraint=models.CheckConstraint(check=models.Q(price__gte=0), name='positive_price'),
-        ),
+        migrations.RunPython(forwards),
     ]
 "#;
 

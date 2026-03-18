@@ -1,7 +1,7 @@
 //! R008: Disallowed file changes alongside migrations
 //!
-//! Detects when migrations are changed alongside other files that match
-//! disallowed patterns. This is often a sign that database changes and
+//! Detects when migrations are changed alongside other files that don't match
+//! any allowed patterns. This is often a sign that database changes and
 //! application code changes are too tightly coupled.
 
 use std::path::Path;
@@ -25,12 +25,12 @@ impl ChangesetRule for R008DisallowedFileChanges {
     }
 
     fn description(&self) -> &'static str {
-        "Migrations should not be changed alongside certain file types (e.g., .py files). \
-         This ensures database changes are deployed separately from application code."
+        "Migrations should not be changed alongside certain file types. \
+         Use allowed-file-patterns to specify which files may change alongside migrations."
     }
 
     fn severity(&self) -> Severity {
-        Severity::Warning
+        Severity::Error
     }
 
     fn check(
@@ -46,9 +46,14 @@ impl ChangesetRule for R008DisallowedFileChanges {
             return diagnostics;
         }
 
+        // If no allowed patterns configured, skip this rule
+        if ctx.config.allowed_file_patterns.is_empty() {
+            return diagnostics;
+        }
+
         let patterns: Vec<Pattern> = ctx
             .config
-            .disallowed_file_patterns
+            .allowed_file_patterns
             .iter()
             .filter_map(|p| Pattern::new(p).ok())
             .collect();
@@ -56,28 +61,25 @@ impl ChangesetRule for R008DisallowedFileChanges {
         for file in other_changed_files {
             let file_name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-            for pattern in &patterns {
-                if pattern.matches(file_name) {
-                    diagnostics.push(Diagnostic {
-                        rule_id: self.id(),
-                        rule_name: self.name(),
-                        message: format!(
-                            "File '{}' matches disallowed pattern '{}' and changed alongside migrations",
-                            file.display(),
-                            pattern
-                        ),
-                        severity: self.severity(),
-                        path: file.to_path_buf(),
-                        span: Span::default(),
-                        help: Some(
-                            "Database migrations and application code should be deployed separately. \
-                             Split this PR into separate changes."
-                                .to_string(),
-                        ),
-                        fix: None,
-                    });
-                    break; // Only report once per file
-                }
+            let is_allowed = patterns.iter().any(|p| p.matches(file_name));
+            if !is_allowed {
+                diagnostics.push(Diagnostic {
+                    rule_id: self.id(),
+                    rule_name: self.name(),
+                    message: format!(
+                        "File '{}' does not match any allowed pattern and changed alongside migrations",
+                        file.display(),
+                    ),
+                    severity: self.severity(),
+                    path: file.to_path_buf(),
+                    span: Span::default(),
+                    help: Some(
+                        "Database migrations and application code should be deployed separately. \
+                         Split this PR into separate changes or add the pattern to allowed-file-patterns."
+                            .to_string(),
+                    ),
+                    fix: None,
+                });
             }
         }
 
@@ -109,7 +111,7 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn test_py_file_alongside_migration_warns() {
+    fn test_no_allowed_patterns_skips_rule() {
         let migration = create_migration();
         let migrations = vec![&migration];
         let other_files = vec![Path::new("app/models.py"), Path::new("app/views.py")];
@@ -121,9 +123,48 @@ class Migration(migrations.Migration):
 
         let diagnostics = R008DisallowedFileChanges.check(&migrations, &other_files, &ctx);
 
-        // Default pattern is *.py, so should warn
-        assert_eq!(diagnostics.len(), 2);
-        assert_eq!(diagnostics[0].rule_id, "R008");
+        // No allowed patterns configured, rule is skipped
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_file_not_matching_allowed_pattern_warns() {
+        let migration = create_migration();
+        let migrations = vec![&migration];
+        let other_files = vec![Path::new("app/models.py"), Path::new("config.json")];
+        let config = Config {
+            allowed_file_patterns: vec!["*.json".to_string()],
+            ..Default::default()
+        };
+        let ctx = RuleContext {
+            config: &config,
+            path: Path::new("."),
+        };
+
+        let diagnostics = R008DisallowedFileChanges.check(&migrations, &other_files, &ctx);
+
+        // *.py is not allowed, *.json is
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("models.py"));
+    }
+
+    #[test]
+    fn test_all_files_matching_allowed_pattern_ok() {
+        let migration = create_migration();
+        let migrations = vec![&migration];
+        let other_files = vec![Path::new("config.json"), Path::new("data.json")];
+        let config = Config {
+            allowed_file_patterns: vec!["*.json".to_string()],
+            ..Default::default()
+        };
+        let ctx = RuleContext {
+            config: &config,
+            path: Path::new("."),
+        };
+
+        let diagnostics = R008DisallowedFileChanges.check(&migrations, &other_files, &ctx);
+
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
@@ -131,7 +172,10 @@ class Migration(migrations.Migration):
         let migration = create_migration();
         let migrations = vec![&migration];
         let other_files: Vec<&Path> = vec![];
-        let config = Config::default();
+        let config = Config {
+            allowed_file_patterns: vec!["*.json".to_string()],
+            ..Default::default()
+        };
         let ctx = RuleContext {
             config: &config,
             path: Path::new("."),
@@ -146,7 +190,10 @@ class Migration(migrations.Migration):
     fn test_no_migrations_good() {
         let migrations: Vec<&Migration> = vec![];
         let other_files = vec![Path::new("app/models.py")];
-        let config = Config::default();
+        let config = Config {
+            allowed_file_patterns: vec!["*.json".to_string()],
+            ..Default::default()
+        };
         let ctx = RuleContext {
             config: &config,
             path: Path::new("."),
@@ -159,12 +206,16 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn test_custom_patterns() {
+    fn test_multiple_allowed_patterns() {
         let migration = create_migration();
         let migrations = vec![&migration];
-        let other_files = vec![Path::new("app/models.py"), Path::new("config.json")];
+        let other_files = vec![
+            Path::new("config.json"),
+            Path::new("data.yaml"),
+            Path::new("app/models.py"),
+        ];
         let config = Config {
-            disallowed_file_patterns: vec!["*.json".to_string()],
+            allowed_file_patterns: vec!["*.json".to_string(), "*.yaml".to_string()],
             ..Default::default()
         };
         let ctx = RuleContext {
@@ -174,8 +225,8 @@ class Migration(migrations.Migration):
 
         let diagnostics = R008DisallowedFileChanges.check(&migrations, &other_files, &ctx);
 
-        // Only *.json is disallowed now
+        // Only *.py should trigger
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.contains("config.json"));
+        assert!(diagnostics[0].message.contains("models.py"));
     }
 }

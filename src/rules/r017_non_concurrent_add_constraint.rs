@@ -25,7 +25,7 @@ impl Rule for R017NonConcurrentAddConstraint {
     }
 
     fn severity(&self) -> Severity {
-        Severity::Warning
+        Severity::Error
     }
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {

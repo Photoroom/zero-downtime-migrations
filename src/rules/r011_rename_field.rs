@@ -25,7 +25,7 @@ impl Rule for R011RenameField {
     }
 
     fn severity(&self) -> Severity {
-        Severity::Warning
+        Severity::Error
     }
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
@@ -92,6 +92,6 @@ class Migration(migrations.Migration):
         let diagnostics = check_migration(RENAME_FIELD_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R011");
-        assert_eq!(diagnostics[0].severity, Severity::Warning);
+        assert_eq!(diagnostics[0].severity, Severity::Error);
     }
 }

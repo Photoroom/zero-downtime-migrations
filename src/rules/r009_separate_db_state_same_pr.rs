@@ -28,7 +28,7 @@ impl ChangesetRule for R009SeparateDbStateSamePr {
     }
 
     fn severity(&self) -> Severity {
-        Severity::Warning
+        Severity::Error
     }
 
     fn check(

@@ -117,7 +117,7 @@ Configure via `pyproject.toml` or `zero-downtime-migrations.toml`:
 select = ["R001", "R002"]
 ignore = ["R008"]
 warnings-as-errors = false
-disallowed-file-patterns = ["*.py"]
+allowed-file-patterns = ["*.txt", "*.md"]
 exclude = ["**/test_migrations/**"]
 ```
 

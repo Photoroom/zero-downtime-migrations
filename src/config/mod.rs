@@ -19,7 +19,7 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 
 /// Configuration for zdm.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     /// Rules to select (if empty, all rules are selected).
     pub select: HashSet<String>,
@@ -29,23 +29,9 @@ pub struct Config {
     pub warnings_as_errors: bool,
     /// File patterns to exclude from linting.
     pub exclude: Vec<String>,
-    /// For R008: file patterns that are disallowed to change alongside migrations.
-    pub disallowed_file_patterns: Vec<String>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            select: HashSet::new(),
-            ignore: HashSet::new(),
-            warnings_as_errors: false,
-            exclude: vec![],
-            disallowed_file_patterns: vec![
-                // Default patterns for R008
-                "*.py".to_string(),
-            ],
-        }
-    }
+    /// For R008: file patterns allowed to change alongside migrations.
+    /// Files NOT matching these patterns will trigger a warning.
+    pub allowed_file_patterns: Vec<String>,
 }
 
 impl Config {
@@ -115,8 +101,8 @@ impl Config {
         if let Some(exclude) = other.exclude {
             self.exclude = exclude;
         }
-        if let Some(patterns) = other.disallowed_file_patterns {
-            self.disallowed_file_patterns = patterns;
+        if let Some(patterns) = other.allowed_file_patterns {
+            self.allowed_file_patterns = patterns;
         }
     }
 
@@ -163,8 +149,8 @@ pub struct FileConfig {
     pub warnings_as_errors: Option<bool>,
     /// File patterns to exclude.
     pub exclude: Option<Vec<String>>,
-    /// For R008: disallowed file patterns.
-    pub disallowed_file_patterns: Option<Vec<String>>,
+    /// For R008: allowed file patterns.
+    pub allowed_file_patterns: Option<Vec<String>>,
 }
 
 #[cfg(test)]
