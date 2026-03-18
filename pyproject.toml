@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "zero-downtime-migrations"
+name = "django-zdm"
 version = "0.1.2"
 description = "A PostgreSQL migration safety linter for Django"
 readme = "README.md"

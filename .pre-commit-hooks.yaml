@@ -5,7 +5,7 @@
   name: Zero-Downtime Migrations Linter
   description: Check Django migrations for PostgreSQL safety issues
   entry: zdm
-  language: system
+  language: python
   types: [python]
   files: .*/migrations/.*\.py$
   exclude: __init__\.py$
@@ -14,7 +14,7 @@
   name: Zero-Downtime Migrations Linter (diff mode)
   description: Check changed Django migrations for PostgreSQL safety issues
   entry: zdm --diff origin/main
-  language: system
+  language: python
   pass_filenames: false
   always_run: true
 
