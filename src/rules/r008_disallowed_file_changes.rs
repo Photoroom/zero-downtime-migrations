@@ -56,8 +56,7 @@ impl ChangesetRule for R008DisallowedFileChanges {
         for file in other_changed_files {
             let file_name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-            let is_allowed =
-                !patterns.is_empty() && patterns.iter().any(|p| p.matches(file_name));
+            let is_allowed = !patterns.is_empty() && patterns.iter().any(|p| p.matches(file_name));
             if !is_allowed {
                 diagnostics.push(Diagnostic {
                     rule_id: self.id(),
