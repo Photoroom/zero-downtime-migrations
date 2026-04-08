@@ -46,11 +46,6 @@ impl ChangesetRule for R008DisallowedFileChanges {
             return diagnostics;
         }
 
-        // If no allowed patterns configured, skip this rule
-        if ctx.config.allowed_file_patterns.is_empty() {
-            return diagnostics;
-        }
-
         let patterns: Vec<Pattern> = ctx
             .config
             .allowed_file_patterns
@@ -61,7 +56,7 @@ impl ChangesetRule for R008DisallowedFileChanges {
         for file in other_changed_files {
             let file_name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-            let is_allowed = patterns.iter().any(|p| p.matches(file_name));
+            let is_allowed = !patterns.is_empty() && patterns.iter().any(|p| p.matches(file_name));
             if !is_allowed {
                 diagnostics.push(Diagnostic {
                     rule_id: self.id(),
@@ -111,7 +106,7 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn test_no_allowed_patterns_skips_rule() {
+    fn test_no_allowed_patterns_rejects_all() {
         let migration = create_migration();
         let migrations = vec![&migration];
         let other_files = vec![Path::new("app/models.py"), Path::new("app/views.py")];
@@ -123,8 +118,8 @@ class Migration(migrations.Migration):
 
         let diagnostics = R008DisallowedFileChanges.check(&migrations, &other_files, &ctx);
 
-        // No allowed patterns configured, rule is skipped
-        assert!(diagnostics.is_empty());
+        // No allowed patterns configured, all non-migration files are rejected
+        assert_eq!(diagnostics.len(), 2);
     }
 
     #[test]
@@ -172,10 +167,7 @@ class Migration(migrations.Migration):
         let migration = create_migration();
         let migrations = vec![&migration];
         let other_files: Vec<&Path> = vec![];
-        let config = Config {
-            allowed_file_patterns: vec!["*.json".to_string()],
-            ..Default::default()
-        };
+        let config = Config::default();
         let ctx = RuleContext {
             config: &config,
             path: Path::new("."),
