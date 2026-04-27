@@ -41,6 +41,9 @@ zdm .
 # Diff mode: lint changed migrations in a PR
 zdm --diff origin/main
 
+# Staged diff mode: lint changes being committed by pre-commit
+zdm --diff-staged origin/main
+
 # Output formats
 zdm --output-format json .
 zdm --output-format compact .
@@ -117,7 +120,7 @@ Configure via `pyproject.toml` or `zero-downtime-migrations.toml`:
 select = ["R001", "R002"]
 ignore = ["R008"]
 warnings-as-errors = false
-allowed-file-patterns = ["*.txt", "*.md"]
+allowed-file-patterns = ["*.txt", "*.md", "models.py"]
 exclude = ["**/test_migrations/**"]
 ```
 
@@ -153,6 +156,9 @@ repos:
     hooks:
       - id: zdm-diff
 ```
+
+The `zdm-diff` hook uses `--diff-staged` so it checks the staged index that
+pre-commit is validating, rather than the previous `HEAD` commit.
 
 ## GitHub Actions
 

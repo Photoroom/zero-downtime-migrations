@@ -54,9 +54,7 @@ impl ChangesetRule for R008DisallowedFileChanges {
             .collect();
 
         for file in other_changed_files {
-            let file_name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-            let is_allowed = !patterns.is_empty() && patterns.iter().any(|p| p.matches(file_name));
+            let is_allowed = !patterns.is_empty() && allowed_by_patterns(file, &patterns);
             if !is_allowed {
                 diagnostics.push(Diagnostic {
                     rule_id: self.id(),
@@ -80,6 +78,20 @@ impl ChangesetRule for R008DisallowedFileChanges {
 
         diagnostics
     }
+}
+
+/// Match a repo-relative path against the configured patterns.
+///
+/// Each pattern is tried against the full repo-relative path and against the
+/// basename, so configs like `backend/**/models.py` and bare `models.py` both
+/// work without the rule needing filesystem access.
+fn allowed_by_patterns(file: &Path, patterns: &[Pattern]) -> bool {
+    let path_str = file.to_string_lossy().replace('\\', "/");
+    let file_name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+    patterns
+        .iter()
+        .any(|pattern| pattern.matches(&path_str) || pattern.matches(file_name))
 }
 
 #[cfg(test)]
@@ -220,5 +232,62 @@ class Migration(migrations.Migration):
         // Only *.py should trigger
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("models.py"));
+    }
+
+    #[test]
+    fn test_repo_relative_allowed_pattern_matches() {
+        let migration = create_migration();
+        let migrations = vec![&migration];
+        let other_files = vec![Path::new("backend/media/models.py")];
+        let config = Config {
+            allowed_file_patterns: vec!["backend/media/models.py".to_string()],
+            ..Default::default()
+        };
+        let ctx = RuleContext {
+            config: &config,
+            path: Path::new("."),
+        };
+
+        let diagnostics = R008DisallowedFileChanges.check(&migrations, &other_files, &ctx);
+
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_repo_relative_glob_allowed_pattern_matches() {
+        let migration = create_migration();
+        let migrations = vec![&migration];
+        let other_files = vec![Path::new("backend/media/models.py")];
+        let config = Config {
+            allowed_file_patterns: vec!["backend/**/models.py".to_string()],
+            ..Default::default()
+        };
+        let ctx = RuleContext {
+            config: &config,
+            path: Path::new("."),
+        };
+
+        let diagnostics = R008DisallowedFileChanges.check(&migrations, &other_files, &ctx);
+
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_basename_allowed_pattern_still_matches() {
+        let migration = create_migration();
+        let migrations = vec![&migration];
+        let other_files = vec![Path::new("backend/media/models.py")];
+        let config = Config {
+            allowed_file_patterns: vec!["models.py".to_string()],
+            ..Default::default()
+        };
+        let ctx = RuleContext {
+            config: &config,
+            path: Path::new("."),
+        };
+
+        let diagnostics = R008DisallowedFileChanges.check(&migrations, &other_files, &ctx);
+
+        assert!(diagnostics.is_empty());
     }
 }

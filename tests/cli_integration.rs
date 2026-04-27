@@ -7,6 +7,7 @@ use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+use std::process::Command as StdCommand;
 use tempfile::TempDir;
 
 /// Helper to create a command for the `zdm` binary
@@ -30,14 +31,46 @@ fn setup_migrations(migrations: &[(&str, &str)]) -> TempDir {
     temp_dir
 }
 
-// =============================================================================
-// Exit Code Tests
-// =============================================================================
+fn git_init(path: &std::path::Path) {
+    StdCommand::new("git")
+        .arg("init")
+        .current_dir(path)
+        .output()
+        .expect("Failed to init git repo");
+    StdCommand::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(path)
+        .output()
+        .expect("Failed to set git user email");
+    StdCommand::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(path)
+        .output()
+        .expect("Failed to set git user name");
+}
 
-mod exit_codes {
-    use super::*;
+fn git_commit_all(path: &std::path::Path, message: &str) {
+    StdCommand::new("git")
+        .args(["add", "."])
+        .current_dir(path)
+        .output()
+        .expect("Failed to stage files");
+    StdCommand::new("git")
+        .args(["commit", "-m", message])
+        .current_dir(path)
+        .output()
+        .expect("Failed to commit files");
+}
 
-    const CLEAN_MIGRATION: &str = r#"
+fn git_stage(path: &std::path::Path, file: &str) {
+    StdCommand::new("git")
+        .args(["add", file])
+        .current_dir(path)
+        .output()
+        .expect("Failed to stage file");
+}
+
+const CLEAN_MIGRATION: &str = r#"
 from django.db import migrations
 
 class Migration(migrations.Migration):
@@ -45,7 +78,7 @@ class Migration(migrations.Migration):
     operations = []
 "#;
 
-    const BAD_MIGRATION_NON_CONCURRENT_INDEX: &str = r#"
+const BAD_MIGRATION_NON_CONCURRENT_INDEX: &str = r#"
 from django.db import migrations, models
 
 class Migration(migrations.Migration):
@@ -57,6 +90,13 @@ class Migration(migrations.Migration):
         ),
     ]
 "#;
+
+// =============================================================================
+// Exit Code Tests
+// =============================================================================
+
+mod exit_codes {
+    use super::*;
 
     const WARNING_ONLY_MIGRATION: &str = r#"
 from django.db import migrations
@@ -118,6 +158,166 @@ class Migration(migrations.Migration):
         let temp = TempDir::new().unwrap();
 
         zdm().arg(temp.path()).assert().success().code(0);
+    }
+}
+
+// =============================================================================
+// Diff Mode Tests
+// =============================================================================
+
+mod diff_mode {
+    use super::*;
+
+    fn setup_git_repo() -> TempDir {
+        let temp = TempDir::new().unwrap();
+        git_init(temp.path());
+
+        let migrations_dir = temp.path().join("app").join("migrations");
+        fs::create_dir_all(&migrations_dir).unwrap();
+        fs::write(migrations_dir.join("__init__.py"), "").unwrap();
+        fs::write(temp.path().join("README.md"), "# Test").unwrap();
+
+        git_commit_all(temp.path(), "Initial");
+
+        StdCommand::new("git")
+            .args(["branch", "origin/main"])
+            .current_dir(temp.path())
+            .output()
+            .expect("Failed to create base branch");
+
+        temp
+    }
+
+    #[test]
+    fn diff_staged_detects_staged_migration_not_in_head() {
+        let temp = setup_git_repo();
+        let migration_path = temp
+            .path()
+            .join("app")
+            .join("migrations")
+            .join("0001_bad.py");
+        fs::write(&migration_path, BAD_MIGRATION_NON_CONCURRENT_INDEX).unwrap();
+        git_stage(temp.path(), "app/migrations/0001_bad.py");
+
+        zdm()
+            .current_dir(temp.path())
+            .arg("--diff-staged")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R001")
+            .arg("--output-format")
+            .arg("compact")
+            .assert()
+            .failure()
+            .stdout(predicate::str::contains("R001"));
+    }
+
+    #[test]
+    fn diff_staged_reads_index_content_not_worktree_content() {
+        let temp = setup_git_repo();
+        let migration_path = temp
+            .path()
+            .join("app")
+            .join("migrations")
+            .join("0001_initial.py");
+        fs::write(&migration_path, CLEAN_MIGRATION).unwrap();
+        git_stage(temp.path(), "app/migrations/0001_initial.py");
+        fs::write(&migration_path, BAD_MIGRATION_NON_CONCURRENT_INDEX).unwrap();
+
+        zdm()
+            .current_dir(temp.path())
+            .arg("--diff-staged")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R001")
+            .assert()
+            .success()
+            .code(0);
+    }
+
+    #[test]
+    fn diff_staged_respects_exclude_patterns() {
+        let temp = setup_git_repo();
+
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"exclude = ["**/test_migrations/**"]"#,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Add config");
+
+        StdCommand::new("git")
+            .args(["branch", "-f", "origin/main", "HEAD"])
+            .current_dir(temp.path())
+            .output()
+            .expect("Failed to update base branch");
+
+        // A staged migration that lives under an excluded path. Without the
+        // exclude filter being applied to staged discovery, R001 would fire.
+        let excluded_dir = temp
+            .path()
+            .join("app")
+            .join("test_migrations")
+            .join("migrations");
+        fs::create_dir_all(&excluded_dir).unwrap();
+        fs::write(excluded_dir.join("__init__.py"), "").unwrap();
+        fs::write(
+            excluded_dir.join("0001_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        git_stage(temp.path(), "app/test_migrations");
+
+        zdm()
+            .current_dir(temp.path())
+            .arg("--diff-staged")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R001")
+            .assert()
+            .success()
+            .code(0);
+    }
+
+    #[test]
+    fn r008_allows_basename_patterns() {
+        let temp = setup_git_repo();
+
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"allowed-file-patterns = ["models.py"]"#,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Add config");
+
+        StdCommand::new("git")
+            .args(["branch", "-f", "origin/main", "HEAD"])
+            .current_dir(temp.path())
+            .output()
+            .expect("Failed to update base branch");
+
+        let migration_path = temp
+            .path()
+            .join("app")
+            .join("migrations")
+            .join("0001_initial.py");
+        fs::write(&migration_path, CLEAN_MIGRATION).unwrap();
+
+        let model_dir = temp.path().join("backend").join("media");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("models.py"), "# model").unwrap();
+
+        git_commit_all(temp.path(), "Add migration and model");
+
+        zdm()
+            .current_dir(temp.path())
+            .arg("--diff")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R008")
+            .assert()
+            .success()
+            .code(0);
     }
 }
 

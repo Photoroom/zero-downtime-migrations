@@ -13,7 +13,7 @@
 - id: zdm-diff
   name: Zero-Downtime Migrations Linter (diff mode)
   description: Check changed Django migrations for PostgreSQL safety issues
-  entry: zdm --diff origin/main
+  entry: zdm --diff-staged origin/main
   language: python
   pass_filenames: false
   always_run: true

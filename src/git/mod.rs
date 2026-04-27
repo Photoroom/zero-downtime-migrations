@@ -153,6 +153,130 @@ impl GitRepo {
         Ok(files)
     }
 
+    /// Get staged files changed between a reference and the git index.
+    ///
+    /// This is intended for pre-commit hooks, where HEAD still points at the
+    /// previous commit and the commit being checked exists only in the index.
+    pub fn changed_staged_files(&self, base_ref: &str) -> Result<Vec<ChangedFile>> {
+        // Resolve the base reference to a commit
+        let base_obj = self.repo.revparse_single(base_ref).map_err(|e| {
+            Error::git_error_msg(format!("Failed to resolve reference '{}': {}", base_ref, e))
+        })?;
+
+        let base_commit = base_obj.peel_to_commit().map_err(|e| {
+            Error::git_error_msg(format!(
+                "Reference '{}' does not point to a commit: {}",
+                base_ref, e
+            ))
+        })?;
+
+        let base_tree = base_commit.tree().map_err(|e| {
+            Error::git_error_msg(format!("Failed to get tree for base commit: {}", e))
+        })?;
+
+        let index = self
+            .repo
+            .index()
+            .map_err(|e| Error::git_error_msg(format!("Failed to read git index: {}", e)))?;
+
+        let mut diff_opts = DiffOptions::new();
+        diff_opts.include_untracked(false);
+
+        let diff = self
+            .repo
+            .diff_tree_to_index(Some(&base_tree), Some(&index), Some(&mut diff_opts))
+            .map_err(|e| Error::git_error_msg(format!("Failed to compute staged diff: {}", e)))?;
+
+        let mut files = Vec::new();
+        diff.foreach(
+            &mut |delta, _| {
+                let status = match delta.status() {
+                    git2::Delta::Added => FileStatus::Added,
+                    git2::Delta::Deleted => FileStatus::Deleted,
+                    git2::Delta::Modified => FileStatus::Modified,
+                    git2::Delta::Renamed => FileStatus::Renamed,
+                    git2::Delta::Copied => FileStatus::Added,
+                    _ => return true, // Skip other statuses
+                };
+
+                let path = delta
+                    .new_file()
+                    .path()
+                    .map(|p| p.to_path_buf())
+                    .or_else(|| delta.old_file().path().map(|p| p.to_path_buf()));
+
+                if let Some(path) = path {
+                    let old_path = if status == FileStatus::Renamed {
+                        delta.old_file().path().map(|p| p.to_path_buf())
+                    } else {
+                        None
+                    };
+
+                    files.push(ChangedFile {
+                        path,
+                        status,
+                        old_path,
+                    });
+                }
+
+                true
+            },
+            None,
+            None,
+            None,
+        )
+        .map_err(|e| Error::git_error_msg(format!("Failed to iterate staged diff: {}", e)))?;
+
+        Ok(files)
+    }
+
+    /// Read the staged contents of a file from the git index.
+    pub fn read_staged_file(&self, path: &Path) -> Result<String> {
+        let root = self.root()?;
+        let relative_path = match path.strip_prefix(&root) {
+            Ok(relative) => relative.to_path_buf(),
+            Err(_) => {
+                let canonical_root = root.canonicalize().map_err(|e| Error::io(e, &root))?;
+                let canonical_path = path.canonicalize().map_err(|e| Error::io(e, path))?;
+                canonical_path
+                    .strip_prefix(canonical_root)
+                    .map(|relative| relative.to_path_buf())
+                    .map_err(|_| {
+                        Error::git_error_msg(format!(
+                            "File '{}' is not inside repository '{}'",
+                            path.display(),
+                            root.display()
+                        ))
+                    })?
+            }
+        };
+
+        let index = self
+            .repo
+            .index()
+            .map_err(|e| Error::git_error_msg(format!("Failed to read git index: {}", e)))?;
+        let entry = index.get_path(&relative_path, 0).ok_or_else(|| {
+            Error::git_error_msg(format!(
+                "File '{}' is not present in the git index",
+                relative_path.display()
+            ))
+        })?;
+        let blob = self
+            .repo
+            .find_blob(entry.id)
+            .map_err(|e| Error::git_error_msg(format!("Failed to read staged file: {}", e)))?;
+
+        std::str::from_utf8(blob.content())
+            .map(|s| s.to_string())
+            .map_err(|e| {
+                Error::git_error_msg(format!(
+                    "Staged file '{}' is not valid UTF-8: {}",
+                    relative_path.display(),
+                    e
+                ))
+            })
+    }
+
     /// Get all uncommitted changes (staged + unstaged).
     pub fn uncommitted_changes(&self) -> Result<Vec<ChangedFile>> {
         let mut opts = StatusOptions::new();
@@ -203,6 +327,15 @@ impl GitRepo {
             .collect())
     }
 
+    /// Filter staged changed files to only migration files.
+    pub fn changed_staged_migrations(&self, base_ref: &str) -> Result<Vec<ChangedFile>> {
+        let files = self.changed_staged_files(base_ref)?;
+        Ok(files
+            .into_iter()
+            .filter(|f| is_migration_path(&f.path))
+            .collect())
+    }
+
     /// Get paths of all changed migration files (for compatibility with discovery).
     pub fn changed_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
         let root = self.root()?;
@@ -214,10 +347,32 @@ impl GitRepo {
             .collect())
     }
 
+    /// Get paths of all staged changed migration files (for compatibility with discovery).
+    pub fn changed_staged_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
+        let root = self.root()?;
+        let migrations = self.changed_staged_migrations(base_ref)?;
+        Ok(migrations
+            .into_iter()
+            .filter(|f| f.status != FileStatus::Deleted)
+            .map(|f| root.join(&f.path))
+            .collect())
+    }
+
     /// Get paths of all non-migration files changed in the diff.
     pub fn changed_non_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
         let root = self.root()?;
         let files = self.changed_files(base_ref)?;
+        Ok(files
+            .into_iter()
+            .filter(|f| !is_migration_path(&f.path) && f.status != FileStatus::Deleted)
+            .map(|f| root.join(&f.path))
+            .collect())
+    }
+
+    /// Get paths of all staged non-migration files changed in the diff.
+    pub fn changed_staged_non_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
+        let root = self.root()?;
+        let files = self.changed_staged_files(base_ref)?;
         Ok(files
             .into_iter()
             .filter(|f| !is_migration_path(&f.path) && f.status != FileStatus::Deleted)
@@ -555,6 +710,61 @@ mod tests {
         let changes = repo.uncommitted_changes().unwrap();
         assert!(!changes.is_empty());
         // Should see the modified file and/or the new staged file
+    }
+
+    #[test]
+    fn test_changed_staged_files_uses_index_not_head() {
+        let (temp, repo) = create_test_repo();
+
+        fs::write(temp.path().join("README.md"), "# Test").unwrap();
+        commit(&temp, "Initial");
+
+        Command::new("git")
+            .args(["branch", "origin/main"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        let migrations_dir = temp.path().join("app").join("migrations");
+        fs::create_dir_all(&migrations_dir).unwrap();
+        fs::write(migrations_dir.join("__init__.py"), "").unwrap();
+        fs::write(migrations_dir.join("0001_initial.py"), "# staged migration").unwrap();
+
+        Command::new("git")
+            .args(["add", "app/migrations/0001_initial.py"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        let head_changed = repo.changed_files("origin/main").unwrap();
+        assert!(head_changed.is_empty());
+
+        let staged_changed = repo.changed_staged_files("origin/main").unwrap();
+        assert_eq!(staged_changed.len(), 1);
+        assert_eq!(
+            staged_changed[0].path,
+            PathBuf::from("app/migrations/0001_initial.py")
+        );
+    }
+
+    #[test]
+    fn test_read_staged_file_ignores_unstaged_worktree_changes() {
+        let (temp, repo) = create_test_repo();
+
+        fs::write(temp.path().join("README.md"), "# Test").unwrap();
+        commit(&temp, "Initial");
+
+        fs::write(temp.path().join("file.py"), "staged").unwrap();
+        Command::new("git")
+            .args(["add", "file.py"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        fs::write(temp.path().join("file.py"), "unstaged").unwrap();
+
+        let content = repo.read_staged_file(&temp.path().join("file.py")).unwrap();
+        assert_eq!(content, "staged");
     }
 
     #[test]
