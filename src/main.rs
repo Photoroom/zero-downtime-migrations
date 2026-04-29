@@ -34,6 +34,10 @@ struct Cli {
     #[arg(long, value_name = "REF")]
     diff: Option<String>,
 
+    /// Compare staged changes against a git reference (for pre-commit hooks)
+    #[arg(long, value_name = "REF", conflicts_with = "diff")]
+    diff_staged: Option<String>,
+
     /// Output format
     #[arg(long, value_enum, default_value = "default")]
     output_format: OutputFormat,
@@ -102,8 +106,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
         config.warnings_as_errors = true;
     }
 
+    let diff_mode = match (cli.diff.as_deref(), cli.diff_staged.as_deref()) {
+        (Some(base_ref), None) => Some(DiffMode::Head { base_ref }),
+        (None, Some(base_ref)) => Some(DiffMode::Staged { base_ref }),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap prevents --diff and --diff-staged together"),
+    };
+
     // Discover migration files (with exclude patterns from config)
-    let migration_paths = discover_migrations(&cli.paths, cli.diff.as_deref(), &config.exclude)?;
+    let migration_paths = discover_migrations(&cli.paths, diff_mode, &config.exclude)?;
 
     // If no migrations found, that's OK
     if migration_paths.is_empty() {
@@ -118,7 +129,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let rule_registry = RuleRegistry::new();
 
     for path in &migration_paths {
-        match parse_and_check_file(path, &rule_registry, &config) {
+        match parse_and_check_file(path, &rule_registry, &config, diff_mode) {
             Ok((migration, diagnostics)) => {
                 all_diagnostics.extend(diagnostics);
                 migrations.push(migration);
@@ -131,8 +142,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 
     // Run changeset rules if in diff mode
-    if cli.diff.is_some() {
-        let other_files = discover_non_migration_files(cli.diff.as_deref())?;
+    if let Some(diff_mode) = diff_mode {
+        let other_files = discover_non_migration_files(diff_mode)?;
         let changeset_registry = ChangesetRuleRegistry::new();
         let migration_refs: Vec<&Migration> = migrations.iter().collect();
         let other_file_refs: Vec<&Path> = other_files.iter().map(|p| p.as_path()).collect();
@@ -196,15 +207,24 @@ fn load_config() -> Result<Config> {
     Config::load_from_directory(&current_dir)
 }
 
+#[derive(Clone, Copy)]
+enum DiffMode<'a> {
+    Head { base_ref: &'a str },
+    Staged { base_ref: &'a str },
+}
+
 fn discover_migrations(
     paths: &[PathBuf],
-    diff_ref: Option<&str>,
+    diff_mode: Option<DiffMode<'_>>,
     exclude_patterns: &[String],
 ) -> Result<Vec<PathBuf>> {
-    if let Some(base_ref) = diff_ref {
+    if let Some(diff_mode) = diff_mode {
         // In diff mode, get changed migrations from git
         let repo = GitRepo::open(Path::new("."))?;
-        let migrations = repo.changed_migration_paths(base_ref)?;
+        let migrations = match diff_mode {
+            DiffMode::Head { base_ref } => repo.changed_migration_paths(base_ref)?,
+            DiffMode::Staged { base_ref } => repo.changed_staged_migration_paths(base_ref)?,
+        };
 
         // Apply exclude patterns to diff mode as well
         if exclude_patterns.is_empty() {
@@ -262,22 +282,35 @@ fn discover_migrations(
     }
 }
 
-fn discover_non_migration_files(diff_ref: Option<&str>) -> Result<Vec<PathBuf>> {
-    if let Some(base_ref) = diff_ref {
-        let repo = GitRepo::open(Path::new("."))?;
-        repo.changed_non_migration_paths(base_ref)
-    } else {
-        Ok(Vec::new())
-    }
+/// Returns repo-relative paths so changeset rules can match without
+/// touching the filesystem.
+fn discover_non_migration_files(diff_mode: DiffMode<'_>) -> Result<Vec<PathBuf>> {
+    let repo = GitRepo::open(Path::new("."))?;
+    let root = repo.root()?;
+    let absolute = match diff_mode {
+        DiffMode::Head { base_ref } => repo.changed_non_migration_paths(base_ref)?,
+        DiffMode::Staged { base_ref } => repo.changed_staged_non_migration_paths(base_ref)?,
+    };
+    Ok(absolute
+        .into_iter()
+        .map(|p| p.strip_prefix(&root).map(|r| r.to_path_buf()).unwrap_or(p))
+        .collect())
 }
 
 fn parse_and_check_file(
     path: &Path,
     rule_registry: &RuleRegistry,
     config: &Config,
+    diff_mode: Option<DiffMode<'_>>,
 ) -> Result<(Migration, Vec<Diagnostic>)> {
     // Read and parse the file
-    let source = std::fs::read_to_string(path).map_err(|e| Error::io(e, path.to_path_buf()))?;
+    let source = match diff_mode {
+        Some(DiffMode::Staged { .. }) => {
+            let repo = GitRepo::open(Path::new("."))?;
+            repo.read_staged_file(path)?
+        }
+        _ => std::fs::read_to_string(path).map_err(|e| Error::io(e, path.to_path_buf()))?,
+    };
 
     let parsed = ParsedMigration::parse(&source)
         .map_err(|e| Error::parse(path.to_path_buf(), e.to_string()))?;
