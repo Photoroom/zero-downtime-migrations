@@ -298,12 +298,27 @@ impl<'a> MigrationExtractor<'a> {
     }
 
     /// Extract RunSQL operation data.
+    ///
+    /// Both `sql` and `reverse_sql` are extracted from either their keyword
+    /// argument or their corresponding positional slot (0 for `sql`, 1 for
+    /// `reverse_sql`, per Django's `RunSQL(sql, reverse_sql=None, ...)`
+    /// signature). For each, a bare identifier value is resolved against
+    /// module-level `NAME = "..."` assignments so that
+    /// `RunSQL(sql=MY_SQL_CONST)` does not slip through as if the SQL were
+    /// the literal text `MY_SQL_CONST`. Non-literal, non-resolvable values
+    /// (function calls, lambdas, etc.) yield `None` so downstream rules
+    /// fall back to the conservative "no SQL extracted" path rather than
+    /// being misled by raw node text.
     fn extract_run_sql_operation(&self, args: Node) -> RunSQLOperation {
         let sql = self
-            .get_keyword_arg_string(args, "sql")
-            .or_else(|| self.get_first_positional_string(args))
+            .get_keyword_arg_value(args, "sql")
+            .or_else(|| self.get_nth_positional_value(args, 0))
+            .and_then(|v| self.resolve_string_value(v))
             .unwrap_or_default();
-        let reverse_sql = self.get_keyword_arg_string(args, "reverse_sql");
+        let reverse_sql = self
+            .get_keyword_arg_value(args, "reverse_sql")
+            .or_else(|| self.get_nth_positional_value(args, 1))
+            .and_then(|v| self.resolve_string_value(v));
 
         RunSQLOperation { sql, reverse_sql }
     }
@@ -379,11 +394,83 @@ impl<'a> MigrationExtractor<'a> {
         None
     }
 
-    /// Get the first positional string argument.
-    fn get_first_positional_string(&self, args: Node) -> Option<String> {
+    /// Get the value node of a keyword argument, if present.
+    fn get_keyword_arg_value(&self, args: Node<'a>, key: &str) -> Option<Node<'a>> {
         for child in args.children(&mut args.walk()) {
-            if child.kind() == "string" {
-                return Some(self.extract_string_value(child));
+            if child.kind() != "keyword_argument" {
+                continue;
+            }
+            let Some(name) = child.child_by_field_name("name") else {
+                continue;
+            };
+            if self.node_text(name) != key {
+                continue;
+            }
+            return child.child_by_field_name("value");
+        }
+        None
+    }
+
+    /// Get the Nth positional value-node (skipping keyword arguments and
+    /// comments). Mirrors `get_nth_positional_arg` but yields the Node so
+    /// callers can branch on its kind.
+    fn get_nth_positional_value(&self, args: Node<'a>, n: usize) -> Option<Node<'a>> {
+        let mut count = 0;
+        for child in args.named_children(&mut args.walk()) {
+            if matches!(child.kind(), "keyword_argument" | "comment") {
+                continue;
+            }
+            if count == n {
+                return Some(child);
+            }
+            count += 1;
+        }
+        None
+    }
+
+    /// Resolve a value node to a string: directly if it's a `string`
+    /// literal, or by following an `identifier` to a module-level
+    /// `NAME = "..."` assignment. Anything else (calls, lambdas, dict
+    /// comprehensions, etc.) yields `None` so callers don't accidentally
+    /// treat raw node text as the value.
+    fn resolve_string_value(&self, node: Node<'_>) -> Option<String> {
+        match node.kind() {
+            "string" => Some(self.extract_string_value(node)),
+            "identifier" => {
+                let name = self.node_text(node).to_string();
+                self.resolve_module_string_binding(&name)
+            }
+            _ => None,
+        }
+    }
+
+    /// Find a module-level `name = "string-literal"` assignment and return
+    /// its right-hand side. Only one level of indirection: chains like
+    /// `A = B; B = "..."` are not followed.
+    fn resolve_module_string_binding(&self, name: &str) -> Option<String> {
+        let root = self.parsed.root_node();
+        let source = self.parsed.source_bytes();
+        for child in root.children(&mut root.walk()) {
+            if child.kind() != "expression_statement" {
+                continue;
+            }
+            let Some(assignment) = child.named_child(0) else {
+                continue;
+            };
+            if assignment.kind() != "assignment" {
+                continue;
+            }
+            let Some(left) = assignment.child_by_field_name("left") else {
+                continue;
+            };
+            if left.utf8_text(source).ok() != Some(name) {
+                continue;
+            }
+            let Some(right) = assignment.child_by_field_name("right") else {
+                continue;
+            };
+            if right.kind() == "string" {
+                return Some(self.extract_string_value(right));
             }
         }
         None
@@ -567,6 +654,89 @@ class Migration(migrations.Migration):
             assert!(data.sql.contains("CREATE INDEX"));
             assert!(data.reverse_sql.is_some());
             assert!(data.contains_create_index());
+        } else {
+            panic!("Expected RunSQL data");
+        }
+    }
+
+    const RUN_SQL_WITH_MODULE_BINDING: &str = r#"
+from django.db import migrations
+
+CREATE_SQL = "CREATE INDEX CONCURRENTLY idx ON tbl (col);"
+DROP_SQL = "DROP INDEX idx;"
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL(sql=CREATE_SQL, reverse_sql=DROP_SQL),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_run_sql_resolves_identifier_bindings() {
+        // The previous extractor took the raw identifier text ("CREATE_SQL")
+        // as the SQL. Now we follow the assignment to the literal so R003
+        // and R013 see the real SQL.
+        let parsed = ParsedMigration::parse(RUN_SQL_WITH_MODULE_BINDING).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        if let OperationData::RunSQL(data) = &migration.operations[0].data {
+            assert_eq!(data.sql, "CREATE INDEX CONCURRENTLY idx ON tbl (col);");
+            assert_eq!(data.reverse_sql.as_deref(), Some("DROP INDEX idx;"));
+        } else {
+            panic!("Expected RunSQL data");
+        }
+    }
+
+    const RUN_SQL_POSITIONAL_LITERAL: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL("CREATE INDEX CONCURRENTLY a ON tbl (c);", "DROP INDEX a;"),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_run_sql_positional_reverse_sql() {
+        let parsed = ParsedMigration::parse(RUN_SQL_POSITIONAL_LITERAL).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        if let OperationData::RunSQL(data) = &migration.operations[0].data {
+            assert_eq!(data.sql, "CREATE INDEX CONCURRENTLY a ON tbl (c);");
+            assert_eq!(data.reverse_sql.as_deref(), Some("DROP INDEX a;"));
+        } else {
+            panic!("Expected RunSQL data");
+        }
+    }
+
+    const RUN_SQL_UNRESOLVABLE: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL(sql=undefined_const),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_run_sql_unresolvable_identifier_yields_empty() {
+        // Unknown identifier: no module-level binding, so we report empty
+        // SQL rather than fabricating "undefined_const" as the SQL text.
+        let parsed = ParsedMigration::parse(RUN_SQL_UNRESOLVABLE).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        if let OperationData::RunSQL(data) = &migration.operations[0].data {
+            assert!(data.sql.is_empty());
+            assert!(data.reverse_sql.is_none());
         } else {
             panic!("Expected RunSQL data");
         }
