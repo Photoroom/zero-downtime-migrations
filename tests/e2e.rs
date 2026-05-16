@@ -57,9 +57,6 @@ fn e2e_r001_pass_add_index_on_new_model() {
 #[test]
 fn e2e_r010_pass_nullable_field() {
     let fixture = fixtures_dir().join("R010/pass_nullable_field.py");
-    if !fixture.exists() {
-        return; // Skip if fixture doesn't exist
-    }
 
     zdm().arg(&fixture).assert().success().code(0);
 }
@@ -67,9 +64,6 @@ fn e2e_r010_pass_nullable_field() {
 #[test]
 fn e2e_r010_fail_not_null_without_default() {
     let fixture = fixtures_dir().join("R010/fail_add_field_not_null.py");
-    if !fixture.exists() {
-        return; // Skip if fixture doesn't exist
-    }
 
     zdm()
         .arg(&fixture)
@@ -86,9 +80,6 @@ fn e2e_r010_fail_not_null_without_default() {
 #[test]
 fn e2e_r016_fail_non_concurrent_remove_index() {
     let fixture = fixtures_dir().join("R016/fail_remove_index_non_concurrent.py");
-    if !fixture.exists() {
-        return; // Skip if fixture doesn't exist
-    }
 
     zdm()
         .arg(&fixture)
@@ -102,9 +93,6 @@ fn e2e_r016_fail_non_concurrent_remove_index() {
 #[test]
 fn e2e_r016_pass_concurrent_remove_index() {
     let fixture = fixtures_dir().join("R016/pass_concurrent_remove_index.py");
-    if !fixture.exists() {
-        return; // Skip if fixture doesn't exist
-    }
 
     zdm().arg(&fixture).assert().success().code(0);
 }
@@ -118,10 +106,6 @@ fn e2e_multiple_rules_detect_all() {
     // Lint multiple failing fixtures at once
     let r001_fail = fixtures_dir().join("R001/fail_non_concurrent_add_index.py");
     let r016_fail = fixtures_dir().join("R016/fail_remove_index_non_concurrent.py");
-
-    if !r001_fail.exists() || !r016_fail.exists() {
-        return;
-    }
 
     zdm()
         .arg(&r001_fail)
