@@ -118,7 +118,7 @@ test suite — every field above is guaranteed on every diagnostic.
 
 ### CreateModel Exemption
 
-Several rules (R001, R002, R006, R010, R017) automatically exempt operations that target models created in the same migration. This is because operations on newly created (empty) tables don't cause the locking issues these rules detect.
+Several rules (R001, R002, R006, R010, R016, R017) automatically exempt operations that target models created in the same migration. This is because operations on newly created (empty) tables don't cause the locking issues these rules detect. The exemption is order-aware — a `CreateModel` that runs *after* the flagged op cannot retroactively exempt it.
 
 > **Note:** R007 (`fk-without-concurrent-index`) was merged into R006 and retired. Its concern — that an FK on an existing table should be preceded by `AddIndexConcurrently` — is now part of R006's check, including the order-aware exemption (a concurrent index later in the same migration does not protect the FK).
 

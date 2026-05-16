@@ -27,7 +27,7 @@ minor bump (`0.4.0`) rather than a patch.
   wrapped inside `SeparateDatabaseAndState(database_operations=[...])`.
   Wrapping doesn't defang the lock — Django runs the wrapped op
   against the live schema.
-- **R002, R006, R010, R016, R017** CreateModel exemptions are now
+- **R001, R002, R006, R010, R016, R017** CreateModel exemptions are now
   order-aware. A `CreateModel` placed *after* the flagged op no
   longer retroactively exempts it (previously these rules consulted
   an order-blind `is_model_created` lookup). Real-world migrations
