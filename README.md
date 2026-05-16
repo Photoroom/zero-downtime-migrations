@@ -112,6 +112,27 @@ class Migration(migrations.Migration):
 
 R015 (alter-field-not-null) cannot determine whether a field was previously nullable. It flags ALL `AlterField` operations where the resulting field is NOT NULL, which may produce false positives when the field was already NOT NULL. This is a fundamental limitation of static analysis without schema history. Use `# zdm: ignore R015` inline comments for legitimate `AlterField` operations that don't change nullability.
 
+### Inline Suppression
+
+You can silence specific rules on a per-operation basis with a comment:
+
+```python
+operations = [
+    # zdm: ignore R001
+    migrations.AddIndex(
+        model_name='order',
+        index=models.Index(fields=['created_at'], name='order_idx'),
+    ),
+    migrations.AlterField(  # zdm: ignore R015, R010
+        model_name='product',
+        name='sku',
+        field=models.CharField(max_length=50),
+    ),
+]
+```
+
+The comment can sit on the line just above the operation or on the same line as any line in the operation's range. Multiple rule IDs may be listed, separated by commas.
+
 ## Configuration
 
 Configure via `pyproject.toml` or `zero-downtime-migrations.toml`:

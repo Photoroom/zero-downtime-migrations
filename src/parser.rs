@@ -182,6 +182,31 @@ impl ParsedMigration {
         false
     }
 
+    /// Collect every comment node in the parse tree, returning `(line,
+    /// text)` pairs. Lines are 1-indexed. The comment text retains its
+    /// leading `#`. Used by the inline-ignore (`# zdm: ignore RXXX`)
+    /// machinery so rules can be suppressed at specific source lines.
+    pub fn all_comments(&self) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        self.collect_comments(self.root_node(), &mut out);
+        out
+    }
+
+    fn collect_comments(&self, node: Node<'_>, out: &mut Vec<(usize, String)>) {
+        if node.kind() == "comment" {
+            let line = node.start_position().row + 1;
+            let text = node
+                .utf8_text(self.source_bytes())
+                .unwrap_or("")
+                .to_string();
+            out.push((line, text));
+            return;
+        }
+        for child in node.children(&mut node.walk()) {
+            self.collect_comments(child, out);
+        }
+    }
+
     /// Get all import statements in the file.
     pub fn get_imports(&self) -> Vec<Node<'_>> {
         let root = self.root_node();

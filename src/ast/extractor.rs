@@ -1,5 +1,6 @@
 //! Extracts typed migration operations from tree-sitter nodes.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use tree_sitter::Node;
@@ -64,6 +65,32 @@ fn strip_whitespace(text: &str) -> Vec<u8> {
     text.bytes().filter(|b| !b.is_ascii_whitespace()).collect()
 }
 
+/// Parse a `# zdm: ignore RXXX[, RYYY]` comment into its rule-ID set,
+/// returning `None` if the comment does not match the suppression form.
+/// Accepts both `# zdm: ignore RXXX` and the slightly lax `# zdm:ignore RXXX`.
+/// Rule IDs are returned in their normalised upper-case form.
+fn parse_ignore_directive(comment: &str) -> Option<Vec<String>> {
+    let body = comment.trim_start_matches('#').trim_start();
+    let body = body.strip_prefix("zdm")?.trim_start();
+    let body = body.strip_prefix(':')?.trim_start();
+    let body = body.strip_prefix("ignore")?;
+    // Require whitespace (or end-of-string) after `ignore`, so that
+    // `ignored_attribute` doesn't accidentally match.
+    if !body.is_empty() && !body.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let ids: Vec<String> = body
+        .split(',')
+        .map(|s| s.trim().to_ascii_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if ids.is_empty() {
+        None
+    } else {
+        Some(ids)
+    }
+}
+
 /// Extracts migration operations from a parsed Python file.
 pub struct MigrationExtractor<'a> {
     parsed: &'a ParsedMigration,
@@ -80,6 +107,7 @@ impl<'a> MigrationExtractor<'a> {
         let operations = self.extract_operations();
         let imports = self.extract_imports();
         let is_non_atomic = self.parsed.is_non_atomic();
+        let line_ignores = self.extract_line_ignores();
 
         // Track created models for exemption
         let created_models: Vec<String> = operations
@@ -97,7 +125,20 @@ impl<'a> MigrationExtractor<'a> {
             operations,
             imports,
             created_models,
+            line_ignores,
         })
+    }
+
+    /// Walk every comment in the parse tree and collect any
+    /// `# zdm: ignore RXXX[, RYYY]` directives into a line → rule-ID map.
+    fn extract_line_ignores(&self) -> BTreeMap<usize, BTreeSet<String>> {
+        let mut map: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
+        for (line, text) in self.parsed.all_comments() {
+            if let Some(ids) = parse_ignore_directive(&text) {
+                map.entry(line).or_default().extend(ids);
+            }
+        }
+        map
     }
 
     /// Extract all operations from the migration.
@@ -786,6 +827,95 @@ class Migration(migrations.Migration):
         migrations.RunSQL(sql=undefined_const),
     ]
 "#;
+
+    const IGNORE_DIRECTIVE_SAMPLES: &str = r#"
+from django.db import migrations
+
+# zdm: ignore R015
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddField(  # zdm: ignore R001, R010
+            model_name='order',
+            name='x',
+            field=None,
+        ),
+        migrations.RunSQL("UPDATE t SET c=1"),  # zdm:ignore R013
+    ]
+"#;
+
+    #[test]
+    fn test_extract_line_ignores() {
+        let parsed = ParsedMigration::parse(IGNORE_DIRECTIVE_SAMPLES).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        // The comment on its own line.
+        let line_r015 = *migration
+            .line_ignores
+            .iter()
+            .find(|(_, set)| set.contains("R015"))
+            .map(|(line, _)| line)
+            .expect("R015 ignore present");
+        assert!(line_r015 > 1, "expected a non-zero line for R015");
+
+        // The same-line comment carries both R001 and R010.
+        let ids_for_addfield = migration
+            .line_ignores
+            .values()
+            .find(|set| set.contains("R001") && set.contains("R010"))
+            .expect("R001+R010 multi-id ignore present");
+        assert_eq!(ids_for_addfield.len(), 2);
+
+        // Lax `# zdm:ignore` (no space after the colon) still works.
+        assert!(migration
+            .line_ignores
+            .values()
+            .any(|set| set.contains("R013")));
+    }
+
+    #[test]
+    fn test_parse_ignore_directive_rejects_non_directives() {
+        assert!(parse_ignore_directive("# normal comment").is_none());
+        assert!(parse_ignore_directive("# zdm: noqa R001").is_none());
+        assert!(parse_ignore_directive("# zdm: ignored R001").is_none());
+        assert!(parse_ignore_directive("# zdm: ignore").is_none());
+        // Case is normalised on rule IDs.
+        let ids = parse_ignore_directive("# zdm: ignore r001, r002").unwrap();
+        assert_eq!(ids, vec!["R001".to_string(), "R002".to_string()]);
+    }
+
+    #[test]
+    fn test_is_rule_suppressed_at_within_span_and_above() {
+        let parsed = ParsedMigration::parse(IGNORE_DIRECTIVE_SAMPLES).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        // Same-line suppression: AddField's `# zdm: ignore R001, R010`
+        // sits on the call's first line.
+        let addfield = migration
+            .operations
+            .iter()
+            .find(|op| op.op_type == OperationType::AddField)
+            .unwrap();
+        assert!(migration.is_rule_suppressed_at(
+            "R001",
+            addfield.span.start_line,
+            addfield.span.end_line,
+        ));
+        assert!(migration.is_rule_suppressed_at(
+            "R010",
+            addfield.span.start_line,
+            addfield.span.end_line,
+        ));
+
+        // Different rule on the same span is not suppressed.
+        assert!(!migration.is_rule_suppressed_at(
+            "R016",
+            addfield.span.start_line,
+            addfield.span.end_line,
+        ));
+    }
 
     #[test]
     fn test_extract_run_sql_unresolvable_identifier_yields_empty() {

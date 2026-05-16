@@ -10,6 +10,7 @@ pub use extractor::MigrationExtractor;
 pub(crate) use operations::strip_sql_noise;
 pub use operations::*;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::diagnostics::Span;
@@ -27,6 +28,10 @@ pub struct Migration {
     pub imports: Vec<Import>,
     /// Model names created in this migration (for exemption tracking).
     pub created_models: Vec<String>,
+    /// For each source line that carried a `# zdm: ignore RXXX[, RYYY]`
+    /// comment, the set of rule IDs the user asked to suppress at that
+    /// line. Lines are 1-indexed.
+    pub line_ignores: BTreeMap<usize, BTreeSet<String>>,
 }
 
 impl Migration {
@@ -42,6 +47,22 @@ impl Migration {
         self.created_models
             .iter()
             .any(|name| name.eq_ignore_ascii_case(model_name))
+    }
+
+    /// Whether the given rule ID is suppressed for a diagnostic whose
+    /// span runs from `start_line` to `end_line` (inclusive). A
+    /// `# zdm: ignore <id>` comment counts when it appears anywhere
+    /// within that range, or on the line immediately preceding it.
+    pub fn is_rule_suppressed_at(&self, rule_id: &str, start_line: usize, end_line: usize) -> bool {
+        // `start_line` is 1-indexed (tree-sitter rows + 1), so the
+        // saturating_sub clamps to 1 on the off chance a default span
+        // produces `start_line == 0`.
+        let lookup_start = start_line.saturating_sub(1).max(1);
+        (lookup_start..=end_line).any(|line| {
+            self.line_ignores
+                .get(&line)
+                .is_some_and(|set| set.contains(rule_id))
+        })
     }
 }
 
