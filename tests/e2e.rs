@@ -13,9 +13,14 @@ fn zdm() -> Command {
     cargo_bin_cmd!("zdm")
 }
 
-/// Path to the test fixtures directory
+/// Path to the per-rule test fixtures directory.
 fn fixtures_dir() -> &'static Path {
     Path::new("tests/fixtures/rules")
+}
+
+/// Path to the test fixtures root (parent of `rules/` and other fixture trees).
+fn fixtures_root() -> &'static Path {
+    Path::new("tests/fixtures")
 }
 
 // =============================================================================
@@ -190,15 +195,33 @@ fn e2e_select_rule_only_checks_that_rule() {
 
 #[test]
 fn e2e_scan_directory_finds_all_issues() {
-    let r001_dir = fixtures_dir().join("R001");
+    // Scan a Django-style app/migrations layout containing one safe and
+    // one unsafe migration. Directory discovery only descends into
+    // `migrations/` subdirectories, which is why the per-rule fixture dirs
+    // (tests/fixtures/rules/R*/) can't be used here directly.
+    let scan_root = fixtures_root().join("scan");
 
-    let output = zdm().arg(&r001_dir).assert().get_output().stdout.clone();
+    let output = zdm()
+        .arg(scan_root)
+        .assert()
+        .failure()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
 
     let output_str = String::from_utf8(output).unwrap();
 
-    // Should find the failing migration but not report issues for passing ones
-    if output_str.contains("R001") {
-        // Found a violation - that's expected for the fail_ file
-        assert!(output_str.contains("fail_non_concurrent_add_index.py"));
-    }
+    assert!(
+        output_str.contains("R001"),
+        "expected R001 violation in output, got: {output_str}"
+    );
+    assert!(
+        output_str.contains("0002_unsafe_index.py"),
+        "expected unsafe fixture in output, got: {output_str}"
+    );
+    assert!(
+        !output_str.contains("0001_initial.py"),
+        "safe fixture should not be reported, got: {output_str}"
+    );
 }
