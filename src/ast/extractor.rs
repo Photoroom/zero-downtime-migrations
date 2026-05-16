@@ -330,7 +330,12 @@ impl<'a> MigrationExtractor<'a> {
             return out;
         }
         for child in node.named_children(&mut node.walk()) {
-            if child.kind() == "string" {
+            // Accept `string` and `concatenated_string` (Python's
+            // implicit-concatenation form `"a" "b"`); the latter
+            // is rare in migrations but tree-sitter wraps it in a
+            // distinct node so the bare `string` filter would
+            // otherwise silently drop adjacent literals.
+            if matches!(child.kind(), "string" | "concatenated_string") {
                 out.push(self.extract_string_value(child));
             }
         }
@@ -735,23 +740,51 @@ impl<'a> MigrationExtractor<'a> {
     /// sequences inside the content are preserved as written, which
     /// matches the previous behaviour for any non-pathological
     /// identifier (column/index/model names don't normally contain
-    /// `\` anyway). Interpolation nodes inside f-strings are skipped
-    /// so we don't fabricate column names from runtime expressions.
+    /// `\` anyway).
+    ///
+    /// F-strings: if any child is an `interpolation` node we return
+    /// an empty string rather than concatenate the surrounding
+    /// `string_content` chunks. `f"prefix_{x}_suffix"` decomposes
+    /// into `"prefix_"` + interpolation + `"_suffix"`; concatenating
+    /// the literal parts yields the plausible-but-wrong identifier
+    /// `prefix__suffix` and an extracted column/model name like that
+    /// would silently mismatch every catalog lookup. Returning empty
+    /// keeps the call site's existing "not found" semantics.
+    ///
+    /// Concatenated strings (`"a" "b"` — Python implicit
+    /// concatenation): tree-sitter wraps these in a
+    /// `concatenated_string` parent containing two `string` children.
+    /// Recurse into the children so callers see the joined content.
     fn extract_string_value(&self, node: Node) -> String {
-        if node.kind() != "string" {
-            // Fallback for non-string nodes (callers occasionally
-            // pass through identifiers in error paths). Returning
-            // raw text preserves the prior best-effort behaviour
-            // without panicking.
-            return self.node_text(node).to_string();
-        }
-        let mut out = String::new();
-        for child in node.children(&mut node.walk()) {
-            if child.kind() == "string_content" {
-                out.push_str(self.node_text(child));
+        match node.kind() {
+            "string" => {
+                let mut out = String::new();
+                for child in node.children(&mut node.walk()) {
+                    match child.kind() {
+                        "string_content" => out.push_str(self.node_text(child)),
+                        "interpolation" => return String::new(),
+                        _ => {}
+                    }
+                }
+                out
+            }
+            "concatenated_string" => {
+                let mut out = String::new();
+                for child in node.children(&mut node.walk()) {
+                    if child.kind() == "string" {
+                        out.push_str(&self.extract_string_value(child));
+                    }
+                }
+                out
+            }
+            _ => {
+                // Fallback for non-string nodes (callers occasionally
+                // pass through identifiers in error paths). Returning
+                // raw text preserves the prior best-effort behaviour
+                // without panicking.
+                self.node_text(node).to_string()
             }
         }
-        out
     }
 
     /// Get the text of a node.
@@ -1845,6 +1878,56 @@ class Migration(migrations.Migration):
                 "category".to_string(),
                 "raw_name".to_string(),
                 "triple".to_string(),
+            ],
+        );
+    }
+
+    const FSTRING_AND_CONCATENATED_SOURCE: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(
+                fields=[f"prefix_{var}_suffix", "split" "joined"],
+                name='odd_idx',
+            ),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_string_handles_fstring_and_concatenated() {
+        // F-strings contain an `interpolation` child whose value is
+        // unknown at lint time. Concatenating the surrounding
+        // `string_content` chunks would fabricate a plausible-but-
+        // wrong identifier (`prefix__suffix`), which would silently
+        // mismatch every catalog lookup downstream. The new
+        // extractor returns an empty string for any f-string with
+        // an interpolation.
+        //
+        // Concatenated string literals (`"a" "b"` — Python's
+        // implicit-concatenation) live under a `concatenated_string`
+        // parent in tree-sitter-python; the extractor now recurses
+        // into the children so callers see "ab" rather than the raw
+        // source span.
+        let parsed = ParsedMigration::parse(FSTRING_AND_CONCATENATED_SOURCE).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(
+            data.columns,
+            vec![
+                // f-string with interpolation → empty
+                "".to_string(),
+                // adjacent literals → joined
+                "splitjoined".to_string(),
             ],
         );
     }
