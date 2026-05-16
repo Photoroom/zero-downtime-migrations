@@ -4,7 +4,7 @@
 //! Regular `AddIndex` takes an exclusive lock on the table, blocking all reads
 //! and writes until the index is built.
 
-use crate::ast::{Migration, Operation, OperationData, OperationType};
+use crate::ast::{Migration, ModelOperation, Operation, OperationData, OperationType};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::rules::{Rule, RuleContext};
 
@@ -32,10 +32,26 @@ impl Rule for R001NonConcurrentAddIndex {
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        // Top-level AddIndex.
-        for op in migration.operations_of_type(OperationType::AddIndex) {
+        // Top-level walk in source order so the CreateModel
+        // exemption only honours models created *before* the
+        // AddIndex. The order-blind `is_model_created` would
+        // silently exempt an AddIndex placed above its
+        // CreateModel — the same false negative R002, R006, R016,
+        // and R017 fixed in this PR.
+        let mut created_so_far: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for op in &migration.operations {
+            if op.op_type == OperationType::CreateModel {
+                if let OperationData::Model(ModelOperation { name, .. }) = &op.data {
+                    created_so_far.insert(name.to_lowercase());
+                }
+                continue;
+            }
+            if op.op_type != OperationType::AddIndex {
+                continue;
+            }
             if let OperationData::Index(index_op) = &op.data {
-                if migration.is_model_created(&index_op.model_name) {
+                if created_so_far.contains(&index_op.model_name.to_lowercase()) {
                     continue;
                 }
             }
@@ -201,5 +217,38 @@ class Migration(migrations.Migration):
         // `wrapped_database_ops`, so R001 leaves them alone.
         let diagnostics = check_migration(ADD_INDEX_INSIDE_SDAS_STATE_OPS_GOOD);
         assert!(diagnostics.is_empty());
+    }
+
+    const ADDINDEX_BEFORE_CREATEMODEL_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(fields=['name'], name='product_name_idx'),
+        ),
+        migrations.CreateModel(
+            name='Product',
+            fields=[
+                ('id', models.AutoField(primary_key=True)),
+                ('name', models.CharField(max_length=255)),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_addindex_before_createmodel_is_not_exempted() {
+        // Order-aware exemption: a CreateModel that runs *after*
+        // the AddIndex cannot retroactively make the AddIndex safe.
+        // R001 was the last rule still using the order-blind
+        // `is_model_created` lookup; this test pins the fix that
+        // brings it in line with R002/R006/R010/R016/R017.
+        let diagnostics = check_migration(ADDINDEX_BEFORE_CREATEMODEL_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R001");
     }
 }
