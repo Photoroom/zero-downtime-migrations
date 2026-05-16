@@ -69,6 +69,32 @@ zdm --warnings-as-errors .
 - `1` — lint violations found (errors). Warnings alone do NOT cause exit code 1 unless `--warnings-as-errors` is set.
 - `2` — tool error (bad arguments, config parse failure, invalid file path)
 
+### JSON Output Schema
+
+`zdm --output-format json` writes a single JSON object to stdout:
+
+```json
+{
+  "diagnostics": [
+    {
+      "rule_id":   "R001",
+      "rule_name": "non-concurrent-add-index",
+      "severity":  "error",
+      "message":   "Use AddIndexConcurrently instead of AddIndex …",
+      "path":      "app/migrations/0001_bad.py",
+      "line":      8,
+      "column":    9,
+      "help":      "Replace migrations.AddIndex with …"
+    }
+  ],
+  "summary": { "total": 1, "errors": 1, "warnings": 0 }
+}
+```
+
+`severity` is `"error"` or `"warning"`. `help` is `null` when the
+rule has no help text. The schema is pinned by the integration
+test suite — every field above is guaranteed on every diagnostic.
+
 ## Rules
 
 | Rule | Name | Severity | Description |

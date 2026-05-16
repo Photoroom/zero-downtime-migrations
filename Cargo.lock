@@ -1606,7 +1606,7 @@ dependencies = [
 
 [[package]]
 name = "zero-downtime-migrations"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "assert_cmd",
  "clap",
