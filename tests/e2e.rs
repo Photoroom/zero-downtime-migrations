@@ -192,6 +192,45 @@ fn e2e_r014_fail_model_import() {
 }
 
 #[test]
+fn e2e_oversized_file_is_rejected_with_parse_error_exit_code() {
+    // The parser caps inputs at 10 MiB to bound memory. A file just
+    // over the cap should be rejected before tree-sitter sees it; the
+    // CLI surfaces the rejection as a parse error and exits 2.
+    use std::fs::File;
+    use std::io::Write;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let migrations_dir = temp.path().join("app").join("migrations");
+    std::fs::create_dir_all(&migrations_dir).unwrap();
+    std::fs::write(migrations_dir.join("__init__.py"), "").unwrap();
+
+    let huge_path = migrations_dir.join("0001_huge.py");
+    let mut file = File::create(&huge_path).unwrap();
+    // Write 10 MiB + 1 byte of a benign repeated pattern; the cap
+    // (`MAX_FILE_SIZE = 10 MiB`) trips on byte length, not on parse
+    // content.
+    let chunk = vec![b'#'; 1024];
+    for _ in 0..(10 * 1024) {
+        file.write_all(&chunk).unwrap();
+    }
+    file.write_all(b"\n").unwrap();
+    drop(file);
+
+    zdm()
+        .arg(&huge_path)
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("0001_huge.py"))
+        // The error from `Error::FileTooLarge` is "File too large:
+        // <path> (<size> bytes, max <max> bytes)". Pin the prefix so
+        // a renaming-only refactor (or losing the size check
+        // entirely) shows up here instead of slipping through as a
+        // generic IO error.
+        .stderr(predicate::str::contains("File too large"));
+}
+
+#[test]
 fn e2e_r015_warns_alter_field_not_null() {
     // R015 surfaces nullable→NOT NULL transitions as a Warning rather
     // than an Error, because the rule cannot tell a genuine transition
