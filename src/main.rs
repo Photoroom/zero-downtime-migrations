@@ -79,7 +79,14 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(exit_code) => exit_code,
         Err(e) => {
-            eprintln!("{}: {}", "error".red().bold(), e);
+            // Sanitize because the error chain can embed a hostile
+            // filename (e.g. via `git_error_msg(format!("File '{}'...
+            // ", path.display()))`).
+            eprintln!(
+                "{}: {}",
+                "error".red().bold(),
+                sanitize_for_terminal(&e.to_string())
+            );
             ExitCode::from(2)
         }
     }
@@ -127,7 +134,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 migrations.push(migration);
             }
             Err(e) => {
-                eprintln!("{}: {} - {}", "error".red().bold(), path.display(), e);
+                eprintln!(
+                    "{}: {} - {}",
+                    "error".red().bold(),
+                    sanitize_path(path),
+                    sanitize_for_terminal(&e.to_string())
+                );
                 has_parse_errors = true;
             }
         }
@@ -355,6 +367,42 @@ fn output_diagnostics(diagnostics: &[Diagnostic], format: &OutputFormat) {
     }
 }
 
+/// Escape ASCII control characters so a migration that smuggles
+/// ANSI sequences, carriage returns, BEL, or backspace through an
+/// identifier (or a filename) can't repaint the user's terminal when
+/// the diagnostic renders. Newlines are passed through because the
+/// help text uses them for multi-line layout; tabs are escaped so a
+/// `\t`-heavy message can't desync the compact format's
+/// `path:line:severity:...` column layout. Everything else in
+/// 0x00–0x1F and 0x7F becomes `\xHH`. JSON output is already safe
+/// because `serde_json` escapes control characters by default.
+///
+/// Out of scope: dangerous Unicode codepoints (bidi-override U+202E,
+/// zero-width joiner, line/paragraph separators U+2028/U+2029). Rule
+/// messages legitimately contain em-dashes and smart quotes, so a
+/// blanket non-ASCII escape would mangle them. A future pass can add
+/// a narrower deny-list for the known-bad codepoints.
+fn sanitize_for_terminal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch == '\n' {
+            out.push(ch);
+        } else if (ch as u32) < 0x20 || ch == '\x7f' {
+            out.push_str(&format!("\\x{:02x}", ch as u32));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Render a path for terminal display, escaping control characters
+/// in case the filename itself is hostile (Unix allows ESC, BEL, CR,
+/// etc. in filenames).
+fn sanitize_path(path: &std::path::Path) -> String {
+    sanitize_for_terminal(&path.display().to_string())
+}
+
 fn output_default(diagnostics: &[Diagnostic]) {
     for diag in diagnostics {
         let severity_str = match diag.severity {
@@ -365,19 +413,19 @@ fn output_default(diagnostics: &[Diagnostic]) {
         println!(
             "{}: {} [{} {}]",
             severity_str,
-            diag.message,
+            sanitize_for_terminal(&diag.message),
             diag.rule_id.cyan(),
             diag.rule_name.cyan(),
         );
         println!(
             "  {} {}:{}",
             "-->".blue(),
-            diag.path.display(),
+            sanitize_path(&diag.path),
             diag.span.start_line
         );
 
         if let Some(ref help) = diag.help {
-            println!("  {} {}", "help:".green(), help);
+            println!("  {} {}", "help:".green(), sanitize_for_terminal(help));
         }
 
         println!();
@@ -498,15 +546,72 @@ fn output_compact(diagnostics: &[Diagnostic]) {
         };
         println!(
             "{}:{}: {}: [{} {}] {}",
-            diag.path.display(),
+            sanitize_path(&diag.path),
             diag.span.start_line,
             severity_char,
             diag.rule_id,
             diag.rule_name,
-            diag.message,
+            sanitize_for_terminal(&diag.message),
         );
         if let Some(help) = &diag.help {
-            println!("  help: {}", help);
+            println!("  help: {}", sanitize_for_terminal(help));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_for_terminal;
+
+    #[test]
+    fn sanitize_passes_through_printable_ascii() {
+        assert_eq!(sanitize_for_terminal("hello world"), "hello world");
+    }
+
+    #[test]
+    fn sanitize_preserves_newlines_but_escapes_tabs() {
+        // Newlines are used by multi-line help text, so they pass
+        // through. Tabs would desync the compact format's
+        // `path:line:severity:[rule] message` column layout, so they
+        // are escaped.
+        assert_eq!(sanitize_for_terminal("a\nb\tc"), "a\nb\\x09c");
+    }
+
+    #[test]
+    fn sanitize_escapes_backspace() {
+        // \x08 can erase preceding chars on most terminals, hiding
+        // arbitrary content from a diagnostic.
+        assert_eq!(sanitize_for_terminal("foo\x08\x08bar"), "foo\\x08\\x08bar");
+    }
+
+    #[test]
+    fn sanitize_escapes_ansi_color_injection() {
+        // A migration whose model name is `evil\x1b[31mRED\x1b[0m`
+        // would otherwise repaint the terminal when R005 renders
+        // "RemoveField 'evil...RED...'".
+        let attack = "evil\x1b[31mRED\x1b[0m";
+        let out = sanitize_for_terminal(attack);
+        assert_eq!(out, "evil\\x1b[31mRED\\x1b[0m");
+    }
+
+    #[test]
+    fn sanitize_escapes_carriage_return_and_bel() {
+        // \r alone is a common trick to overwrite the current line;
+        // \x07 rings the terminal bell.
+        assert_eq!(sanitize_for_terminal("\rfoo"), "\\x0dfoo");
+        assert_eq!(sanitize_for_terminal("bar\x07"), "bar\\x07");
+    }
+
+    #[test]
+    fn sanitize_escapes_del() {
+        assert_eq!(sanitize_for_terminal("a\x7fb"), "a\\x7fb");
+    }
+
+    #[test]
+    fn sanitize_passes_through_unicode() {
+        // Non-ASCII printable codepoints are not terminal control
+        // sequences and should not be escaped — the rule messages
+        // already use em-dashes and smart quotes.
+        assert_eq!(sanitize_for_terminal("café — naïve"), "café — naïve");
     }
 }
