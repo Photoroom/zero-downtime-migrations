@@ -21,15 +21,10 @@ use crate::error::{Error, Result};
 /// Configuration for zdm.
 ///
 /// `exclude` and `allowed_file_patterns` are validated at config
-/// load (`Config::load_from_directory` → `validate_glob_patterns`)
-/// and runtime call sites rely on that invariant — they call
-/// `glob::Pattern::new(p).expect(...)` rather than gracefully
-/// degrading on a re-parse failure. **A library consumer that
-/// mutates these fields directly must call `validate_glob_patterns`
-/// before invoking any code that compiles them, or risk a panic at
-/// the runtime site.** The fields are `pub` for ergonomics
-/// (config-from-Rust callers); enforcing this via setters would be
-/// cleaner but isn't done yet.
+/// load (`Config::load_from_directory` → `validate_glob_patterns`).
+/// Library consumers that mutate these fields directly can call
+/// `validate_glob_patterns` to surface invalid glob syntax before
+/// running discovery or changeset rules.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct Config {
@@ -39,14 +34,11 @@ pub struct Config {
     pub ignore: HashSet<String>,
     /// Treat warnings as errors.
     pub warnings_as_errors: bool,
-    /// File patterns to exclude from linting. See struct doc — must
-    /// be re-validated via `validate_glob_patterns` after any
-    /// out-of-band mutation.
+    /// File patterns to exclude from linting.
     pub exclude: Vec<String>,
     /// For R008: file patterns allowed to change alongside
     /// migrations. Files NOT matching these patterns will trigger a
-    /// warning. See struct doc — must be re-validated via
-    /// `validate_glob_patterns` after any out-of-band mutation.
+    /// warning.
     pub allowed_file_patterns: Vec<String>,
 }
 
@@ -133,10 +125,24 @@ impl Config {
         // Preflight: is there a `.git` ancestor strictly above
         // `start`? If not, we won't climb at all — the walk-up is
         // only authorised inside a confirmed repository.
+        //
+        // Trust hardening (Unix only): the anchor directory must
+        // also be owned by the current effective uid. Without this
+        // check, an attacker with write access to a shared parent
+        // (the classic example: world-writable `/tmp` with sticky
+        // bit) can plant `/tmp/.git` and
+        // `/tmp/zero-downtime-migrations.toml`, then any zdm run
+        // from inside `/tmp/<victim>/...` adopts the hostile
+        // config — disabling rules, flipping warnings-as-errors,
+        // etc. The uid check rejects an anchor we don't own.
+        //
+        // On Windows ownership semantics differ (ACLs, no simple
+        // uid), so the check is a no-op there — the same threat
+        // model would need a Windows-specific guard.
         let mut probe = start;
         let mut have_git_anchor = false;
         while let Some(parent) = probe.parent() {
-            if parent.join(".git").exists() {
+            if parent.join(".git").exists() && anchor_dir_is_trusted(parent) {
                 have_git_anchor = true;
                 break;
             }
@@ -190,7 +196,7 @@ impl Config {
     /// Compile every glob pattern in this config to surface syntax errors
     /// early. The compiled patterns are discarded — call sites recompile
     /// on demand, but the compilation is guaranteed to succeed after this.
-    fn validate_glob_patterns(&self) -> Result<()> {
+    pub fn validate_glob_patterns(&self) -> Result<()> {
         for pattern in self.exclude.iter().chain(self.allowed_file_patterns.iter()) {
             glob::Pattern::new(pattern).map_err(|e| Error::InvalidGlobPattern {
                 pattern: pattern.clone(),
@@ -254,6 +260,35 @@ impl Config {
             self.warnings_as_errors = true;
         }
     }
+}
+
+/// On Unix: `true` iff `dir` exists and its owner uid matches the
+/// current effective uid. Used by `Config::find_config_dir` to
+/// reject a `.git` ancestor that an attacker could plant in a
+/// shared parent (classic `/tmp` sticky-bit scenario). A directory
+/// we own — or that's owned by root in a system-managed location
+/// — passes; one owned by an arbitrary other user fails.
+///
+/// On Windows: always `true` because ownership semantics differ
+/// (ACL-based, no simple uid comparison). The same attack would
+/// need a Windows-specific guard; not implemented yet.
+#[cfg(unix)]
+fn anchor_dir_is_trusted(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(dir) {
+        Ok(meta) => {
+            // SAFETY: `geteuid` is a libc call with no preconditions.
+            let euid = unsafe { libc::geteuid() };
+            let group_or_other_writable = meta.mode() & 0o022 != 0;
+            !group_or_other_writable && (meta.uid() == euid || meta.uid() == 0)
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn anchor_dir_is_trusted(_dir: &Path) -> bool {
+    true
 }
 
 /// pyproject.toml structure.
@@ -707,5 +742,46 @@ exclude = ["**/test_migrations/**", "**/fixtures/**"]
         assert!(config.select.is_empty());
         assert!(config.ignore.is_empty());
         assert!(config.exclude.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_anchor_dir_is_trusted_accepts_self_owned_dir() {
+        // Sanity check: a directory we own — the temp dir we
+        // just created — is trusted. Without this, the trust
+        // check would reject every legitimate `.git` ancestor in
+        // a normal user checkout, breaking the walk-up entirely.
+        let temp = TempDir::new().unwrap();
+        assert!(
+            anchor_dir_is_trusted(temp.path()),
+            "a self-created tempdir should be trusted by the uid check",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_anchor_dir_is_trusted_rejects_nonexistent() {
+        // A nonexistent path can't be trusted — defensive false
+        // is correct (the walk-up keeps probing parents until it
+        // finds a trusted anchor or runs out).
+        let temp = TempDir::new().unwrap();
+        let missing = temp.path().join("does-not-exist");
+        assert!(!anchor_dir_is_trusted(&missing));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_anchor_dir_is_trusted_rejects_world_writable_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("shared");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+        assert!(
+            !anchor_dir_is_trusted(&dir),
+            "world-writable anchors must not authorize config walk-up",
+        );
     }
 }

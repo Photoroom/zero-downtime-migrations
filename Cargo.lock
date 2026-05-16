@@ -1614,6 +1614,7 @@ dependencies = [
  "git2",
  "glob",
  "insta",
+ "libc",
  "miette",
  "once_cell",
  "predicates",
