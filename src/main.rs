@@ -249,7 +249,9 @@ fn discover_migrations(
         } else {
             let patterns: Vec<glob::Pattern> = exclude_patterns
                 .iter()
-                .filter_map(|p| glob::Pattern::new(p).ok())
+                .map(|p| {
+                    glob::Pattern::new(p).expect("exclude patterns are validated at config load")
+                })
                 .collect();
             Ok(migrations
                 .into_iter()
@@ -268,7 +270,7 @@ fn discover_migrations(
         // Compile exclude patterns once
         let patterns: Vec<glob::Pattern> = exclude_patterns
             .iter()
-            .filter_map(|p| glob::Pattern::new(p).ok())
+            .map(|p| glob::Pattern::new(p).expect("exclude patterns are validated at config load"))
             .collect();
 
         for path in paths {

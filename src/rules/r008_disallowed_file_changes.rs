@@ -50,7 +50,7 @@ impl ChangesetRule for R008DisallowedFileChanges {
             .config
             .allowed_file_patterns
             .iter()
-            .filter_map(|p| Pattern::new(p).ok())
+            .map(|p| Pattern::new(p).expect("allowed_file_patterns are validated at config load"))
             .collect();
 
         for file in other_changed_files {

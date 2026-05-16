@@ -19,11 +19,18 @@ pub fn discover_migrations_with_exclude(
 ) -> Result<Vec<PathBuf>> {
     let mut migrations = Vec::new();
 
-    // Compile exclude patterns
+    // Compile exclude patterns here rather than assuming they came
+    // from `Config`: this is a public function and callers may pass
+    // patterns directly.
     let patterns: Vec<Pattern> = exclude_patterns
         .iter()
-        .filter_map(|p| Pattern::new(p).ok())
-        .collect();
+        .map(|p| {
+            Pattern::new(p).map_err(|e| Error::InvalidGlobPattern {
+                pattern: p.clone(),
+                message: e.to_string(),
+            })
+        })
+        .collect::<Result<_>>()?;
 
     for path in paths {
         if path.is_file() {
@@ -277,6 +284,19 @@ mod tests {
         // None should be from app1
         for m in &migrations {
             assert!(!m.to_string_lossy().contains("app1"));
+        }
+    }
+
+    #[test]
+    fn test_discover_invalid_exclude_pattern_errors() {
+        let temp = TempDir::new().unwrap();
+        let err =
+            discover_migrations_with_exclude(&[temp.path().to_path_buf()], &["[".to_string()])
+                .unwrap_err();
+
+        match err {
+            Error::InvalidGlobPattern { pattern, .. } => assert_eq!(pattern, "["),
+            other => panic!("expected InvalidGlobPattern, got {other:?}"),
         }
     }
 
