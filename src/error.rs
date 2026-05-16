@@ -1,15 +1,9 @@
 //! Error types for zero-downtime-migrations.
 //!
-//! This module defines a unified error type that covers all failure modes:
-//! - File I/O errors
-//! - Parse errors (tree-sitter)
-//! - Configuration errors
-//! - Git errors
-//!
-//! The error recovery strategy is:
-//! - Continue on single file parse failure (report error, skip file)
-//! - Abort on config parse failure (cannot proceed without config)
-//! - Continue on git errors in non-diff mode (fall back to linting all files)
+//! Covers file I/O, tree-sitter parsing, configuration loading, and the
+//! git diff layer. Failures bubble through `Result<T>`; individual call
+//! sites decide whether to abort (config parse) or skip-and-continue
+//! (per-file parse — handled in `main.rs::run`).
 
 use std::path::PathBuf;
 
@@ -69,14 +63,6 @@ pub enum Error {
         column: usize,
     },
 
-    /// Configuration file not found
-    #[error("Configuration file not found: {path}")]
-    #[diagnostic(
-        code(zdm::config::not_found),
-        help("Create a pyproject.toml with [tool.zdm] or zero-downtime-migrations.toml")
-    )]
-    ConfigNotFound { path: PathBuf },
-
     /// Configuration parse error
     #[error("Failed to parse configuration: {path}")]
     #[diagnostic(code(zdm::config::parse_error))]
@@ -85,11 +71,6 @@ pub enum Error {
         #[source]
         source: toml::de::Error,
     },
-
-    /// Invalid configuration value
-    #[error("Invalid configuration value for '{key}': {message}")]
-    #[diagnostic(code(zdm::config::invalid_value))]
-    ConfigInvalidValue { key: String, message: String },
 
     /// Git error
     #[error("Git error: {message}")]
@@ -100,15 +81,9 @@ pub enum Error {
         source: Option<git2::Error>,
     },
 
-    /// Git repository not found
-    #[error("Not a git repository: {path}")]
-    #[diagnostic(
-        code(zdm::git::not_repo),
-        help("The --diff flag requires a git repository")
-    )]
-    NotAGitRepository { path: PathBuf },
-
-    /// Invalid git reference
+    /// Invalid git reference. Currently has no producer; reserved for the
+    /// upcoming refinement that distinguishes "ref does not exist" from
+    /// generic git failures in `GitRepo::tree_at`.
     #[error("Invalid git reference: {reference}")]
     #[diagnostic(
         code(zdm::git::invalid_ref),
@@ -128,11 +103,6 @@ pub enum Error {
     #[error("Invalid path: {path}")]
     #[diagnostic(code(zdm::io::invalid_path))]
     InvalidPath { path: PathBuf },
-
-    /// Multiple errors collected
-    #[error("Multiple errors occurred ({count} errors)")]
-    #[diagnostic(code(zdm::multiple_errors))]
-    Multiple { count: usize, errors: Vec<Error> },
 }
 
 impl Error {
@@ -186,15 +156,7 @@ impl Error {
         }
     }
 
-    /// Create a git error.
-    pub fn git_error(message: impl Into<String>, source: git2::Error) -> Self {
-        Self::GitError {
-            message: message.into(),
-            source: Some(source),
-        }
-    }
-
-    /// Create a git error without a source.
+    /// Create a git error without a wrapped source.
     pub fn git_error_msg(message: impl Into<String>) -> Self {
         Self::GitError {
             message: message.into(),
@@ -228,96 +190,5 @@ impl Error {
     /// Create a path not found error.
     pub fn path_not_found(path: impl Into<PathBuf>) -> Self {
         Self::InvalidPath { path: path.into() }
-    }
-
-    /// Returns true if this error is recoverable (we can continue processing other files).
-    pub fn is_recoverable(&self) -> bool {
-        match self {
-            // File-level errors are recoverable - skip the file and continue
-            Self::FileRead { .. } => true,
-            Self::FileTooLarge { .. } => true,
-            Self::ParseError { .. } => true,
-            Self::ParseErrorWithLocation { .. } => true,
-            Self::DirectoryWalk { .. } => true,
-
-            // Config errors are not recoverable - we can't proceed without config
-            Self::ConfigNotFound { .. } => false,
-            Self::ConfigParseError { .. } => false,
-            Self::ConfigInvalidValue { .. } => false,
-
-            // Git errors are recoverable in non-diff mode
-            Self::GitError { .. } => true,
-            Self::NotAGitRepository { .. } => true,
-            Self::InvalidGitReference { .. } => false,
-
-            // Rule errors depend on context
-            Self::UnknownRule { .. } => false,
-
-            // Path errors are recoverable
-            Self::InvalidPath { .. } => true,
-
-            // Multiple errors - check if all are recoverable
-            Self::Multiple { errors, .. } => errors.iter().all(|e| e.is_recoverable()),
-        }
-    }
-}
-
-/// Collector for accumulating errors during processing.
-///
-/// This allows us to continue processing files even when some fail,
-/// collecting all errors for a final report.
-#[derive(Debug, Default)]
-pub struct ErrorCollector {
-    errors: Vec<Error>,
-}
-
-impl ErrorCollector {
-    /// Create a new error collector.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add an error to the collector.
-    pub fn push(&mut self, error: Error) {
-        self.errors.push(error);
-    }
-
-    /// Returns true if any errors have been collected.
-    pub fn has_errors(&self) -> bool {
-        !self.errors.is_empty()
-    }
-
-    /// Returns the number of errors collected.
-    pub fn len(&self) -> usize {
-        self.errors.len()
-    }
-
-    /// Returns true if no errors have been collected.
-    pub fn is_empty(&self) -> bool {
-        self.errors.is_empty()
-    }
-
-    /// Convert into a single error (Multiple) or Ok if no errors.
-    pub fn into_result(self) -> Result<()> {
-        if self.errors.is_empty() {
-            Ok(())
-        } else if self.errors.len() == 1 {
-            Err(self.errors.into_iter().next().unwrap())
-        } else {
-            Err(Error::Multiple {
-                count: self.errors.len(),
-                errors: self.errors,
-            })
-        }
-    }
-
-    /// Get an iterator over collected errors.
-    pub fn iter(&self) -> impl Iterator<Item = &Error> {
-        self.errors.iter()
-    }
-
-    /// Check if any non-recoverable errors have been collected.
-    pub fn has_fatal_errors(&self) -> bool {
-        self.errors.iter().any(|e| !e.is_recoverable())
     }
 }
