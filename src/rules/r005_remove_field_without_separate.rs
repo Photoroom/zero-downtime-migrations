@@ -4,7 +4,7 @@
 //! Directly removing a field can cause errors if the application still
 //! references the column.
 
-use crate::ast::{Migration, OperationType};
+use crate::ast::{Migration, ModelOperation, OperationData, OperationType};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::rules::{Rule, RuleContext};
 
@@ -31,14 +31,41 @@ impl Rule for R005RemoveFieldWithoutSeparate {
     }
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
+        // R005's concern is *deployment* safety: a freshly-deployed app
+        // still references the column, and a direct DROP COLUMN causes
+        // missing-column errors on every read. That risk only applies
+        // to columns the app already knows about.
+        //
+        // If a model is created earlier in the *same* migration, the
+        // app couldn't possibly have referenced it before this migration
+        // ran (the field never existed in any prior deployed schema),
+        // so the SDaS wrap is overkill. Exempt those — same order-aware
+        // walk shape as R001/R002/R006/R010/R016/R017.
+        //
+        // Note on extraction: top-level RemoveFields wrapped inside
+        // SeparateDatabaseAndState are *not* surfaced as top-level ops
+        // by the extractor (they live under
+        // `OperationData::SeparateDatabaseAndState`), so any RemoveField
+        // we see here is by definition not wrapped.
         let mut diagnostics = Vec::new();
+        let mut created_so_far: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for op in &migration.operations {
+            if op.op_type == OperationType::CreateModel {
+                if let OperationData::Model(ModelOperation { name, .. }) = &op.data {
+                    created_so_far.insert(name.to_lowercase());
+                }
+                continue;
+            }
+            if op.op_type != OperationType::RemoveField {
+                continue;
+            }
+            if let OperationData::Field(data) = &op.data {
+                if created_so_far.contains(&data.model_name.to_lowercase()) {
+                    continue;
+                }
+            }
 
-        // Note: We only extract top-level operations. If a RemoveField is properly
-        // wrapped inside SeparateDatabaseAndState, it won't be extracted as a
-        // separate operation. Therefore, any RemoveField we see here is NOT wrapped
-        // and should be flagged.
-
-        for op in migration.operations_of_type(OperationType::RemoveField) {
             diagnostics.push(Diagnostic {
                 rule_id: self.id(),
                 rule_name: self.name(),
@@ -153,6 +180,71 @@ class Migration(migrations.Migration):
     fn test_mixed_separate_and_direct_remove_flags_direct() {
         // Having SeparateDatabaseAndState should NOT exempt a direct RemoveField
         let diagnostics = check_migration(MIXED_SEPARATE_AND_DIRECT_REMOVE_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R005");
+    }
+
+    const CREATEMODEL_BEFORE_REMOVEFIELD_GOOD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.CreateModel(
+            name='Product',
+            fields=[
+                ('id', models.AutoField(primary_key=True)),
+                ('legacy', models.CharField(max_length=50)),
+            ],
+        ),
+        migrations.RemoveField(
+            model_name='product',
+            name='legacy',
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_createmodel_before_removefield_is_exempted() {
+        // A RemoveField on a model created earlier in the same migration
+        // is safe: the app never had a chance to reference the column
+        // (it never existed in any deployed schema), so the SDaS wrap
+        // is overkill.
+        let diagnostics = check_migration(CREATEMODEL_BEFORE_REMOVEFIELD_GOOD);
+        assert!(
+            diagnostics.is_empty(),
+            "RemoveField on a freshly-created model should not fire R005, got: {diagnostics:?}",
+        );
+    }
+
+    const REMOVEFIELD_BEFORE_CREATEMODEL_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RemoveField(
+            model_name='product',
+            name='legacy',
+        ),
+        migrations.CreateModel(
+            name='Product',
+            fields=[
+                ('id', models.AutoField(primary_key=True)),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_removefield_before_createmodel_is_not_exempted() {
+        // Symmetry pin for the order-aware fix above. A CreateModel
+        // that runs *after* the RemoveField cannot retroactively
+        // exempt — the RemoveField runs against whatever shape the
+        // model had before the migration.
+        let diagnostics = check_migration(REMOVEFIELD_BEFORE_CREATEMODEL_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R005");
     }
