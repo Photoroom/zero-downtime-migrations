@@ -30,16 +30,35 @@ impl Rule for R002UniqueConstraintWithoutIndex {
     }
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
+        // Walk operations in order so the CreateModel exemption only
+        // honors models that were actually created *before* the
+        // AddConstraint in this migration. The previous implementation
+        // used `migration.is_model_created`, which is order-blind: a
+        // CreateModel placed *after* the AddConstraint silently
+        // exempted, even though Django would execute the AddConstraint
+        // first and lock the (then non-empty? still missing?) target.
         let mut diagnostics = Vec::new();
+        let mut created_so_far: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
-        for op in migration.operations_of_type(OperationType::AddConstraint) {
-            if let OperationData::Constraint(data) = &op.data {
-                // Skip if model was created in same migration - no existing rows to lock
-                if migration.is_model_created(&data.model_name) {
-                    continue;
+        for op in &migration.operations {
+            match op.op_type {
+                OperationType::CreateModel => {
+                    if let OperationData::Model(m) = &op.data {
+                        created_so_far.insert(m.name.to_lowercase());
+                    }
                 }
+                OperationType::AddConstraint => {
+                    let OperationData::Constraint(data) = &op.data else {
+                        continue;
+                    };
+                    if data.constraint_type != ConstraintType::Unique {
+                        continue;
+                    }
+                    if created_so_far.contains(&data.model_name.to_lowercase()) {
+                        continue;
+                    }
 
-                if data.constraint_type == ConstraintType::Unique {
                     diagnostics.push(Diagnostic {
                         rule_id: self.id(),
                         rule_name: self.name(),
@@ -55,6 +74,7 @@ impl Rule for R002UniqueConstraintWithoutIndex {
                         ),
                     });
                 }
+                _ => {}
             }
         }
 
@@ -149,5 +169,38 @@ class Migration(migrations.Migration):
         // UniqueConstraint on a model created in same migration should be exempt
         let diagnostics = check_migration(CREATE_MODEL_WITH_UNIQUE_CONSTRAINT);
         assert!(diagnostics.is_empty());
+    }
+
+    const ADDCONSTRAINT_BEFORE_CREATEMODEL_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddConstraint(
+            model_name='product',
+            constraint=models.UniqueConstraint(fields=['sku'], name='unique_sku'),
+        ),
+        migrations.CreateModel(
+            name='Product',
+            fields=[
+                ('id', models.AutoField(primary_key=True)),
+                ('sku', models.CharField(max_length=50)),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_addconstraint_before_createmodel_is_not_exempted() {
+        // The previous order-blind `is_model_created` exemption silently
+        // passed this migration even though the AddConstraint executes
+        // *before* the CreateModel and therefore can't be exempted by a
+        // model that doesn't yet exist (or — if the model did exist in a
+        // prior migration — locks it with rows in it).
+        let diagnostics = check_migration(ADDCONSTRAINT_BEFORE_CREATEMODEL_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R002");
     }
 }
