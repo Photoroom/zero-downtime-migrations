@@ -214,7 +214,10 @@ fn run_rule_command(rule_id: &str) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    eprintln!("{}: Unknown rule: {}", "error".red().bold(), rule_id);
+    // No `eprintln!` here: returning the error propagates to `main()`,
+    // which renders it through the standard sanitized error path. The
+    // previous explicit print produced a duplicate "error: Unknown
+    // rule: X" line.
     Err(Error::unknown_rule(rule_id))
 }
 

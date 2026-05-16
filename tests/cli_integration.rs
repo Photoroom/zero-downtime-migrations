@@ -655,7 +655,14 @@ mod rule_command {
             .assert()
             .failure()
             .code(2)
-            .stderr(predicate::str::contains("Unknown rule"));
+            .stderr(predicate::str::contains("Unknown rule"))
+            // Pin the no-duplicate behaviour: the previous implementation
+            // printed "error: Unknown rule: R999" twice (once via an
+            // explicit `eprintln!` in `run_rule_command`, once via
+            // `main()`'s error sink).
+            .stderr(predicate::function(|s: &str| {
+                s.matches("Unknown rule").count() == 1
+            }));
     }
 }
 
