@@ -433,6 +433,9 @@ fn parse_and_check_file(
 
 fn output_diagnostics(diagnostics: &[Diagnostic], format: &OutputFormat) {
     if diagnostics.is_empty() {
+        if matches!(format, OutputFormat::Json) {
+            output_json(diagnostics);
+        }
         return;
     }
 

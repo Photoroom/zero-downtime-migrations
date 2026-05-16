@@ -354,26 +354,6 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn json_output_is_valid_json() {
-        let temp = setup_migrations(&[("0001_bad.py", BAD_MIGRATION)]);
-
-        let output = zdm()
-            .arg(temp.path())
-            .arg("--output-format")
-            .arg("json")
-            .assert()
-            .failure()
-            .get_output()
-            .stdout
-            .clone();
-
-        let json_str = String::from_utf8(output).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-
-        assert!(parsed.is_object() || parsed.is_array());
-    }
-
-    #[test]
     fn json_output_contains_required_fields() {
         let temp = setup_migrations(&[("0001_bad.py", BAD_MIGRATION)]);
 
@@ -388,28 +368,134 @@ class Migration(migrations.Migration):
             .clone();
 
         let json_str = String::from_utf8(output).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json_str).expect("output must be valid JSON");
 
-        // Should contain rule_id, message, path, severity
-        assert!(json_str.contains("\"rule_id\""));
-        assert!(json_str.contains("\"message\""));
-        assert!(json_str.contains("\"path\""));
-        assert!(json_str.contains("\"severity\""));
+        // Parse structurally rather than grepping the raw text: an
+        // accidental rename of `path` to `pathname` (or moving fields
+        // into a nested object) would otherwise still pass the old
+        // substring check.
+        let diagnostics = parsed
+            .get("diagnostics")
+            .and_then(|v| v.as_array())
+            .expect("top-level JSON must have a `diagnostics` array");
+        assert!(
+            !diagnostics.is_empty(),
+            "expected at least one diagnostic in the JSON output"
+        );
+        let diag = diagnostics[0]
+            .as_object()
+            .expect("each diagnostic must be a JSON object");
+        for field in [
+            "rule_id",
+            "rule_name",
+            "message",
+            "path",
+            "severity",
+            "line",
+        ] {
+            assert!(
+                diag.contains_key(field),
+                "diagnostic is missing required field `{field}`, got: {diag:?}",
+            );
+        }
+        assert_eq!(diag["rule_id"].as_str(), Some("R001"));
+        assert_eq!(diag["severity"].as_str(), Some("error"));
+        assert!(
+            diag["path"]
+                .as_str()
+                .is_some_and(|s| s.ends_with("0001_bad.py")),
+            "path should end with the fixture filename, got: {:?}",
+            diag["path"],
+        );
+
+        // The documented JSON shape also carries a `summary` object.
+        let summary = parsed
+            .get("summary")
+            .and_then(|v| v.as_object())
+            .expect("top-level JSON must include a `summary` object");
+        assert_eq!(summary["total"].as_u64(), Some(diagnostics.len() as u64));
+        assert!(summary["errors"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn json_output_for_clean_run_contains_empty_summary() {
+        let temp = setup_migrations(&[("0001_clean.py", CLEAN_MIGRATION)]);
+
+        let output = zdm()
+            .arg(temp.path())
+            .arg("--output-format")
+            .arg("json")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&output).expect("clean JSON output must be valid JSON");
+        assert_eq!(parsed["diagnostics"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["summary"]["total"].as_u64(), Some(0));
+        assert_eq!(parsed["summary"]["errors"].as_u64(), Some(0));
+        assert_eq!(parsed["summary"]["warnings"].as_u64(), Some(0));
     }
 
     #[test]
     fn compact_output_one_line_per_diagnostic() {
         let temp = setup_migrations(&[("0001_bad.py", BAD_MIGRATION)]);
 
-        zdm()
+        let output = zdm()
             .arg(temp.path())
             .arg("--output-format")
             .arg("compact")
             .assert()
             .failure()
-            // Compact format: `path:line: SEV: [RULE_ID rule-name] message`.
-            .stdout(predicate::str::contains(
-                "E: [R001 non-concurrent-add-index]",
-            ));
+            .get_output()
+            .stdout
+            .clone();
+        let text = String::from_utf8(output).unwrap();
+
+        // Compact format prints one `path:line: SEV: [RULE_ID
+        // rule-name] message` line per diagnostic, plus an indented
+        // `  help: ...` continuation line when the rule supplies help
+        // text. R001 supplies help, so we expect a diagnostic line +
+        // a help line — but no third line.
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected exactly two compact-format lines (diag + help), got {lines:#?}",
+        );
+        let diag_line = lines[0];
+        assert!(
+            diag_line.contains("0001_bad.py"),
+            "compact line should start with the path, got: {diag_line}",
+        );
+        assert!(
+            diag_line.contains("E: [R001 non-concurrent-add-index]"),
+            "compact line should carry SEV: [RULE rulename], got: {diag_line}",
+        );
+        // The first colon-separated field is the path; the second is
+        // a line number, not text.
+        let colon_idx = diag_line
+            .find(':')
+            .expect("compact line must include a colon");
+        let after_path = &diag_line[colon_idx + 1..];
+        let next_colon = after_path
+            .find(':')
+            .expect("compact line must have a `:line:` after the path");
+        let line_field = &after_path[..next_colon];
+        assert!(
+            line_field.parse::<usize>().is_ok(),
+            "expected a line-number field after the path, got: {line_field:?}",
+        );
+
+        // Help continuation is two-space indented and starts with `help:`.
+        assert!(
+            lines[1].starts_with("  help:"),
+            "help continuation must start with `  help:`, got: {}",
+            lines[1],
+        );
     }
 }
 
@@ -444,15 +530,34 @@ class Migration(migrations.Migration):
     fn select_only_runs_specified_rules() {
         let temp = setup_migrations(&[("0001_multi.py", MIGRATION_WITH_MULTIPLE_ISSUES)]);
 
-        // With --select R001, should only see R001, not R016
-        zdm()
+        // With --select R001, the JSON output should contain exactly
+        // one diagnostic (the R001 hit). The previous substring-only
+        // check would have missed a regression that added a third
+        // rule's diagnostic (e.g. R005) since "R016" is the only
+        // negative check.
+        let output = zdm()
             .arg(temp.path())
             .arg("--select")
             .arg("R001")
+            .arg("--output-format")
+            .arg("json")
             .assert()
             .failure()
-            .stdout(predicate::str::contains("R001"))
-            .stdout(predicate::str::contains("R016").not());
+            .get_output()
+            .stdout
+            .clone();
+        let json: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(output).unwrap()).unwrap();
+        let diags = json
+            .get("diagnostics")
+            .and_then(|v| v.as_array())
+            .expect("JSON output must include a `diagnostics` array");
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected exactly one diagnostic with --select R001, got: {diags:#?}",
+        );
+        assert_eq!(diags[0]["rule_id"].as_str(), Some("R001"));
     }
 
     #[test]
