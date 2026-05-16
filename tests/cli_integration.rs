@@ -174,7 +174,12 @@ class Migration(migrations.Migration):
 
     #[test]
     fn exit_0_when_no_migrations_found() {
+        // Plant `.git` so the config walk-up doesn't escape into
+        // the host's pyproject (the test would still pass either
+        // way because zero migrations always exits 0, but pinning
+        // the boundary matches every other CLI test in this file).
         let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join(".git")).unwrap();
 
         zdm().arg(temp.path()).assert().success().code(0);
     }
@@ -979,5 +984,32 @@ mod list_rules {
             // should reflect the current severity.
             .stdout(predicate::str::contains("R015"))
             .stdout(predicate::str::contains("Warning"));
+    }
+
+    #[test]
+    fn list_rules_includes_every_documented_rule() {
+        // Enumerate every rule ID the binary currently ships and
+        // assert each appears in the listing. Without this, a
+        // future contributor could add a rule and silently forget
+        // to wire it into whichever registry `--list-rules` walks
+        // (there are two: regular and changeset), and the broader
+        // spot-check above would still pass.
+        let expected_ids = [
+            "R001", "R002", "R003", "R004", "R005", "R006", "R008", "R009", "R010", "R011", "R012",
+            "R013", "R014", "R015", "R016", "R017",
+        ];
+        let output = zdm().arg("--list-rules").output().expect("zdm should run");
+        assert!(
+            output.status.success(),
+            "--list-rules should exit 0, got status {:?}",
+            output.status,
+        );
+        let stdout = String::from_utf8(output.stdout).expect("--list-rules output is UTF-8");
+        for id in expected_ids {
+            assert!(
+                stdout.contains(id),
+                "--list-rules output is missing rule {id}; got:\n{stdout}",
+            );
+        }
     }
 }

@@ -449,14 +449,16 @@ class Migration:
         // of valid code, then the `class Migration(... )` line that
         // is missing its colon (line 4 of the literal string, which
         // means the error node starts somewhere on or after line 4).
-        // Tree-sitter's error recovery can choose slightly different
-        // anchors (one line earlier when the missing token follows a
-        // continuation), so we accept lines 3 onward but reject a
-        // defaulted `line: 1`/`line: 2` — those would indicate the
-        // location wasn't extracted from the error node at all.
+        // The broken class header is line 4 of INVALID_PYTHON
+        // (1: empty leading newline, 2: import, 3: blank, 4: class
+        // header missing its colon). Tree-sitter's recovery anchors
+        // at the error node, which can't predate the broken header
+        // because lines 1-3 parse cleanly. Accepting line 3 (blank
+        // line, valid) or earlier would mean the location wasn't
+        // extracted from the error node at all.
         assert!(
-            (3..=INVALID_PYTHON.lines().count() + 1).contains(&line),
-            "error line {line} should fall on or after the broken class header",
+            (4..=INVALID_PYTHON.lines().count() + 1).contains(&line),
+            "error line {line} should fall on or after the broken class header (line 4)",
         );
     }
 

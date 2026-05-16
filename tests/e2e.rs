@@ -379,3 +379,69 @@ fn e2e_scan_directory_finds_all_issues() {
         "safe fixture should not be reported, got: {output_str}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn e2e_hostile_filename_with_newline_does_not_inject_fake_diagnostics() {
+    // Pin the end-to-end injection-defense the sanitizer split
+    // exists for: a migration filename containing a literal `\n`
+    // would otherwise produce stderr output like
+    //
+    //   error: <real msg> for path
+    //     --> /repo/app/migrations/legit.py:1
+    //     --> /etc/passwd:1
+    //     ...
+    //
+    // because every output sink interpolates the path. The
+    // sanitizer must escape the embedded `\n` so the injected
+    // line shows up as `\x0a` and the user sees one logical line.
+    use std::fs;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    // Plant `.git` so the config walk-up doesn't escape into the
+    // host's pyproject.
+    fs::create_dir_all(temp.path().join(".git")).unwrap();
+    let migrations_dir = temp.path().join("app").join("migrations");
+    fs::create_dir_all(&migrations_dir).unwrap();
+    fs::write(migrations_dir.join("__init__.py"), "").unwrap();
+
+    // Write content that will trigger R001 to ensure the path
+    // appears in a diagnostic.
+    let trigger = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(fields=['name'], name='product_name_idx'),
+        ),
+    ]
+"#;
+    let hostile_path = migrations_dir.join("0001_hostile\n  --> /etc/passwd:1\nfake.py");
+    let write_result = fs::write(&hostile_path, trigger);
+    if write_result.is_err() {
+        // Some filesystems (notably ZFS with utf8only=on) reject
+        // control characters in filenames. The test is meaningful
+        // only when the OS lets us create the hostile filename.
+        return;
+    }
+
+    let output = Command::cargo_bin("zdm")
+        .unwrap()
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("\\x0a"),
+        "expected literal `\\x0a` (escaped LF) in output to prove the hostile filename was sanitized, got:\n{stdout}",
+    );
+    assert!(
+        !stdout.contains("\n  --> /etc/passwd:1\n"),
+        "the injected `--> /etc/passwd:1` line must not appear unsanitized in output, got:\n{stdout}",
+    );
+}
