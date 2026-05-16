@@ -13,21 +13,55 @@ use crate::diagnostics::Span;
 use crate::error::Result;
 use crate::parser::ParsedMigration;
 
-/// Check if text contains a keyword assignment pattern, handling whitespace variations.
-/// e.g., matches both "null=True" and "null = True"
+/// Check if `text` contains a `keyword=value` assignment that sits at a
+/// keyword-argument boundary inside a call. Both `null=True` and
+/// `null = True` match, but `not_null=True` (no boundary before) and
+/// `null=Truthy` (no boundary after the value) do not.
 fn contains_keyword_assignment(text: &str, keyword: &str, value: &str) -> bool {
-    // Normalize whitespace: remove all spaces and check
-    let normalized = text.replace(' ', "");
-    let pattern = format!("{}={}", keyword, value);
-    normalized.contains(&pattern)
+    let normalized = strip_whitespace(text);
+    let value_bytes = value.as_bytes();
+    for after_eq in keyword_eq_positions(&normalized, keyword) {
+        if !normalized[after_eq..].starts_with(value_bytes) {
+            continue;
+        }
+        let next = normalized
+            .get(after_eq + value_bytes.len())
+            .copied()
+            .unwrap_or(b')');
+        if matches!(next, b',' | b')') {
+            return true;
+        }
+    }
+    false
 }
 
-/// Check if text contains a keyword assignment with any value.
-/// e.g., matches "default=", "default =", "default= ", "default = "
+/// Check if `text` contains `keyword=...` where `keyword` is a complete
+/// kwarg name (preceded by `(`, `,`, or start of text).
 fn contains_keyword_with_value(text: &str, keyword: &str) -> bool {
-    // Check if keyword appears followed by = (with optional whitespace)
-    let normalized = text.replace(' ', "");
-    normalized.contains(&format!("{}=", keyword))
+    let normalized = strip_whitespace(text);
+    !keyword_eq_positions(&normalized, keyword).is_empty()
+}
+
+/// Indices in `normalized` just after each `<keyword>=` whose keyword sits
+/// at a kwarg boundary (preceded by `(`, `,`, or start of text).
+fn keyword_eq_positions(normalized: &[u8], keyword: &str) -> Vec<usize> {
+    let kw_eq: Vec<u8> = keyword.bytes().chain(std::iter::once(b'=')).collect();
+    let mut hits = Vec::new();
+    for i in 0..normalized.len() {
+        if !normalized[i..].starts_with(&kw_eq) {
+            continue;
+        }
+        let prev = if i == 0 { b'(' } else { normalized[i - 1] };
+        if !matches!(prev, b'(' | b',') {
+            continue;
+        }
+        hits.push(i + kw_eq.len());
+    }
+    hits
+}
+
+fn strip_whitespace(text: &str) -> Vec<u8> {
+    text.bytes().filter(|b| !b.is_ascii_whitespace()).collect()
 }
 
 /// Extracts migration operations from a parsed Python file.
@@ -646,7 +680,7 @@ class Migration(migrations.Migration):
 
     #[test]
     fn test_contains_keyword_assignment() {
-        // Test the helper function directly
+        // Whitespace variants of the positive case.
         assert!(contains_keyword_assignment("null=True", "null", "True"));
         assert!(contains_keyword_assignment("null = True", "null", "True"));
         assert!(contains_keyword_assignment("null  =  True", "null", "True"));
@@ -655,9 +689,34 @@ class Migration(migrations.Migration):
             "null",
             "True"
         ));
+
+        // Wrong value.
         assert!(!contains_keyword_assignment("null=False", "null", "True"));
+
+        // Lookalike keywords. The old substring-only implementation matched
+        // these because, after stripping whitespace, "nullable=True" /
+        // "not_null=True" each contain the substring "null=True".
         assert!(!contains_keyword_assignment(
             "nullable=True",
+            "null",
+            "True"
+        ));
+        assert!(!contains_keyword_assignment(
+            "models.CharField(not_null=True)",
+            "null",
+            "True"
+        ));
+
+        // Lookalike values: "True" appearing as a prefix of "Truthy".
+        assert!(!contains_keyword_assignment(
+            "models.CharField(null=Truthy)",
+            "null",
+            "True"
+        ));
+
+        // Real usage with surrounding kwargs.
+        assert!(contains_keyword_assignment(
+            "models.CharField(max_length=50, null=True, default='x')",
             "null",
             "True"
         ));
@@ -669,6 +728,20 @@ class Migration(migrations.Migration):
         assert!(contains_keyword_with_value("default = 'foo'", "default"));
         assert!(contains_keyword_with_value("default=None", "default"));
         assert!(!contains_keyword_with_value("no_default_here", "default"));
+
+        // Lookalike keyword: "my_default=5" should not match the keyword
+        // "default" because `default` is not at a kwarg boundary.
+        assert!(!contains_keyword_with_value("my_default=5", "default"));
+        assert!(!contains_keyword_with_value(
+            "models.CharField(my_default=5)",
+            "default"
+        ));
+
+        // Real usage.
+        assert!(contains_keyword_with_value(
+            "models.CharField(max_length=50, default='x')",
+            "default"
+        ));
     }
 
     const FIELD_WITH_WHITESPACE_NULLABLE: &str = r#"
