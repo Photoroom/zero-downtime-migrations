@@ -3,7 +3,7 @@
 //! Detects RunSQL operations that contain CREATE INDEX without CONCURRENTLY.
 //! This pattern bypasses Django's concurrent operations and can cause table locks.
 
-use crate::ast::{Migration, OperationData, OperationType};
+use crate::ast::{strip_sql_noise, Migration, OperationData, OperationType};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::rules::{Rule, RuleContext};
 
@@ -33,12 +33,16 @@ impl Rule for R003RunSQLCreateIndex {
 
         for op in migration.operations_of_type(OperationType::RunSQL) {
             if let OperationData::RunSQL(data) = &op.data {
-                let sql_upper = data.sql.to_uppercase();
-
-                // Check for CREATE INDEX without CONCURRENTLY
-                if (sql_upper.contains("CREATE INDEX") || sql_upper.contains("CREATE UNIQUE INDEX"))
-                    && !sql_upper.contains("CONCURRENTLY")
-                {
+                // Strip comments and string literals from BOTH sides of
+                // the check. Without it, SQL like `"-- about CREATE INDEX
+                // ..."` false-positives on the CREATE INDEX side, AND
+                // SQL like `"-- We chose not to use CONCURRENTLY\n
+                // CREATE INDEX foo ON t (c);"` false-negatives because
+                // CONCURRENTLY is found in the comment. `contains_create_index`
+                // already noise-strips internally; re-strip here so the
+                // CONCURRENTLY check sees the same cleaned source.
+                let cleaned = strip_sql_noise(&data.sql).to_uppercase();
+                if data.contains_create_index() && !cleaned.contains("CONCURRENTLY") {
                     diagnostics.push(Diagnostic {
                         rule_id: self.id(),
                         rule_name: self.name(),
@@ -136,5 +140,72 @@ class Migration(migrations.Migration):
     fn test_runsql_other_good() {
         let diagnostics = check_migration(RUNSQL_OTHER_GOOD);
         assert!(diagnostics.is_empty());
+    }
+
+    const RUNSQL_CREATE_INDEX_IN_COMMENT_GOOD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL(
+            sql='-- CREATE INDEX was discussed and rejected\nUPDATE t SET c = 1;',
+        ),
+    ]
+"#;
+
+    const RUNSQL_CREATE_INDEX_IN_STRING_GOOD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL(
+            sql="INSERT INTO audit_log (message) VALUES ('CREATE INDEX rolled out');",
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_create_index_in_comment_does_not_fire() {
+        // R003 used to substring-match the raw SQL and false-positive on
+        // `-- CREATE INDEX` in a SQL comment. The fix routes through
+        // `RunSQLOperation::contains_create_index`, which strips comments.
+        let diagnostics = check_migration(RUNSQL_CREATE_INDEX_IN_COMMENT_GOOD);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_create_index_in_string_literal_does_not_fire() {
+        let diagnostics = check_migration(RUNSQL_CREATE_INDEX_IN_STRING_GOOD);
+        assert!(diagnostics.is_empty());
+    }
+
+    const RUNSQL_CONCURRENTLY_ONLY_IN_COMMENT_BAD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL(
+            sql="""-- We chose not to use CONCURRENTLY here
+                CREATE INDEX foo ON t (c);""",
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_concurrently_in_comment_does_not_hide_real_violation() {
+        // The CREATE INDEX side already noise-strips via
+        // `contains_create_index`. The CONCURRENTLY check must noise-strip
+        // too, otherwise a comment mentioning CONCURRENTLY (here,
+        // explaining why it wasn't used) hides a real non-concurrent
+        // CREATE INDEX statement.
+        let diagnostics = check_migration(RUNSQL_CONCURRENTLY_ONLY_IN_COMMENT_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R003");
     }
 }

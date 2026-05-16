@@ -7,6 +7,7 @@ pub mod extractor;
 mod operations;
 
 pub use extractor::MigrationExtractor;
+pub(crate) use operations::strip_sql_noise;
 pub use operations::*;
 
 use std::path::PathBuf;

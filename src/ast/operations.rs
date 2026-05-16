@@ -224,15 +224,153 @@ pub struct RunSQLOperation {
 }
 
 impl RunSQLOperation {
-    /// Check if the SQL contains CREATE INDEX.
+    /// Check if the SQL contains a `CREATE INDEX` or `CREATE UNIQUE INDEX`
+    /// statement. Comments (`-- ...`, `/* ... */`) and single-quoted string
+    /// literals are stripped before the substring search so SQL like
+    /// `"-- about CREATE INDEX"` or `"'CREATE INDEX'"` does not match.
     pub fn contains_create_index(&self) -> bool {
-        let sql_upper = self.sql.to_uppercase();
-        sql_upper.contains("CREATE INDEX") || sql_upper.contains("CREATE UNIQUE INDEX")
+        let stripped = strip_sql_noise(&self.sql).to_uppercase();
+        stripped.contains("CREATE INDEX") || stripped.contains("CREATE UNIQUE INDEX")
     }
 
-    /// Check if the SQL contains DROP INDEX.
+    /// Check if the SQL contains a `DROP INDEX` statement, ignoring
+    /// comments and string literals.
     pub fn contains_drop_index(&self) -> bool {
-        self.sql.to_uppercase().contains("DROP INDEX")
+        strip_sql_noise(&self.sql)
+            .to_uppercase()
+            .contains("DROP INDEX")
+    }
+}
+
+/// Remove SQL line comments (`-- ...` to end of line), block comments
+/// (`/* ... */`), and single-quoted string contents. Stripped spans
+/// are replaced by a single space so adjacent identifiers don't
+/// accidentally merge.
+///
+/// Known gaps (rare in Django migrations, accepted for simplicity):
+/// - PostgreSQL dollar-quoted strings (`$tag$ ... $tag$`) pass through
+///   unchanged — false-*positive* bias if they contain CREATE/DROP
+///   INDEX as plain text.
+/// - An unterminated single-quoted string is consumed to end-of-input —
+///   false-*negative* bias for whatever followed, but real SQL with
+///   unterminated quotes won't execute anyway.
+/// - Nested block comments (a PostgreSQL extension) only strip up to
+///   the first `*/`.
+/// - Double-quoted identifiers (`"CREATE INDEX"` as an identifier name)
+///   are not stripped, so a literal identifier containing the phrase
+///   will false-positive.
+pub(crate) fn strip_sql_noise(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '-' if chars.peek() == Some(&'-') => {
+                chars.next();
+                for nc in chars.by_ref() {
+                    if nc == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                while let Some(nc) = chars.next() {
+                    if nc == '*' && chars.peek() == Some(&'/') {
+                        chars.next();
+                        break;
+                    }
+                }
+                // Replace with a space so tokens like `CREATE/*x*/INDEX`
+                // don't accidentally merge into `CREATEINDEX` and slip
+                // past the substring check.
+                out.push(' ');
+            }
+            '\'' => {
+                out.push(' ');
+                while let Some(nc) = chars.next() {
+                    if nc == '\'' {
+                        // Doubled '' is an escaped single quote, stay in string.
+                        if chars.peek() == Some(&'\'') {
+                            chars.next();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn op(sql: &str) -> RunSQLOperation {
+        RunSQLOperation {
+            sql: sql.to_string(),
+            reverse_sql: None,
+        }
+    }
+
+    #[test]
+    fn create_index_in_line_comment_is_ignored() {
+        assert!(!op("-- CREATE INDEX foo ON t (c);\nUPDATE t SET c = 1;").contains_create_index());
+    }
+
+    #[test]
+    fn create_index_in_block_comment_is_ignored() {
+        assert!(!op("/* CREATE INDEX foo */ UPDATE t SET c = 1;").contains_create_index());
+    }
+
+    #[test]
+    fn create_index_in_string_literal_is_ignored() {
+        assert!(
+            !op("INSERT INTO log (msg) VALUES ('CREATE INDEX in audit');").contains_create_index()
+        );
+    }
+
+    #[test]
+    fn real_create_index_still_matches() {
+        assert!(op("CREATE INDEX foo ON t (c);").contains_create_index());
+        assert!(op("create unique index foo ON t (c);").contains_create_index());
+    }
+
+    #[test]
+    fn block_comment_between_tokens_still_matches() {
+        // A block comment dropped without separator would merge tokens and
+        // hide the CREATE INDEX statement from the substring check.
+        assert!(op("CREATE/*x*/INDEX foo ON t (c);").contains_create_index());
+    }
+
+    #[test]
+    fn drop_index_in_comment_is_ignored() {
+        assert!(!op("-- DROP INDEX foo\n").contains_drop_index());
+        assert!(!op("/* DROP INDEX foo */").contains_drop_index());
+    }
+
+    #[test]
+    fn drop_index_real_matches() {
+        assert!(op("DROP INDEX foo;").contains_drop_index());
+    }
+
+    #[test]
+    fn escaped_quote_keeps_string_intact() {
+        // '' inside a string is a literal apostrophe; the CREATE INDEX is
+        // still inside the string and should not match.
+        assert!(
+            !op("INSERT INTO t (s) VALUES ('isn''t CREATE INDEX okay');").contains_create_index()
+        );
+    }
+
+    #[test]
+    fn unterminated_string_is_consumed_to_end() {
+        // Pathological input: the unterminated string runs to end of input
+        // so nothing past it can match. Better than misparsing and matching.
+        assert!(!op("INSERT INTO t VALUES ('CREATE INDEX").contains_create_index());
     }
 }
 
