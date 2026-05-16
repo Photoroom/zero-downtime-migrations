@@ -406,7 +406,10 @@ class Migration(migrations.Migration):
             .arg("compact")
             .assert()
             .failure()
-            .stdout(predicate::str::contains("E: R001"));
+            // Compact format: `path:line: SEV: [RULE_ID rule-name] message`.
+            .stdout(predicate::str::contains(
+                "E: [R001 non-concurrent-add-index]",
+            ));
     }
 }
 

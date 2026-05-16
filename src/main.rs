@@ -363,10 +363,11 @@ fn output_default(diagnostics: &[Diagnostic]) {
         };
 
         println!(
-            "{}: {} [{}]",
+            "{}: {} [{} {}]",
             severity_str,
             diag.message,
-            diag.rule_id.cyan()
+            diag.rule_id.cyan(),
+            diag.rule_name.cyan(),
         );
         println!(
             "  {} {}:{}",
@@ -496,12 +497,16 @@ fn output_compact(diagnostics: &[Diagnostic]) {
             Severity::Warning => "W",
         };
         println!(
-            "{}:{}: {}: {} [{}]",
+            "{}:{}: {}: [{} {}] {}",
             diag.path.display(),
             diag.span.start_line,
             severity_char,
             diag.rule_id,
-            diag.message
+            diag.rule_name,
+            diag.message,
         );
+        if let Some(help) = &diag.help {
+            println!("  help: {}", help);
+        }
     }
 }
