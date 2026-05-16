@@ -74,8 +74,7 @@ zdm --warnings-as-errors .
 | R003 | runsql-create-index | Error | Use `AddIndexConcurrently` instead of raw SQL `CREATE INDEX` |
 | R004 | missing-atomic-false | Error | Non-atomic migrations require `atomic = False` |
 | R005 | remove-field-without-separate | Error | Use `SeparateDatabaseAndState` to remove fields safely |
-| R006 | add-field-foreign-key | Warning | Adding FK creates index and validates constraint |
-| R007 | fk-without-concurrent-index | Error | Foreign keys should have a concurrent index |
+| R006 | add-field-foreign-key | Error | Adding FK creates index and validates constraint (merged R007) |
 | R008 | disallowed-file-changes | Error | Don't change app code alongside migrations |
 | R009 | separate-db-state-same-pr | Error | Don't deploy both steps of `SeparateDatabaseAndState` together |
 | R010 | add-field-not-null | Error | Adding NOT NULL field without default rewrites table |
@@ -89,7 +88,9 @@ zdm --warnings-as-errors .
 
 ### CreateModel Exemption
 
-Several rules (R001, R002, R006, R007, R010, R017) automatically exempt operations that target models created in the same migration. This is because operations on newly created (empty) tables don't cause the locking issues these rules detect.
+Several rules (R001, R002, R006, R010, R017) automatically exempt operations that target models created in the same migration. This is because operations on newly created (empty) tables don't cause the locking issues these rules detect.
+
+> **Note:** R007 (`fk-without-concurrent-index`) was merged into R006 and retired. Its concern — that an FK on an existing table should be preceded by `AddIndexConcurrently` — is now part of R006's check, including the order-aware exemption (a concurrent index later in the same migration does not protect the FK).
 
 For example, this migration will NOT trigger R001:
 
@@ -177,7 +178,7 @@ pre-commit is validating, rather than the previous `HEAD` commit.
 | **Requires Django installed** | No | Yes | Yes |
 | **Requires project setup** | No | Yes (settings.py) | Yes (full environment) |
 | **Checks for missing migrations** | No | No | Yes |
-| **Checks for unsafe operations** | Yes (17 rules) | Yes (~8 rules) | No |
+| **Checks for unsafe operations** | Yes (16 rules) | Yes (~8 rules) | No |
 | **Can run without database** | Yes | Yes | No |
 | **Language** | Rust | Python | Python |
 

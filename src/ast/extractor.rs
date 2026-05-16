@@ -249,7 +249,7 @@ impl<'a> MigrationExtractor<'a> {
                                 field_type,
                                 is_nullable,
                                 has_default,
-                                // FK target extraction not implemented: R006/R007 only need to know
+                                // FK target extraction not implemented: R006 only needs to know
                                 // a field is a ForeignKey, not which model it references.
                                 references: None,
                                 raw_text,

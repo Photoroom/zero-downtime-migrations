@@ -1,8 +1,10 @@
 //! Rule definitions and implementations.
 //!
 //! Rules are organized into two categories:
-//! - Per-file rules (R001-R007, R010-R017): Analyze individual migration files
+//! - Per-file rules (R001-R006, R010-R017): Analyze individual migration files
 //! - Changeset rules (R008-R009): Analyze sets of changed files in a PR
+//!
+//! R007 was merged into R006 and retired; the ID is intentionally skipped.
 //!
 //! Each rule implements either the `Rule` trait (per-file) or `ChangesetRule` trait.
 
@@ -12,7 +14,6 @@ mod r003_runsql_create_index;
 mod r004_missing_atomic_false;
 mod r005_remove_field_without_separate;
 mod r006_add_field_foreign_key;
-mod r007_fk_without_index;
 mod r008_disallowed_file_changes;
 mod r009_separate_db_state_same_pr;
 mod r010_add_field_not_null;
@@ -30,7 +31,6 @@ pub use r003_runsql_create_index::R003RunSQLCreateIndex;
 pub use r004_missing_atomic_false::R004MissingAtomicFalse;
 pub use r005_remove_field_without_separate::R005RemoveFieldWithoutSeparate;
 pub use r006_add_field_foreign_key::R006AddFieldForeignKey;
-pub use r007_fk_without_index::R007FKWithoutIndex;
 pub use r008_disallowed_file_changes::R008DisallowedFileChanges;
 pub use r009_separate_db_state_same_pr::R009SeparateDbStateSamePr;
 pub use r010_add_field_not_null::R010AddFieldNotNull;
@@ -124,7 +124,6 @@ impl RuleRegistry {
                 Box::new(R004MissingAtomicFalse),
                 Box::new(R005RemoveFieldWithoutSeparate),
                 Box::new(R006AddFieldForeignKey),
-                Box::new(R007FKWithoutIndex),
                 Box::new(R010AddFieldNotNull),
                 Box::new(R011RenameField),
                 Box::new(R012IrreversibleRunPython),
@@ -257,13 +256,15 @@ mod tests {
 
     #[test]
     fn test_registry_has_all_rules() {
+        // R007 was merged into R006 and retired; its ID is intentionally
+        // absent and must not be reused for a new rule.
         let registry = RuleRegistry::new();
         let ids: Vec<&str> = registry.rules().iter().map(|r| r.id()).collect();
         assert_eq!(
             ids,
             vec![
-                "R001", "R002", "R003", "R004", "R005", "R006", "R007", "R010", "R011", "R012",
-                "R013", "R014", "R015", "R016", "R017",
+                "R001", "R002", "R003", "R004", "R005", "R006", "R010", "R011", "R012", "R013",
+                "R014", "R015", "R016", "R017",
             ],
         );
     }

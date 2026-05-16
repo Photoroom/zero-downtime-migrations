@@ -41,7 +41,7 @@ impl Rule for R017NonConcurrentAddConstraint {
 
                 // CHECK constraints require a full table scan when added without NOT VALID.
                 // (Foreign keys are added via AddField, not AddConstraint, so they are
-                // covered by R006/R007 rather than here.)
+                // covered by R006 rather than here.)
                 if data.constraint_type == ConstraintType::Check {
                     diagnostics.push(Diagnostic {
                         rule_id: self.id(),
