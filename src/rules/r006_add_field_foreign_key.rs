@@ -41,16 +41,29 @@ impl Rule for R006AddFieldForeignKey {
         // Walk operations in order so the AddIndexConcurrently exemption is
         // only honored when the index appeared *before* the FK in this
         // migration — otherwise the FK would still acquire its lock before
-        // the index exists.
+        // the index exists. The exemption additionally requires the index
+        // to *lead with* the FK column: Postgres can use a btree's leading
+        // prefix for FK lookups/joins, but not a non-leading column, so
+        // an index on `(status, customer)` does nothing for an FK on
+        // `customer`. The previous heuristic exempted any index whose
+        // column set contained the FK column, which silently shipped that
+        // false negative.
         let mut diagnostics = Vec::new();
-        let mut indexed_concurrently: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut leading_columns: std::collections::HashMap<
+            String,
+            std::collections::HashSet<String>,
+        > = std::collections::HashMap::new();
 
         for op in &migration.operations {
             match op.op_type {
                 OperationType::AddIndexConcurrently => {
                     if let OperationData::Index(idx) = &op.data {
-                        indexed_concurrently.insert(idx.model_name.to_lowercase());
+                        if let Some(first) = idx.columns.first() {
+                            leading_columns
+                                .entry(idx.model_name.to_lowercase())
+                                .or_default()
+                                .insert(first.to_lowercase());
+                        }
                     }
                 }
                 OperationType::AddField => {
@@ -66,9 +79,19 @@ impl Rule for R006AddFieldForeignKey {
                     if migration.is_model_created(&data.model_name) {
                         continue;
                     }
-                    // Exempt if a concurrent index for the same model already
-                    // appeared earlier in this migration.
-                    if indexed_concurrently.contains(&data.model_name.to_lowercase()) {
+                    // Exempt if a concurrent index whose leading column
+                    // matches the FK already appeared earlier in this
+                    // migration. Django uses lowercase column names by
+                    // default, so the lookup is case-insensitive; we also
+                    // accept Django's auto-suffixed `<name>_id` form,
+                    // since FK columns in Postgres carry that suffix and
+                    // the user may have indexed either spelling.
+                    let model = data.model_name.to_lowercase();
+                    let field_name = data.field_name.to_lowercase();
+                    let fk_column = format!("{field_name}_id");
+                    if leading_columns.get(&model).is_some_and(|leads| {
+                        leads.contains(&field_name) || leads.contains(&fk_column)
+                    }) {
                         continue;
                     }
 
@@ -245,6 +268,220 @@ class Migration(migrations.Migration):
         // Pre-creating the concurrent index AFTER the AddField does not
         // protect against the lock; R006 must still fire.
         let diagnostics = check_migration(ADD_FK_BEFORE_CONCURRENT_INDEX_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R006");
+    }
+
+    const ADD_FK_AFTER_UNRELATED_CONCURRENT_INDEX_BAD: &str = r#"
+from django.db import migrations, models
+from django.contrib.postgres.operations import AddIndexConcurrently
+
+
+class Migration(migrations.Migration):
+    atomic = False
+
+    operations = [
+        AddIndexConcurrently(
+            model_name='order',
+            index=models.Index(fields=['status'], name='order_status_idx'),
+        ),
+        migrations.AddField(
+            model_name='order',
+            name='customer',
+            field=models.ForeignKey(on_delete=models.CASCADE, to='app.customer'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_add_fk_after_unrelated_concurrent_index_bad() {
+        // The previous heuristic exempted any FK on a model that had
+        // *any* prior concurrent index, even when the index column
+        // had nothing to do with the FK. R006 now requires the index
+        // to cover the FK column.
+        let diagnostics = check_migration(ADD_FK_AFTER_UNRELATED_CONCURRENT_INDEX_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R006");
+    }
+
+    const ADD_FK_AFTER_CONCURRENT_INDEX_ON_FK_ID_COLUMN_GOOD: &str = r#"
+from django.db import migrations, models
+from django.contrib.postgres.operations import AddIndexConcurrently
+
+
+class Migration(migrations.Migration):
+    atomic = False
+
+    operations = [
+        AddIndexConcurrently(
+            model_name='order',
+            index=models.Index(fields=['customer_id'], name='order_customer_id_idx'),
+        ),
+        migrations.AddField(
+            model_name='order',
+            name='customer',
+            field=models.ForeignKey(on_delete=models.CASCADE, to='app.customer'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_add_fk_after_concurrent_index_on_fk_id_column_good() {
+        // Postgres FK columns get a `<name>_id` suffix, so a user may
+        // index either `customer` (Django's field name) or
+        // `customer_id` (the actual SQL column). Both should exempt.
+        let diagnostics = check_migration(ADD_FK_AFTER_CONCURRENT_INDEX_ON_FK_ID_COLUMN_GOOD);
+        assert!(
+            diagnostics.is_empty(),
+            "expected no diagnostics, got: {diagnostics:?}",
+        );
+    }
+
+    const ADD_FK_AFTER_MULTI_COLUMN_INDEX_GOOD: &str = r#"
+from django.db import migrations, models
+from django.contrib.postgres.operations import AddIndexConcurrently
+
+
+class Migration(migrations.Migration):
+    atomic = False
+
+    operations = [
+        AddIndexConcurrently(
+            model_name='order',
+            index=models.Index(
+                fields=['customer', 'status'],
+                name='order_customer_status_idx',
+            ),
+        ),
+        migrations.AddField(
+            model_name='order',
+            name='customer',
+            field=models.ForeignKey(on_delete=models.CASCADE, to='app.customer'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_add_fk_after_multi_column_index_leading_with_fk_good() {
+        // A composite index on `(customer, status)` is usable for FK
+        // joins/lookups on `customer` because Postgres can use any
+        // leading-prefix of a btree.
+        let diagnostics = check_migration(ADD_FK_AFTER_MULTI_COLUMN_INDEX_GOOD);
+        assert!(
+            diagnostics.is_empty(),
+            "expected no diagnostics, got: {diagnostics:?}",
+        );
+    }
+
+    const ADD_FK_AFTER_MULTI_COLUMN_INDEX_TRAILING_FK_BAD: &str = r#"
+from django.db import migrations, models
+from django.contrib.postgres.operations import AddIndexConcurrently
+
+
+class Migration(migrations.Migration):
+    atomic = False
+
+    operations = [
+        AddIndexConcurrently(
+            model_name='order',
+            index=models.Index(
+                fields=['status', 'customer'],
+                name='order_status_customer_idx',
+            ),
+        ),
+        migrations.AddField(
+            model_name='order',
+            name='customer',
+            field=models.ForeignKey(on_delete=models.CASCADE, to='app.customer'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_add_fk_after_multi_column_index_trailing_with_fk_bad() {
+        // Postgres won't use `(status, customer)` for an FK lookup on
+        // `customer` — no usable leading prefix. The previous
+        // set-membership check would have exempted this; the
+        // leading-column check correctly flags it.
+        let diagnostics = check_migration(ADD_FK_AFTER_MULTI_COLUMN_INDEX_TRAILING_FK_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R006");
+    }
+
+    const TWO_FKS_ONLY_ONE_COVERED: &str = r#"
+from django.db import migrations, models
+from django.contrib.postgres.operations import AddIndexConcurrently
+
+
+class Migration(migrations.Migration):
+    atomic = False
+
+    operations = [
+        AddIndexConcurrently(
+            model_name='order',
+            index=models.Index(fields=['customer'], name='order_customer_idx'),
+        ),
+        migrations.AddField(
+            model_name='order',
+            name='customer',
+            field=models.ForeignKey(on_delete=models.CASCADE, to='app.customer'),
+        ),
+        migrations.AddField(
+            model_name='order',
+            name='product',
+            field=models.ForeignKey(on_delete=models.CASCADE, to='app.product'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_two_fks_only_one_covered_flags_uncovered() {
+        // Per-FK granularity: the `customer` FK is exempt because of
+        // the prior concurrent index, but the `product` FK has no
+        // matching index and must still be flagged.
+        let diagnostics = check_migration(TWO_FKS_ONLY_ONE_COVERED);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R006");
+        assert!(
+            diagnostics[0].message.contains("order"),
+            "diagnostic should be on the order model, got: {}",
+            diagnostics[0].message
+        );
+    }
+
+    const ADD_FK_WITH_DB_COLUMN_KNOWN_LIMITATION: &str = r#"
+from django.db import migrations, models
+from django.contrib.postgres.operations import AddIndexConcurrently
+
+
+class Migration(migrations.Migration):
+    atomic = False
+
+    operations = [
+        AddIndexConcurrently(
+            model_name='order',
+            index=models.Index(fields=['legacy_customer'], name='order_legacy_customer_idx'),
+        ),
+        migrations.AddField(
+            model_name='order',
+            name='customer',
+            field=models.ForeignKey(
+                on_delete=models.CASCADE, to='app.customer', db_column='legacy_customer',
+            ),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_add_fk_with_db_column_is_false_positive() {
+        // Known limitation: the extractor does not capture `db_column`,
+        // so an index on the real SQL column (`legacy_customer`)
+        // doesn't match the field name (`customer`) or its `_id`
+        // suffix. R006 currently flags this even though the user
+        // pre-built a covering index. Pinning the false-positive
+        // behavior so a future `db_column`-aware extractor forces a
+        // re-think instead of silently passing.
+        let diagnostics = check_migration(ADD_FK_WITH_DB_COLUMN_KNOWN_LIMITATION);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R006");
     }
