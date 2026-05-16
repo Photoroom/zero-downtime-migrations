@@ -153,6 +153,14 @@ class Migration(migrations.Migration):
 
     #[test]
     fn exit_1_when_warnings_as_errors() {
+        // Pin R012 in stdout so the test catches "warnings-as-
+        // errors promoted SOMETHING to error" rather than just
+        // "some error fired." Without this, a future bug that
+        // makes the fixture trip a different rule (e.g. R001 on
+        // an unrelated change) would still pass `.code(1)`
+        // without proving the warning-promotion path itself
+        // works. Mirrors `exit_0_when_only_warnings` which
+        // already pins R012.
         let temp = setup_migrations(&[("0001_warning.py", WARNING_ONLY_MIGRATION)]);
 
         zdm()
@@ -160,7 +168,8 @@ class Migration(migrations.Migration):
             .arg("--warnings-as-errors")
             .assert()
             .failure()
-            .code(1);
+            .code(1)
+            .stdout(predicate::str::contains("R012"));
     }
 
     #[test]
@@ -238,15 +247,30 @@ mod diff_mode {
 
     #[test]
     fn diff_staged_reads_index_content_not_worktree_content() {
+        // The original test was self-confirming: a bare
+        // `.success().code(0)` would pass if the diff-staged
+        // pipeline went dark (no files extracted, no rules run,
+        // no diagnostics emitted). Stage TWO files: one whose
+        // index-content is CLEAN but worktree-content is BAD
+        // (the subject — proves we read the index, not the
+        // worktree, so no diagnostic), and one whose
+        // index-content is BAD (the control — proves the
+        // pipeline is alive and would surface a real index
+        // violation). If the diff-staged plumbing silently
+        // emitted nothing, the control assertion would fail.
         let temp = setup_git_repo();
-        let migration_path = temp
-            .path()
-            .join("app")
-            .join("migrations")
-            .join("0001_initial.py");
-        fs::write(&migration_path, CLEAN_MIGRATION).unwrap();
+        let migrations_dir = temp.path().join("app").join("migrations");
+
+        // Subject: index = clean, worktree = bad. No diagnostic.
+        let subject_path = migrations_dir.join("0001_initial.py");
+        fs::write(&subject_path, CLEAN_MIGRATION).unwrap();
         git_stage(temp.path(), "app/migrations/0001_initial.py");
-        fs::write(&migration_path, BAD_MIGRATION_NON_CONCURRENT_INDEX).unwrap();
+        fs::write(&subject_path, BAD_MIGRATION_NON_CONCURRENT_INDEX).unwrap();
+
+        // Control: index = bad, worktree = bad (same file). Diagnostic.
+        let control_path = migrations_dir.join("0002_control_bad.py");
+        fs::write(&control_path, BAD_MIGRATION_NON_CONCURRENT_INDEX).unwrap();
+        git_stage(temp.path(), "app/migrations/0002_control_bad.py");
 
         zdm()
             .current_dir(temp.path())
@@ -254,9 +278,16 @@ mod diff_mode {
             .arg("origin/main")
             .arg("--select")
             .arg("R001")
+            .arg("--output-format")
+            .arg("compact")
             .assert()
-            .success()
-            .code(0);
+            .failure()
+            .code(1)
+            // The control fires: the diff plumbing is alive.
+            .stdout(predicate::str::contains("0002_control_bad.py"))
+            // The subject does not fire: we read the index, not
+            // the worktree, so the clean staged content wins.
+            .stdout(predicate::str::contains("0001_initial.py").not());
     }
 
     #[test]
@@ -347,6 +378,12 @@ mod diff_mode {
 
     #[test]
     fn r008_allows_basename_patterns() {
+        // This is currently the ONLY R008 coverage outside unit
+        // tests, and the bare `.success().code(0)` would pass if
+        // R008 silently stopped firing in diff mode entirely.
+        // Add a second changed file (`views.py`) that does NOT
+        // match the allowed-file-patterns — R008 must fire on it,
+        // proving the rule is alive on this branch.
         let temp = setup_git_repo();
 
         fs::write(
@@ -371,9 +408,12 @@ mod diff_mode {
 
         let model_dir = temp.path().join("backend").join("media");
         fs::create_dir_all(&model_dir).unwrap();
+        // Allowed: matches the `models.py` basename pattern.
         fs::write(model_dir.join("models.py"), "# model").unwrap();
+        // Not allowed: matches no pattern. R008 should fire on this.
+        fs::write(model_dir.join("views.py"), "# view").unwrap();
 
-        git_commit_all(temp.path(), "Add migration and model");
+        git_commit_all(temp.path(), "Add migration, model, and view");
 
         zdm()
             .current_dir(temp.path())
@@ -382,8 +422,13 @@ mod diff_mode {
             .arg("--select")
             .arg("R008")
             .assert()
-            .success()
-            .code(0);
+            .failure()
+            .code(1)
+            // The not-allowed file fires.
+            .stdout(predicate::str::contains("R008"))
+            .stdout(predicate::str::contains("views.py"))
+            // The allowed-basename file does not.
+            .stdout(predicate::str::contains("models.py").not());
     }
 }
 
@@ -1029,12 +1074,29 @@ mod list_rules {
         // where stdout contains all expected IDs PLUS a stale one
         // (e.g. a retired R007 line still printed alongside live
         // rules).
+        // Anchored shape: `R` followed by exactly three digits and
+        // then whitespace. Catches the "wrap" case where
+        // `--list-rules` later grows a multi-line format (e.g. an
+        // indented help line that happens to start with `Rule …`),
+        // which a `starts_with('R') && next-is-digit` filter would
+        // over-count.
         let printed_count = stdout
             .lines()
             .filter(|l| {
                 let trimmed = l.trim_start();
-                trimmed.starts_with('R')
-                    && trimmed.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+                let mut chars = trimmed.chars();
+                if chars.next() != Some('R') {
+                    return false;
+                }
+                let id_digits: String = chars.by_ref().take(3).collect();
+                if id_digits.len() != 3 || !id_digits.chars().all(|c| c.is_ascii_digit()) {
+                    return false;
+                }
+                // Next char after the 3-digit id must be whitespace
+                // (separating the ID column from the name/severity
+                // columns). This rejects accidental matches like
+                // "R001-something" in body text.
+                chars.next().is_some_and(char::is_whitespace)
             })
             .count();
         assert_eq!(

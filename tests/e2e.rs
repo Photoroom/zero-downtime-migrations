@@ -375,8 +375,23 @@ fn e2e_json_output_structure() {
 
 #[test]
 fn e2e_ignore_rule_skips_detection() {
+    // Self-confirming-pass risk: a bare `.success().code(0)`
+    // would pass if R001 silently stopped firing on this
+    // fixture (registry dark, op-extractor broken). Pair with
+    // a control invocation that proves R001 fires WITHOUT
+    // `--ignore`, so the test catches "rule stopped working"
+    // as well as "rule was incorrectly suppressed".
     let fixture = fixtures_dir().join("R001/fail_non_concurrent_add_index.py");
 
+    // Control: rule fires when not ignored.
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R001"));
+
+    // Subject: rule is suppressed when --ignore is set.
     zdm()
         .arg(&fixture)
         .arg("--ignore")
@@ -388,9 +403,23 @@ fn e2e_ignore_rule_skips_detection() {
 
 #[test]
 fn e2e_select_rule_only_checks_that_rule() {
+    // Same pass-only risk as e2e_ignore_rule_skips_detection.
+    // Pair with a control that proves --select R001 still fires
+    // on this fixture, so a silent registry regression can't
+    // pass the test by emitting nothing.
     let fixture = fixtures_dir().join("R001/fail_non_concurrent_add_index.py");
 
-    // With --select R002, R001 violations should not be reported
+    // Control: --select R001 fires.
+    zdm()
+        .arg(&fixture)
+        .arg("--select")
+        .arg("R001")
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R001"));
+
+    // Subject: --select R002 produces no diagnostic for this R001 fixture.
     zdm()
         .arg(&fixture)
         .arg("--select")
