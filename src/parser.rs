@@ -428,6 +428,37 @@ class Migration:
     }
 
     #[test]
+    fn test_parse_file_surfaces_parse_error_with_location() {
+        // `parse()` only flags errors via `has_errors()`; `parse_file`
+        // additionally raises them as `Error::ParseErrorWithLocation`
+        // so the CLI can render an actionable diagnostic. This path
+        // was previously untested — a refactor that silently swallowed
+        // the error would have shipped.
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(INVALID_PYTHON.as_bytes()).unwrap();
+        let path = file.path().to_path_buf();
+
+        let err = ParsedMigration::parse_file(&path).unwrap_err();
+        let (err_path, line) = match err {
+            Error::ParseErrorWithLocation { path, line, .. } => (path, line),
+            other => panic!("expected ParseErrorWithLocation, got: {other:?}"),
+        };
+        assert_eq!(err_path, path, "error should reference the file we parsed");
+        // INVALID_PYTHON starts with a leading newline, then 3 lines
+        // of valid code, then the `class Migration(... )` line that
+        // is missing its colon (line 4 of the literal string, which
+        // means the error node starts somewhere on or after line 4).
+        // We don't pin the exact line because tree-sitter recovery
+        // can choose between several reasonable error points; assert
+        // the line is at least non-zero and within the fixture.
+        assert!(
+            (1..=INVALID_PYTHON.lines().count() + 1).contains(&line),
+            "error line {line} should fall within the fixture",
+        );
+    }
+
+    #[test]
     fn test_node_text() {
         let parsed = ParsedMigration::parse(SIMPLE_MIGRATION).unwrap();
         let class_node = parsed.find_migration_class().unwrap();
