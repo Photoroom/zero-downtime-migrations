@@ -95,8 +95,10 @@ pub enum Error {
     )]
     InvalidGitReference { reference: String },
 
-    /// Unknown rule
-    #[error("Unknown rule: {rule_id}\n  available rules: {}", available.join(", "))]
+    /// Unknown rule. Format is single-line because the top-level
+    /// error sink runs the chain through `sanitize_single_line`,
+    /// which would otherwise escape an embedded `\n` into `\x0a`.
+    #[error("Unknown rule: {rule_id} (available rules: {})", available.join(", "))]
     #[diagnostic(
         code(zdm::rule::unknown),
         help("Run 'zdm rule <id>' to see documentation for a specific rule")

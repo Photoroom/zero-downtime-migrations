@@ -91,7 +91,8 @@ impl Rule for R015AlterFieldNotNull {
                                  2. ALTER TABLE ... VALIDATE CONSTRAINT <table>_<col>_not_null;  \
                                  -- table-scan without blocking writes\n  \
                                  3. ALTER TABLE ... ALTER COLUMN col SET NOT NULL;  \
-                                 -- catalog-only, no scan, because the validated CHECK proves no NULLs\n  \
+                                 -- PostgreSQL 12+: catalog-only, no scan, because the validated CHECK proves no NULLs. \
+                                 On 11 and earlier, SET NOT NULL still scans the table, defeating the four-step pattern.\n  \
                                  4. ALTER TABLE ... DROP CONSTRAINT <table>_<col>_not_null;  \
                                  -- recommended cleanup; the CHECK is subsumed by NOT NULL, \
                                  but keeping both forces every INSERT to re-evaluate the predicate"
