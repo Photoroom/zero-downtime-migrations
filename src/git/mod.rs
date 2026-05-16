@@ -25,6 +25,13 @@ pub enum FileStatus {
     Renamed,
 }
 
+/// Which subset of changed files a caller wants.
+#[derive(Debug, Clone, Copy)]
+enum ChangedKind {
+    Migrations,
+    NonMigrations,
+}
+
 /// A changed file in the git diff.
 #[derive(Debug, Clone)]
 pub struct ChangedFile {
@@ -70,87 +77,15 @@ impl GitRepo {
     /// - A commit SHA (e.g., "abc123")
     /// - A relative reference (e.g., "HEAD~1", "HEAD^")
     pub fn changed_files(&self, base_ref: &str) -> Result<Vec<ChangedFile>> {
-        // Resolve the base reference to a commit
-        let base_obj = self.repo.revparse_single(base_ref).map_err(|e| {
-            Error::git_error_msg(format!("Failed to resolve reference '{}': {}", base_ref, e))
-        })?;
-
-        let base_commit = base_obj.peel_to_commit().map_err(|e| {
-            Error::git_error_msg(format!(
-                "Reference '{}' does not point to a commit: {}",
-                base_ref, e
-            ))
-        })?;
-
-        let base_tree = base_commit.tree().map_err(|e| {
-            Error::git_error_msg(format!("Failed to get tree for base commit: {}", e))
-        })?;
-
-        // Get HEAD commit tree
-        let head_ref = self
-            .repo
-            .head()
-            .map_err(|e| Error::git_error_msg(format!("Failed to get HEAD: {}", e)))?;
-
-        let head_commit = head_ref
-            .peel_to_commit()
-            .map_err(|e| Error::git_error_msg(format!("Failed to get HEAD commit: {}", e)))?;
-
-        let head_tree = head_commit
-            .tree()
-            .map_err(|e| Error::git_error_msg(format!("Failed to get tree for HEAD: {}", e)))?;
-
-        // Compute diff
+        let base_tree = self.tree_at(base_ref)?;
+        let head_tree = self.head_tree()?;
         let mut diff_opts = DiffOptions::new();
         diff_opts.include_untracked(false);
-
         let diff = self
             .repo
             .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut diff_opts))
             .map_err(|e| Error::git_error_msg(format!("Failed to compute diff: {}", e)))?;
-
-        // Collect changed files
-        let mut files = Vec::new();
-        diff.foreach(
-            &mut |delta, _| {
-                let status = match delta.status() {
-                    git2::Delta::Added => FileStatus::Added,
-                    git2::Delta::Deleted => FileStatus::Deleted,
-                    git2::Delta::Modified => FileStatus::Modified,
-                    git2::Delta::Renamed => FileStatus::Renamed,
-                    git2::Delta::Copied => FileStatus::Added,
-                    _ => return true, // Skip other statuses
-                };
-
-                let path = delta
-                    .new_file()
-                    .path()
-                    .map(|p| p.to_path_buf())
-                    .or_else(|| delta.old_file().path().map(|p| p.to_path_buf()));
-
-                if let Some(path) = path {
-                    let old_path = if status == FileStatus::Renamed {
-                        delta.old_file().path().map(|p| p.to_path_buf())
-                    } else {
-                        None
-                    };
-
-                    files.push(ChangedFile {
-                        path,
-                        status,
-                        old_path,
-                    });
-                }
-
-                true
-            },
-            None,
-            None,
-            None,
-        )
-        .map_err(|e| Error::git_error_msg(format!("Failed to iterate diff: {}", e)))?;
-
-        Ok(files)
+        collect_changed_files(&diff)
     }
 
     /// Get staged files changed between a reference and the git index.
@@ -158,76 +93,48 @@ impl GitRepo {
     /// This is intended for pre-commit hooks, where HEAD still points at the
     /// previous commit and the commit being checked exists only in the index.
     pub fn changed_staged_files(&self, base_ref: &str) -> Result<Vec<ChangedFile>> {
-        // Resolve the base reference to a commit
+        let base_tree = self.tree_at(base_ref)?;
+        let index = self
+            .repo
+            .index()
+            .map_err(|e| Error::git_error_msg(format!("Failed to read git index: {}", e)))?;
+        let mut diff_opts = DiffOptions::new();
+        diff_opts.include_untracked(false);
+        let diff = self
+            .repo
+            .diff_tree_to_index(Some(&base_tree), Some(&index), Some(&mut diff_opts))
+            .map_err(|e| Error::git_error_msg(format!("Failed to compute staged diff: {}", e)))?;
+        collect_changed_files(&diff)
+    }
+
+    /// Resolve a reference to the tree at that commit.
+    fn tree_at(&self, base_ref: &str) -> Result<git2::Tree<'_>> {
         let base_obj = self.repo.revparse_single(base_ref).map_err(|e| {
             Error::git_error_msg(format!("Failed to resolve reference '{}': {}", base_ref, e))
         })?;
-
         let base_commit = base_obj.peel_to_commit().map_err(|e| {
             Error::git_error_msg(format!(
                 "Reference '{}' does not point to a commit: {}",
                 base_ref, e
             ))
         })?;
+        base_commit
+            .tree()
+            .map_err(|e| Error::git_error_msg(format!("Failed to get tree for base commit: {}", e)))
+    }
 
-        let base_tree = base_commit.tree().map_err(|e| {
-            Error::git_error_msg(format!("Failed to get tree for base commit: {}", e))
-        })?;
-
-        let index = self
+    /// Get the tree at HEAD.
+    fn head_tree(&self) -> Result<git2::Tree<'_>> {
+        let head_ref = self
             .repo
-            .index()
-            .map_err(|e| Error::git_error_msg(format!("Failed to read git index: {}", e)))?;
-
-        let mut diff_opts = DiffOptions::new();
-        diff_opts.include_untracked(false);
-
-        let diff = self
-            .repo
-            .diff_tree_to_index(Some(&base_tree), Some(&index), Some(&mut diff_opts))
-            .map_err(|e| Error::git_error_msg(format!("Failed to compute staged diff: {}", e)))?;
-
-        let mut files = Vec::new();
-        diff.foreach(
-            &mut |delta, _| {
-                let status = match delta.status() {
-                    git2::Delta::Added => FileStatus::Added,
-                    git2::Delta::Deleted => FileStatus::Deleted,
-                    git2::Delta::Modified => FileStatus::Modified,
-                    git2::Delta::Renamed => FileStatus::Renamed,
-                    git2::Delta::Copied => FileStatus::Added,
-                    _ => return true, // Skip other statuses
-                };
-
-                let path = delta
-                    .new_file()
-                    .path()
-                    .map(|p| p.to_path_buf())
-                    .or_else(|| delta.old_file().path().map(|p| p.to_path_buf()));
-
-                if let Some(path) = path {
-                    let old_path = if status == FileStatus::Renamed {
-                        delta.old_file().path().map(|p| p.to_path_buf())
-                    } else {
-                        None
-                    };
-
-                    files.push(ChangedFile {
-                        path,
-                        status,
-                        old_path,
-                    });
-                }
-
-                true
-            },
-            None,
-            None,
-            None,
-        )
-        .map_err(|e| Error::git_error_msg(format!("Failed to iterate staged diff: {}", e)))?;
-
-        Ok(files)
+            .head()
+            .map_err(|e| Error::git_error_msg(format!("Failed to get HEAD: {}", e)))?;
+        let head_commit = head_ref
+            .peel_to_commit()
+            .map_err(|e| Error::git_error_msg(format!("Failed to get HEAD commit: {}", e)))?;
+        head_commit
+            .tree()
+            .map_err(|e| Error::git_error_msg(format!("Failed to get tree for HEAD: {}", e)))
     }
 
     /// Read the staged contents of a file from the git index.
@@ -328,64 +235,43 @@ impl GitRepo {
         Ok(files)
     }
 
-    /// Filter changed files to only migration files.
-    pub fn changed_migrations(&self, base_ref: &str) -> Result<Vec<ChangedFile>> {
-        let files = self.changed_files(base_ref)?;
-        Ok(files
-            .into_iter()
-            .filter(|f| is_migration_path(&f.path))
-            .collect())
-    }
-
-    /// Filter staged changed files to only migration files.
-    pub fn changed_staged_migrations(&self, base_ref: &str) -> Result<Vec<ChangedFile>> {
-        let files = self.changed_staged_files(base_ref)?;
-        Ok(files
-            .into_iter()
-            .filter(|f| is_migration_path(&f.path))
-            .collect())
-    }
-
-    /// Get paths of all changed migration files (for compatibility with discovery).
+    /// Get paths of all changed migration files (absolute paths under
+    /// the repo root).
     pub fn changed_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
-        let root = self.root()?;
-        let migrations = self.changed_migrations(base_ref)?;
-        Ok(migrations
-            .into_iter()
-            .filter(|f| f.status != FileStatus::Deleted)
-            .map(|f| root.join(&f.path))
-            .collect())
+        self.paths_from(self.changed_files(base_ref)?, ChangedKind::Migrations)
     }
 
-    /// Get paths of all staged changed migration files (for compatibility with discovery).
+    /// Get paths of all staged changed migration files.
     pub fn changed_staged_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
-        let root = self.root()?;
-        let migrations = self.changed_staged_migrations(base_ref)?;
-        Ok(migrations
-            .into_iter()
-            .filter(|f| f.status != FileStatus::Deleted)
-            .map(|f| root.join(&f.path))
-            .collect())
+        self.paths_from(
+            self.changed_staged_files(base_ref)?,
+            ChangedKind::Migrations,
+        )
     }
 
     /// Get paths of all non-migration files changed in the diff.
     pub fn changed_non_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
-        let root = self.root()?;
-        let files = self.changed_files(base_ref)?;
-        Ok(files
-            .into_iter()
-            .filter(|f| !is_migration_path(&f.path) && f.status != FileStatus::Deleted)
-            .map(|f| root.join(&f.path))
-            .collect())
+        self.paths_from(self.changed_files(base_ref)?, ChangedKind::NonMigrations)
     }
 
     /// Get paths of all staged non-migration files changed in the diff.
     pub fn changed_staged_non_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
+        self.paths_from(
+            self.changed_staged_files(base_ref)?,
+            ChangedKind::NonMigrations,
+        )
+    }
+
+    /// Project a list of `ChangedFile`s into absolute paths, filtering
+    /// out deletions and selecting either migration or non-migration files
+    /// according to `kind`.
+    fn paths_from(&self, files: Vec<ChangedFile>, kind: ChangedKind) -> Result<Vec<PathBuf>> {
         let root = self.root()?;
-        let files = self.changed_staged_files(base_ref)?;
+        let want_migrations = matches!(kind, ChangedKind::Migrations);
         Ok(files
             .into_iter()
-            .filter(|f| !is_migration_path(&f.path) && f.status != FileStatus::Deleted)
+            .filter(|f| f.status != FileStatus::Deleted)
+            .filter(|f| is_migration_path(&f.path) == want_migrations)
             .map(|f| root.join(&f.path))
             .collect())
     }
@@ -407,6 +293,49 @@ impl GitRepo {
             .ok()
             .and_then(|r| r.shorthand().map(String::from))
     }
+}
+
+/// Iterate a `git2::Diff` and project each `DiffDelta` into a
+/// `ChangedFile`. Used by both `changed_files` (tree-to-tree) and
+/// `changed_staged_files` (tree-to-index); the two paths only differ in
+/// how they produced the diff.
+fn collect_changed_files(diff: &git2::Diff<'_>) -> Result<Vec<ChangedFile>> {
+    let mut files = Vec::new();
+    diff.foreach(
+        &mut |delta, _| {
+            let status = match delta.status() {
+                git2::Delta::Added => FileStatus::Added,
+                git2::Delta::Deleted => FileStatus::Deleted,
+                git2::Delta::Modified => FileStatus::Modified,
+                git2::Delta::Renamed => FileStatus::Renamed,
+                git2::Delta::Copied => FileStatus::Added,
+                _ => return true,
+            };
+            let path = delta
+                .new_file()
+                .path()
+                .map(|p| p.to_path_buf())
+                .or_else(|| delta.old_file().path().map(|p| p.to_path_buf()));
+            if let Some(path) = path {
+                let old_path = if status == FileStatus::Renamed {
+                    delta.old_file().path().map(|p| p.to_path_buf())
+                } else {
+                    None
+                };
+                files.push(ChangedFile {
+                    path,
+                    status,
+                    old_path,
+                });
+            }
+            true
+        },
+        None,
+        None,
+        None,
+    )
+    .map_err(|e| Error::git_error_msg(format!("Failed to iterate diff: {}", e)))?;
+    Ok(files)
 }
 
 /// Check if a path looks like a Django migration file.
@@ -585,24 +514,21 @@ mod tests {
     fn test_changed_migrations_filter() {
         let (temp, repo) = create_test_repo();
 
-        // Create initial commit
         fs::write(temp.path().join("README.md"), "# Test").unwrap();
         commit(&temp, "Initial");
 
-        // Create migrations directory structure
         let migrations_dir = temp.path().join("myapp").join("migrations");
         fs::create_dir_all(&migrations_dir).unwrap();
-
-        // Add migration and regular Python file
         fs::write(migrations_dir.join("0001_initial.py"), "# migration").unwrap();
         fs::write(migrations_dir.join("__init__.py"), "").unwrap();
         fs::write(temp.path().join("myapp").join("models.py"), "# models").unwrap();
         commit(&temp, "Add files");
 
-        let migrations = repo.changed_migrations("HEAD~1").unwrap();
-        assert_eq!(migrations.len(), 1);
-        assert!(migrations[0]
-            .path
+        // The filter keeps the migration and drops __init__.py and the
+        // regular models.py.
+        let migration_paths = repo.changed_migration_paths("HEAD~1").unwrap();
+        assert_eq!(migration_paths.len(), 1);
+        assert!(migration_paths[0]
             .to_string_lossy()
             .contains("0001_initial.py"));
     }
