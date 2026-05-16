@@ -76,15 +76,29 @@ impl Rule for R002UniqueConstraintWithoutIndex {
                         help: Some(
                             "Django's AddConstraint cannot reuse a pre-built index. \
                              To avoid the lock, build the index concurrently first and \
-                             attach it via two separate RunSQL operations:\n\
+                             attach it via two RunSQL operations, wrapped in \
+                             SeparateDatabaseAndState so Django's model state still \
+                             records the constraint (otherwise the next `makemigrations` \
+                             regenerates this AddConstraint and re-introduces the lock):\n\
                              \n  \
-                             RunSQL('CREATE UNIQUE INDEX CONCURRENTLY <name> ON <table> (<cols>);'),\n  \
-                             RunSQL('ALTER TABLE <table> ADD CONSTRAINT <name> UNIQUE USING INDEX <name>;'),\n\
+                             SeparateDatabaseAndState(\n      \
+                                 state_operations=[\n          \
+                                     migrations.AddConstraint(\n              \
+                                         model_name='<table>',\n              \
+                                         constraint=models.UniqueConstraint(fields=[<cols>], name='<name>'),\n          \
+                                     ),\n      \
+                                 ],\n      \
+                                 database_operations=[\n          \
+                                     migrations.RunSQL('CREATE UNIQUE INDEX CONCURRENTLY <name> ON <table> (<cols>);'),\n          \
+                                     migrations.RunSQL('ALTER TABLE <table> ADD CONSTRAINT <name> UNIQUE USING INDEX <name>;'),\n      \
+                                 ],\n  \
+                             )\n\
                              \n\
-                             Two operations are required because `CREATE INDEX CONCURRENTLY` \
-                             must run outside a transaction; bundling both statements in one \
-                             RunSQL would still be a single transaction. Set `atomic = False` \
-                             on the migration so RunSQL doesn't open one."
+                             Two RunSQL operations are required because \
+                             `CREATE INDEX CONCURRENTLY` must run outside a transaction; \
+                             bundling both statements in one RunSQL would still be a single \
+                             transaction. Set `atomic = False` on the migration so RunSQL \
+                             doesn't open one."
                                 .to_string(),
                         ),
                     });
@@ -217,5 +231,29 @@ class Migration(migrations.Migration):
         let diagnostics = check_migration(ADDCONSTRAINT_BEFORE_CREATEMODEL_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R002");
+    }
+
+    #[test]
+    fn test_help_text_recommends_separate_database_and_state_wrap() {
+        // The original help told users to swap the AddConstraint for
+        // two raw RunSQL operations — which gets the lock-avoidance
+        // right but leaves Django's model state ignorant of the
+        // constraint. The next `makemigrations` then regenerates the
+        // AddConstraint and re-introduces the very pattern R002
+        // exists to flag. The fix recommends wrapping the RunSQLs in
+        // SeparateDatabaseAndState with the original AddConstraint
+        // in `state_operations`. Pin both pieces so a future help-
+        // text rewrite can't silently lose either half.
+        let diagnostics = check_migration(UNIQUE_CONSTRAINT_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        let help = diagnostics[0].help.as_ref().expect("R002 emits help");
+        assert!(
+            help.contains("SeparateDatabaseAndState"),
+            "help should recommend the SDaS wrapper, got:\n{help}",
+        );
+        assert!(
+            help.contains("state_operations") && help.contains("database_operations"),
+            "help should show both halves of the SDaS wrap, got:\n{help}",
+        );
     }
 }
