@@ -85,7 +85,7 @@ zdm --warnings-as-errors .
 | R014 | model-imports | Error | Don't import models in `RunPython` |
 | R015 | alter-field-not-null | Warning | `AlterField` whose result is NOT NULL may scan every row |
 | R016 | non-concurrent-remove-index | Error | Use `RemoveIndexConcurrently` instead of `RemoveIndex` |
-| R017 | non-concurrent-add-constraint | Error | Adding a CHECK constraint validates all rows |
+| R017 | non-concurrent-add-constraint | Error | CHECK constraint validates all rows; EXCLUDE constraint builds an index non-concurrently |
 
 ### CreateModel Exemption
 
