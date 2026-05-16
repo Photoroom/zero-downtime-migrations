@@ -429,11 +429,7 @@ class Migration(migrations.Migration):
         return;
     }
 
-    let output = Command::cargo_bin("zdm")
-        .unwrap()
-        .arg(temp.path())
-        .output()
-        .unwrap();
+    let output = zdm().arg(temp.path()).output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(
