@@ -1,14 +1,17 @@
-//! R002: Unique constraint without concurrent index
+//! R002: Unique constraint locks the table
 //!
-//! Detects AddConstraint with UniqueConstraint that doesn't have a corresponding
-//! concurrent index already created. Adding a unique constraint directly
-//! requires scanning the entire table with a lock.
+//! Detects `migrations.AddConstraint(UniqueConstraint(...))` on an existing
+//! table. Django's `AddConstraint` always builds the constraint's index from
+//! scratch — it does not accept an existing concurrent index as a parameter.
+//! The result is a `CREATE UNIQUE INDEX` (non-concurrent) that locks the
+//! table for the duration of the scan.
 
 use crate::ast::{ConstraintType, Migration, OperationData, OperationType};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::rules::{Rule, RuleContext};
 
-/// Rule that detects unique constraints without pre-built concurrent indexes.
+/// Rule that detects `AddConstraint(UniqueConstraint)` on existing tables,
+/// where Django builds the index non-concurrently under a table lock.
 pub struct R002UniqueConstraintWithoutIndex;
 
 impl Rule for R002UniqueConstraintWithoutIndex {
@@ -21,8 +24,11 @@ impl Rule for R002UniqueConstraintWithoutIndex {
     }
 
     fn description(&self) -> &'static str {
-        "Adding a UniqueConstraint directly requires a full table scan with locks. \
-         First create a unique index concurrently, then add the constraint using that index."
+        "AddConstraint with a UniqueConstraint builds the constraint's index \
+         non-concurrently, locking the table for the duration of the scan. \
+         Django's AddConstraint cannot reuse a pre-built index — issue the \
+         constraint via RunSQL instead so it can attach to a concurrently \
+         created index."
     }
 
     fn severity(&self) -> Severity {
@@ -62,14 +68,23 @@ impl Rule for R002UniqueConstraintWithoutIndex {
                     diagnostics.push(Diagnostic {
                         rule_id: self.id(),
                         rule_name: self.name(),
-                        message: "UniqueConstraint added without pre-built concurrent index"
+                        message: "AddConstraint with UniqueConstraint locks the table while it builds the index"
                             .to_string(),
                         severity: self.severity(),
                         path: ctx.path.to_path_buf(),
                         span: op.span,
                         help: Some(
-                            "First create the unique index using AddIndexConcurrently, \
-                             then add the constraint referencing that index"
+                            "Django's AddConstraint cannot reuse a pre-built index. \
+                             To avoid the lock, build the index concurrently first and \
+                             attach it via RunSQL:\n\
+                             \n  \
+                             RunSQL(\n    \
+                                'CREATE UNIQUE INDEX CONCURRENTLY <name> ON <table> (<cols>);'\n    \
+                                'ALTER TABLE <table> ADD CONSTRAINT <name> UNIQUE USING INDEX <name>;',\n  \
+                             )\n\
+                             \n\
+                             The CREATE INDEX statement must run outside a transaction \
+                             (`atomic = False`)."
                                 .to_string(),
                         ),
                     });
