@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use crate::ast::{Migration, OperationData, OperationType};
-use crate::diagnostics::{Diagnostic, Severity};
+use crate::diagnostics::{Diagnostic, Severity, Span};
 use crate::rules::{ChangesetRule, RuleContext};
 
 /// Rule that detects SeparateDatabaseAndState followed by second step in same PR.
@@ -37,92 +37,78 @@ impl ChangesetRule for R009SeparateDbStateSamePr {
         _other_changed_files: &[&Path],
         _ctx: &RuleContext,
     ) -> Vec<Diagnostic> {
+        // The rule only triggers when the changeset contains BOTH halves of
+        // a SeparateDatabaseAndState two-step deployment: at least one
+        // state-only migration AND at least one database-only migration.
+        // We then flag every file participating in the pair, with one
+        // diagnostic per file. Bundling a state-only migration with an
+        // unrelated migration is intentionally not flagged here — that is
+        // a separate bundling concern, not what R009 is about.
         let mut diagnostics = Vec::new();
 
-        // Find migrations with SeparateDatabaseAndState
-        let separate_migrations: Vec<_> = migrations
-            .iter()
-            .filter(|m| {
-                m.operations
-                    .iter()
-                    .any(|op| op.op_type == OperationType::SeparateDatabaseAndState)
-            })
-            .collect();
-
-        if separate_migrations.is_empty() {
+        let has_state_step = migrations.iter().any(|m| is_state_only_separation(m));
+        let has_db_step = migrations.iter().any(|m| is_db_only_separation(m));
+        if !(has_state_step && has_db_step) {
             return diagnostics;
         }
 
-        // Check if there are multiple migrations in the changeset
-        // that suggest a two-step deployment pattern
-        for migration in &separate_migrations {
-            // Check if the SeparateDatabaseAndState has only state_operations (step 1)
-            // or only database_operations (step 2)
-            for op in &migration.operations {
-                if op.op_type == OperationType::SeparateDatabaseAndState {
-                    if let OperationData::SeparateDatabaseAndState(data) = &op.data {
-                        let is_state_only =
-                            data.has_state_operations && !data.has_database_operations;
-                        let is_db_only = data.has_database_operations && !data.has_state_operations;
-
-                        // If this is step 1 (state_operations only) and there are other migrations,
-                        // warn that they might be trying to do both steps in one PR
-                        if is_state_only && migrations.len() > 1 {
-                            diagnostics.push(Diagnostic {
-                                rule_id: self.id(),
-                                rule_name: self.name(),
-                                message: "SeparateDatabaseAndState with state_operations alongside other migrations".to_string(),
-                                severity: self.severity(),
-                                path: migration.path.clone(),
-                                span: op.span,
-                                help: Some(
-                                    "SeparateDatabaseAndState is meant for two-phase deployments: \
-                                     1) Deploy state change, 2) Deploy database change separately. \
-                                     Having both in one PR defeats this purpose."
-                                        .to_string(),
-                                ),
-                                fix: None,
-                            });
-                        }
-
-                        // If this is step 2 (database_operations only) and there's a step 1 migration
-                        // in the same changeset, warn
-                        if is_db_only {
-                            let has_step1 = separate_migrations.iter().any(|m| {
-                                m.operations.iter().any(|op2| {
-                                    if let OperationData::SeparateDatabaseAndState(d) = &op2.data {
-                                        d.has_state_operations && !d.has_database_operations
-                                    } else {
-                                        false
-                                    }
-                                })
-                            });
-
-                            if has_step1 {
-                                diagnostics.push(Diagnostic {
-                                    rule_id: self.id(),
-                                    rule_name: self.name(),
-                                    message: "Both state_operations and database_operations migrations in same changeset".to_string(),
-                                    severity: self.severity(),
-                                    path: migration.path.clone(),
-                                    span: op.span,
-                                    help: Some(
-                                        "Deploy the state_operations migration first, wait for all \
-                                         application servers to pick up the change, then deploy \
-                                         the database_operations migration in a separate PR."
-                                            .to_string(),
-                                    ),
-                                    fix: None,
-                                });
-                            }
-                        }
-                    }
-                }
+        for migration in migrations {
+            if !(is_state_only_separation(migration) || is_db_only_separation(migration)) {
+                continue;
             }
+            let Some(span) = separation_span(migration) else {
+                continue;
+            };
+            diagnostics.push(Diagnostic {
+                rule_id: self.id(),
+                rule_name: self.name(),
+                message: "Both halves of a SeparateDatabaseAndState two-step deployment \
+                     appear in this changeset"
+                    .to_string(),
+                severity: self.severity(),
+                path: migration.path.clone(),
+                span,
+                help: Some(
+                    "Deploy the state-only migration first, wait for all application \
+                     servers to pick up the change, then deploy the database-only \
+                     migration in a separate PR."
+                        .to_string(),
+                ),
+                fix: None,
+            });
         }
 
         diagnostics
     }
+}
+
+fn is_state_only_separation(migration: &Migration) -> bool {
+    migration.operations.iter().any(|op| match &op.data {
+        OperationData::SeparateDatabaseAndState(d) => {
+            d.has_state_operations && !d.has_database_operations
+        }
+        _ => false,
+    })
+}
+
+fn is_db_only_separation(migration: &Migration) -> bool {
+    migration.operations.iter().any(|op| match &op.data {
+        OperationData::SeparateDatabaseAndState(d) => {
+            d.has_database_operations && !d.has_state_operations
+        }
+        _ => false,
+    })
+}
+
+/// Span of the migration's `SeparateDatabaseAndState` operation, used to
+/// anchor the diagnostic. Returns `None` if no such operation exists
+/// (in which case the migration wouldn't be flagged in the first place).
+fn separation_span(migration: &Migration) -> Option<Span> {
+    migration
+        .operations
+        .iter()
+        .find(|op| op.op_type == OperationType::SeparateDatabaseAndState)
+        .map(|op| op.span)
 }
 
 #[cfg(test)]
@@ -186,57 +172,70 @@ class Migration(migrations.Migration):
         extractor.extract(Path::new(path)).unwrap()
     }
 
-    #[test]
-    fn test_state_and_db_migrations_same_pr_warns() {
-        let state_migration = parse_migration(STATE_ONLY_MIGRATION, "0001_state.py");
-        let db_migration = parse_migration(DB_ONLY_MIGRATION, "0002_db.py");
-        let migrations = vec![&state_migration, &db_migration];
+    fn run(migrations: &[&Migration]) -> Vec<Diagnostic> {
         let other_files: Vec<&Path> = vec![];
         let config = Config::default();
         let ctx = RuleContext {
             config: &config,
             path: Path::new("."),
         };
-
-        let diagnostics = R009SeparateDbStateSamePr.check(&migrations, &other_files, &ctx);
-
-        // Should warn about both steps being in same PR
-        assert!(!diagnostics.is_empty());
-        assert!(diagnostics.iter().all(|d| d.rule_id == "R009"));
+        R009SeparateDbStateSamePr.check(migrations, &other_files, &ctx)
     }
 
     #[test]
-    fn test_state_only_with_other_migration_warns() {
+    fn test_state_and_db_migrations_same_pr_emits_one_per_file() {
+        let state_migration = parse_migration(STATE_ONLY_MIGRATION, "0001_state.py");
+        let db_migration = parse_migration(DB_ONLY_MIGRATION, "0002_db.py");
+        let migrations = vec![&state_migration, &db_migration];
+
+        let diagnostics = run(&migrations);
+
+        // One diagnostic per file in the pair (not two on one file or a
+        // mix of differently-worded messages on each).
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics.iter().all(|d| d.rule_id == "R009"));
+        let paths: std::collections::HashSet<_> =
+            diagnostics.iter().map(|d| d.path.clone()).collect();
+        assert!(paths.contains(&Path::new("0001_state.py").to_path_buf()));
+        assert!(paths.contains(&Path::new("0002_db.py").to_path_buf()));
+        // Same message on both, since they describe the same logical issue.
+        let messages: std::collections::HashSet<_> =
+            diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn test_state_only_with_unrelated_migration_does_not_warn() {
+        // R009 is about the state/db pair specifically. Bundling a
+        // state-only migration with an unrelated AddField is a different
+        // concern (and the old rule's "any other migration" branch was
+        // overbroad).
         let state_migration = parse_migration(STATE_ONLY_MIGRATION, "0001_state.py");
         let other_migration = parse_migration(OTHER_MIGRATION, "0002_other.py");
         let migrations = vec![&state_migration, &other_migration];
-        let other_files: Vec<&Path> = vec![];
-        let config = Config::default();
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("."),
-        };
 
-        let diagnostics = R009SeparateDbStateSamePr.check(&migrations, &other_files, &ctx);
+        let diagnostics = run(&migrations);
 
-        // Should warn about state migration alongside other migrations
-        assert!(!diagnostics.is_empty());
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
     fn test_single_state_migration_good() {
         let state_migration = parse_migration(STATE_ONLY_MIGRATION, "0001_state.py");
         let migrations = vec![&state_migration];
-        let other_files: Vec<&Path> = vec![];
-        let config = Config::default();
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("."),
-        };
 
-        let diagnostics = R009SeparateDbStateSamePr.check(&migrations, &other_files, &ctx);
+        let diagnostics = run(&migrations);
 
-        // Single migration is fine
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_single_db_migration_good() {
+        let db_migration = parse_migration(DB_ONLY_MIGRATION, "0001_db.py");
+        let migrations = vec![&db_migration];
+
+        let diagnostics = run(&migrations);
+
         assert!(diagnostics.is_empty());
     }
 }
