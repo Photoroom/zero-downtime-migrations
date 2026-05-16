@@ -106,33 +106,47 @@ impl Config {
     /// Returns `None` if no config file is found within those
     /// bounds.
     fn find_config_dir(start: &Path) -> Option<std::path::PathBuf> {
-        // Preflight: is there a `.git` ancestor at all? If not, only
-        // consider `start` itself.
-        let mut probe = start;
-        let mut have_git_anchor = probe.join(".git").exists();
-        while !have_git_anchor {
-            probe = match probe.parent() {
-                Some(p) => p,
-                None => break,
-            };
-            if probe.join(".git").exists() {
-                have_git_anchor = true;
-            }
-        }
-
+        // First: a config file in `start` itself always wins, no
+        // walk-up needed.
         if start.join("pyproject.toml").exists()
             || start.join("zero-downtime-migrations.toml").exists()
         {
             return Some(start.to_path_buf());
+        }
+
+        // If `start` IS the repo root (has its own `.git`), we are
+        // already at the boundary — never walk into `start.parent()`,
+        // even if another `.git` exists further up. A world-writable
+        // `/tmp/zero-downtime-migrations.toml` next to a temp-dir
+        // repo would otherwise be adopted as "the project config";
+        // earlier this fix only blocked the no-`.git`-anywhere case
+        // and missed the `.git`-is-in-start case.
+        //
+        // `.git` can be a directory (regular repo) or a file
+        // (worktree / submodule with a gitdir pointer); accept
+        // either form as the stop signal.
+        if start.join(".git").exists() {
+            return None;
+        }
+
+        // Preflight: is there a `.git` ancestor strictly above
+        // `start`? If not, we won't climb at all — the walk-up is
+        // only authorised inside a confirmed repository.
+        let mut probe = start;
+        let mut have_git_anchor = false;
+        while let Some(parent) = probe.parent() {
+            if parent.join(".git").exists() {
+                have_git_anchor = true;
+                break;
+            }
+            probe = parent;
         }
         if !have_git_anchor {
             return None;
         }
 
         // Walk up looking for a config file, stopping at the
-        // `.git`-bearing directory. `.git` can be a directory
-        // (regular repo) or a file (worktree / submodule with a
-        // gitdir pointer); accept either form as the stop signal.
+        // `.git`-bearing directory.
         let mut current = start;
         loop {
             current = current.parent()?;
@@ -618,6 +632,36 @@ exclude = ["**/test_migrations/**", "**/fixtures/**"]
         assert!(
             !config.ignore.contains("R001"),
             "outer config should not bleed through when the inner config exists",
+        );
+    }
+
+    #[test]
+    fn test_walk_does_not_escape_when_git_is_in_start_dir() {
+        // SECURITY: when `start` itself holds `.git`, the walk must
+        // not climb into `start.parent()` — start IS the repo root,
+        // and a world-writable config in the parent (e.g.
+        // `/tmp/zero-downtime-migrations.toml`) must not be adopted
+        // as "the project config". The first cut of the `.git`-anchor
+        // fix only blocked the no-`.git`-anywhere case; this case
+        // round-trips the full silent-escalation path the security
+        // reviewer reproduced.
+        let temp = TempDir::new().unwrap();
+        // Parent-of-repo config that should NOT be picked up:
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"ignore = ["RXXX"]"#,
+        )
+        .unwrap();
+
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        // No config inside `repo` — start IS the repo root.
+
+        let config = Config::load_from_directory(&repo).unwrap();
+        assert!(
+            !config.ignore.contains("RXXX"),
+            "config from parent of repo must not bleed in when start is repo root, got: {:?}",
+            config.ignore,
         );
     }
 
