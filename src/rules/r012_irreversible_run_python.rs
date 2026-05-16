@@ -122,4 +122,142 @@ class Migration(migrations.Migration):
         let diagnostics = check_migration(REVERSIBLE_GOOD);
         assert!(diagnostics.is_empty());
     }
+
+    const REVERSIBLE_NOOP_GOOD: &str = r#"
+from django.db import migrations
+
+
+def forward(apps, schema_editor):
+    pass
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunPython(forward, migrations.RunPython.noop),
+    ]
+"#;
+
+    #[test]
+    fn test_reversible_via_noop_attribute_good() {
+        // The help text in this rule explicitly suggests
+        // `migrations.RunPython.noop`. Verify the extractor recognises
+        // attribute-access reverse callables, not just bare identifiers.
+        let diagnostics = check_migration(REVERSIBLE_NOOP_GOOD);
+        assert!(diagnostics.is_empty());
+    }
+
+    const REVERSIBLE_DOTTED_GOOD: &str = r#"
+from django.db import migrations
+import myapp.migrations.helpers as helpers
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunPython(helpers.forward, helpers.backward),
+    ]
+"#;
+
+    #[test]
+    fn test_reversible_via_dotted_attribute_good() {
+        let diagnostics = check_migration(REVERSIBLE_DOTTED_GOOD);
+        assert!(diagnostics.is_empty());
+    }
+
+    const REVERSIBLE_VIA_CALL_GOOD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunPython(make_forward(), make_backward()),
+    ]
+"#;
+
+    #[test]
+    fn test_reversible_via_call_expression_good() {
+        // Positional args don't have to be bare identifiers or attributes;
+        // accept any expression so factory-style callables don't trip R012.
+        let diagnostics = check_migration(REVERSIBLE_VIA_CALL_GOOD);
+        assert!(diagnostics.is_empty());
+    }
+
+    // Inter-arg-comment behavior (forward and reverse identifiers must not
+    // be confused with a comment node) is covered at the extractor layer
+    // by `test_extract_run_python_skips_inter_arg_comment`, where we can
+    // assert the actual extracted value rather than just R012's emission.
+    const REVERSIBLE_PARENTHESIZED_GOOD: &str = r#"
+from django.db import migrations
+
+
+def forward(apps, schema_editor):
+    pass
+
+
+def backward(apps, schema_editor):
+    pass
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunPython((forward), (backward)),
+    ]
+"#;
+
+    #[test]
+    fn test_reversible_via_parenthesized_good() {
+        let diagnostics = check_migration(REVERSIBLE_PARENTHESIZED_GOOD);
+        assert!(diagnostics.is_empty());
+    }
+
+    const IRREVERSIBLE_POSITIONAL_NONE_BAD: &str = r#"
+from django.db import migrations
+
+
+def forward(apps, schema_editor):
+    pass
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunPython(forward, None),
+    ]
+"#;
+
+    const IRREVERSIBLE_KEYWORD_NONE_BAD: &str = r#"
+from django.db import migrations
+
+
+def forward(apps, schema_editor):
+    pass
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunPython(forward, reverse_code=None),
+    ]
+"#;
+
+    #[test]
+    fn test_explicit_none_positional_is_irreversible() {
+        // Broadening the positional helper to accept any expression
+        // started returning the literal text "None" as the reverse
+        // callable. Django treats `reverse_code=None` as irreversible,
+        // so R012 must still fire.
+        let diagnostics = check_migration(IRREVERSIBLE_POSITIONAL_NONE_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R012");
+    }
+
+    #[test]
+    fn test_explicit_none_keyword_is_irreversible() {
+        let diagnostics = check_migration(IRREVERSIBLE_KEYWORD_NONE_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R012");
+    }
 }

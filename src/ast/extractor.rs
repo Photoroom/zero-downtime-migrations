@@ -312,11 +312,17 @@ impl<'a> MigrationExtractor<'a> {
     fn extract_run_python_operation(&self, args: Node) -> RunPythonOperation {
         let code = self
             .get_keyword_arg_string(args, "code")
-            .or_else(|| self.get_nth_positional_identifier(args, 0))
+            .or_else(|| self.get_nth_positional_arg(args, 0))
             .unwrap_or_default();
+        // Treat an explicit Python `None` (`RunPython(forward, None)` or
+        // `reverse_code=None`) as no reverse. Django itself flags that
+        // shape as irreversible; without the filter, the helpers above
+        // return the literal text `"None"` and downstream code mistakes
+        // it for a real callable name.
         let reverse_code = self
             .get_keyword_arg_string(args, "reverse_code")
-            .or_else(|| self.get_nth_positional_identifier(args, 1));
+            .or_else(|| self.get_nth_positional_arg(args, 1))
+            .filter(|s| s != "None");
 
         RunPythonOperation { code, reverse_code }
     }
@@ -383,16 +389,25 @@ impl<'a> MigrationExtractor<'a> {
         None
     }
 
-    /// Get the Nth positional identifier argument.
-    fn get_nth_positional_identifier(&self, args: Node, n: usize) -> Option<String> {
+    /// Get the textual source of the Nth positional argument, regardless
+    /// of expression shape. Skips `keyword_argument` and `comment` named
+    /// children so that e.g. `RunPython(forward, reverse_code=rev)`
+    /// returns `forward` for `n == 0` and yields nothing for `n == 1`,
+    /// and `RunPython(forward, # note\n backward)` returns `backward` for
+    /// `n == 1`. The returned string is the raw node text (e.g.
+    /// `migrations.RunPython.noop`, `helpers.fwd`, `(forward)`, or
+    /// `make_forward()`); callers that need a specific shape should
+    /// inspect it further.
+    fn get_nth_positional_arg(&self, args: Node, n: usize) -> Option<String> {
         let mut count = 0;
-        for child in args.children(&mut args.walk()) {
-            if child.kind() == "identifier" {
-                if count == n {
-                    return Some(self.node_text(child).to_string());
-                }
-                count += 1;
+        for child in args.named_children(&mut args.walk()) {
+            if matches!(child.kind(), "keyword_argument" | "comment") {
+                continue;
             }
+            if count == n {
+                return Some(self.node_text(child).to_string());
+            }
+            count += 1;
         }
         None
     }
@@ -571,6 +586,47 @@ class Migration(migrations.Migration):
             assert_eq!(data.code, "forward");
             assert!(data.reverse_code.is_some());
             assert!(data.is_reversible());
+        } else {
+            panic!("Expected RunPython data");
+        }
+    }
+
+    const RUN_PYTHON_WITH_INTER_ARG_COMMENT: &str = r#"
+from django.db import migrations
+
+
+def forward(apps, schema_editor):
+    pass
+
+
+def backward(apps, schema_editor):
+    pass
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunPython(
+            forward,
+            # historical context for the reverse
+            backward,
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_run_python_skips_inter_arg_comment() {
+        // Tree-sitter-python emits comments as named children of
+        // `argument_list`. Without an explicit skip, the comment between
+        // `forward` and `backward` would be returned as `reverse_code` and
+        // `backward` would be lost.
+        let parsed = ParsedMigration::parse(RUN_PYTHON_WITH_INTER_ARG_COMMENT).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        if let OperationData::RunPython(data) = &migration.operations[0].data {
+            assert_eq!(data.code, "forward");
+            assert_eq!(data.reverse_code.as_deref(), Some("backward"));
         } else {
             panic!("Expected RunPython data");
         }
