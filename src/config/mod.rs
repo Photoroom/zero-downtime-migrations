@@ -49,6 +49,9 @@ impl Config {
     }
 
     /// Load configuration from a directory, searching for config files.
+    /// Glob patterns in `exclude` and `allowed_file_patterns` are validated
+    /// at load time; an invalid pattern surfaces as `Error::InvalidGlobPattern`
+    /// instead of being silently dropped at the match site.
     pub fn load_from_directory(dir: &Path) -> Result<Self> {
         let mut config = Config::default();
 
@@ -67,7 +70,21 @@ impl Config {
             config.merge(file_config);
         }
 
+        config.validate_glob_patterns()?;
         Ok(config)
+    }
+
+    /// Compile every glob pattern in this config to surface syntax errors
+    /// early. The compiled patterns are discarded — call sites recompile
+    /// on demand, but the compilation is guaranteed to succeed after this.
+    fn validate_glob_patterns(&self) -> Result<()> {
+        for pattern in self.exclude.iter().chain(self.allowed_file_patterns.iter()) {
+            glob::Pattern::new(pattern).map_err(|e| Error::InvalidGlobPattern {
+                pattern: pattern.clone(),
+                message: e.to_string(),
+            })?;
+        }
+        Ok(())
     }
 
     /// Load from pyproject.toml.
@@ -364,5 +381,41 @@ exclude = ["**/test_migrations/**", "**/fixtures/**"]
         assert!(config
             .exclude
             .contains(&"**/test_migrations/**".to_string()));
+    }
+
+    #[test]
+    fn test_invalid_glob_pattern_in_exclude_errors() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            // `[` opens a character class that is never closed — a real
+            // syntactic error in the glob crate.
+            r#"exclude = ["src/[unclosed"]"#,
+        )
+        .unwrap();
+
+        match Config::load_from_directory(temp.path()) {
+            Err(Error::InvalidGlobPattern { pattern, .. }) => {
+                assert_eq!(pattern, "src/[unclosed");
+            }
+            other => panic!("expected InvalidGlobPattern, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_glob_pattern_in_allowed_files_errors() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"allowed-file-patterns = ["models.py", "*.[broken"]"#,
+        )
+        .unwrap();
+
+        match Config::load_from_directory(temp.path()) {
+            Err(Error::InvalidGlobPattern { pattern, .. }) => {
+                assert_eq!(pattern, "*.[broken");
+            }
+            other => panic!("expected InvalidGlobPattern, got {other:?}"),
+        }
     }
 }

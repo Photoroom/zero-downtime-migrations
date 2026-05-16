@@ -53,7 +53,6 @@ impl Rule for R001NonConcurrentAddIndex {
                      django.contrib.postgres.operations"
                         .to_string(),
                 ),
-                fix: None,
             });
         }
 

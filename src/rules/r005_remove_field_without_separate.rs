@@ -53,7 +53,6 @@ impl Rule for R005RemoveFieldWithoutSeparate {
                      drops the column (database_operations)."
                         .to_string(),
                 ),
-                fix: None,
             });
         }
 

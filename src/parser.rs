@@ -12,8 +12,18 @@ use tree_sitter::{Language, Node, Parser, Tree};
 use crate::error::{Error, Result};
 
 /// Maximum file size for migration files (10 MB).
-/// This prevents DoS attacks from extremely large files.
-const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+/// This bounds memory use and parse time when processing untrusted input.
+pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Returns `Err(Error::FileTooLarge)` if the given byte count exceeds
+/// `MAX_FILE_SIZE`. Callers that already hold a source string should pass
+/// `source.len() as u64`; callers reading from disk can stat the file first.
+pub fn check_size(path: &Path, size: u64) -> Result<()> {
+    if size > MAX_FILE_SIZE {
+        return Err(Error::file_too_large(path, size, MAX_FILE_SIZE));
+    }
+    Ok(())
+}
 
 /// Global Python language instance.
 static PYTHON_LANGUAGE: Lazy<Language> = Lazy::new(|| tree_sitter_python::LANGUAGE.into());
@@ -45,11 +55,9 @@ impl ParsedMigration {
 
     /// Parse a migration file from a path.
     pub fn parse_file(path: &Path) -> Result<Self> {
-        // Check file size before reading to prevent DoS
+        // Cap on-disk size before reading to bound memory.
         let metadata = std::fs::metadata(path).map_err(|e| Error::file_read(path, e))?;
-        if metadata.len() > MAX_FILE_SIZE {
-            return Err(Error::file_too_large(path, metadata.len(), MAX_FILE_SIZE));
-        }
+        check_size(path, metadata.len())?;
 
         let source = std::fs::read_to_string(path).map_err(|e| Error::file_read(path, e))?;
 
@@ -132,7 +140,12 @@ impl ParsedMigration {
         None
     }
 
-    /// Check if the migration has `atomic = False`.
+    /// Check if the migration has `atomic = False` as a class-body
+    /// assignment. Only matches a real assignment whose LHS is the bare
+    /// identifier `atomic` and whose RHS is the Python `False` literal
+    /// (including the parenthesized form `(False)`). Comments mentioning
+    /// "False", strings containing those words, `atomic = True`,
+    /// `not_atomic = False`, and `atomic = some_func(False)` do not match.
     pub fn is_non_atomic(&self) -> bool {
         let Some(class_node) = self.find_migration_class() else {
             return false;
@@ -144,14 +157,54 @@ impl ParsedMigration {
         };
 
         for child in body.children(&mut body.walk()) {
-            if child.kind() == "expression_statement" {
-                let text = child.utf8_text(source).unwrap_or("");
-                if text.contains("atomic") && text.contains("False") {
-                    return true;
-                }
+            if child.kind() != "expression_statement" {
+                continue;
+            }
+            let Some(assignment) = child.named_child(0) else {
+                continue;
+            };
+            if assignment.kind() != "assignment" {
+                continue;
+            }
+            let Some(left) = assignment.child_by_field_name("left") else {
+                continue;
+            };
+            if left.utf8_text(source).ok() != Some("atomic") {
+                continue;
+            }
+            let Some(right) = assignment.child_by_field_name("right") else {
+                continue;
+            };
+            if is_false_literal(right) {
+                return true;
             }
         }
         false
+    }
+
+    /// Collect every comment node in the parse tree, returning `(line,
+    /// text)` pairs. Lines are 1-indexed. The comment text retains its
+    /// leading `#`. Used by the inline-ignore (`# zdm: ignore RXXX`)
+    /// machinery so rules can be suppressed at specific source lines.
+    pub fn all_comments(&self) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        self.collect_comments(self.root_node(), &mut out);
+        out
+    }
+
+    fn collect_comments(&self, node: Node<'_>, out: &mut Vec<(usize, String)>) {
+        if node.kind() == "comment" {
+            let line = node.start_position().row + 1;
+            let text = node
+                .utf8_text(self.source_bytes())
+                .unwrap_or("")
+                .to_string();
+            out.push((line, text));
+            return;
+        }
+        for child in node.children(&mut node.walk()) {
+            self.collect_comments(child, out);
+        }
     }
 
     /// Get all import statements in the file.
@@ -171,6 +224,23 @@ impl ParsedMigration {
     /// Get the text of a node.
     pub fn node_text(&self, node: Node<'_>) -> &str {
         node.utf8_text(self.source_bytes()).unwrap_or("")
+    }
+}
+
+/// Whether a node is the Python `False` literal, possibly wrapped in any
+/// number of parentheses. tree-sitter-python represents `False` with the
+/// `"false"` node kind and `(expr)` as `parenthesized_expression`.
+fn is_false_literal(node: Node<'_>) -> bool {
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "false" => return true,
+            "parenthesized_expression" => match current.named_child(0) {
+                Some(inner) => current = inner,
+                None => return false,
+            },
+            _ => return false,
+        }
     }
 }
 
@@ -270,6 +340,81 @@ class Migration(migrations.Migration)  # Missing colon
     }
 
     #[test]
+    fn test_is_non_atomic_accepts_parenthesized_false() {
+        let source = r#"
+class Migration:
+    atomic = (False)
+    operations = []
+"#;
+        let parsed = ParsedMigration::parse(source).unwrap();
+        assert!(parsed.is_non_atomic());
+
+        let nested = r#"
+class Migration:
+    atomic = ((False))
+    operations = []
+"#;
+        let parsed = ParsedMigration::parse(nested).unwrap();
+        assert!(parsed.is_non_atomic());
+    }
+
+    #[test]
+    fn test_is_non_atomic_rejects_substring_lookalikes() {
+        // None of these should be detected as non-atomic, even though the old
+        // substring scan ("text contains 'atomic' and 'False'") would have
+        // matched several of them.
+        let cases: &[(&str, &str)] = &[
+            (
+                "atomic = True",
+                r#"
+class Migration:
+    atomic = True
+    operations = []
+"#,
+            ),
+            (
+                "not_atomic = False",
+                r#"
+class Migration:
+    not_atomic = False
+    operations = []
+"#,
+            ),
+            (
+                "atomic = some_func(False)",
+                r#"
+class Migration:
+    atomic = some_func(False)
+    operations = []
+"#,
+            ),
+            (
+                "atomic appears only in a string",
+                r#"
+class Migration:
+    description = "atomic was set to False elsewhere"
+    operations = []
+"#,
+            ),
+            (
+                "atomic appears only in a comment",
+                r#"
+class Migration:
+    # atomic = False would disable transactions
+    operations = []
+"#,
+            ),
+        ];
+        for (label, source) in cases {
+            let parsed = ParsedMigration::parse(*source).unwrap();
+            assert!(
+                !parsed.is_non_atomic(),
+                "case `{label}` should not be flagged as non-atomic"
+            );
+        }
+    }
+
+    #[test]
     fn test_get_imports() {
         let parsed = ParsedMigration::parse(NON_ATOMIC_MIGRATION).unwrap();
         let imports = parsed.get_imports();
@@ -305,5 +450,28 @@ class Migration(migrations.Migration)  # Missing colon
             }
         }
         assert_eq!(call_count, 1);
+    }
+
+    #[test]
+    fn test_check_size_accepts_under_limit() {
+        assert!(check_size(Path::new("test.py"), 0).is_ok());
+        assert!(check_size(Path::new("test.py"), MAX_FILE_SIZE).is_ok());
+    }
+
+    #[test]
+    fn test_check_size_rejects_over_limit() {
+        let err = check_size(Path::new("huge.py"), MAX_FILE_SIZE + 1).unwrap_err();
+        match err {
+            Error::FileTooLarge {
+                path,
+                size,
+                max_size,
+            } => {
+                assert_eq!(path, Path::new("huge.py"));
+                assert_eq!(size, MAX_FILE_SIZE + 1);
+                assert_eq!(max_size, MAX_FILE_SIZE);
+            }
+            other => panic!("expected FileTooLarge, got {other:?}"),
+        }
     }
 }

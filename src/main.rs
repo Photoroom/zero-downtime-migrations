@@ -15,7 +15,7 @@ use zero_downtime_migrations::diagnostics::{Diagnostic, Severity};
 use zero_downtime_migrations::discovery;
 use zero_downtime_migrations::error::{Error, Result};
 use zero_downtime_migrations::git::GitRepo;
-use zero_downtime_migrations::parser::ParsedMigration;
+use zero_downtime_migrations::parser::{self, ParsedMigration};
 use zero_downtime_migrations::rules::{ChangesetRuleRegistry, RuleRegistry};
 
 /// Zero-Downtime Migrations - A PostgreSQL migration safety linter for Django
@@ -93,18 +93,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
         };
     }
 
-    // Build config from CLI args
+    // Build config from CLI args. `apply_cli_overrides` treats `--ignore`
+    // as additive to the file's ignore list and `--select` as replacing it.
     let mut config = load_config()?;
-
-    if let Some(select) = cli.select {
-        config.select = select.into_iter().collect();
-    }
-    if let Some(ignore) = cli.ignore {
-        config.ignore = ignore.into_iter().collect();
-    }
-    if cli.warnings_as_errors {
-        config.warnings_as_errors = true;
-    }
+    config.apply_cli_overrides(cli.select, cli.ignore, cli.warnings_as_errors);
 
     let diff_mode = match (cli.diff.as_deref(), cli.diff_staged.as_deref()) {
         (Some(base_ref), None) => Some(DiffMode::Head { base_ref }),
@@ -152,6 +144,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             changeset_registry.check(&migration_refs, &other_file_refs, &config);
         all_diagnostics.extend(changeset_diagnostics);
     }
+
+    // Sort diagnostics by (path, line, column) so output reads in source
+    // order rather than rule-iteration order. Rules iterate file-by-file
+    // and rule-by-rule, which would otherwise group all R001s together
+    // before all R002s for the same file, etc. — the opposite of what
+    // most linters do.
+    all_diagnostics.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.span.start_line.cmp(&b.span.start_line))
+            .then(a.span.start_column.cmp(&b.span.start_column))
+            .then(a.rule_id.cmp(b.rule_id))
+    });
 
     // Output results
     output_diagnostics(&all_diagnostics, &cli.output_format);
@@ -303,25 +308,29 @@ fn parse_and_check_file(
     config: &Config,
     diff_mode: Option<DiffMode<'_>>,
 ) -> Result<(Migration, Vec<Diagnostic>)> {
-    // Read and parse the file
-    let source = match diff_mode {
+    // Both paths enforce a size cap (parser::MAX_FILE_SIZE) to bound memory
+    // and parse time on untrusted input. The regular path uses parse_file,
+    // which also reports syntax errors with line/column. The staged path
+    // emits a less precise error on syntax failure; aligning the two would
+    // mean exposing parse_file's internals as a source-string variant —
+    // tracked as a follow-up.
+    let parsed = match diff_mode {
         Some(DiffMode::Staged { .. }) => {
             let repo = GitRepo::open(Path::new("."))?;
-            repo.read_staged_file(path)?
+            let source = repo.read_staged_file(path)?;
+            parser::check_size(path, source.len() as u64)?;
+            let parsed = ParsedMigration::parse(&source)
+                .map_err(|e| Error::parse(path.to_path_buf(), e.to_string()))?;
+            if parsed.has_errors() {
+                return Err(Error::parse(
+                    path.to_path_buf(),
+                    "syntax error in migration file".to_string(),
+                ));
+            }
+            parsed
         }
-        _ => std::fs::read_to_string(path).map_err(|e| Error::io(e, path.to_path_buf()))?,
+        _ => ParsedMigration::parse_file(path)?,
     };
-
-    let parsed = ParsedMigration::parse(&source)
-        .map_err(|e| Error::parse(path.to_path_buf(), e.to_string()))?;
-
-    // Check for parse errors in the syntax tree
-    if parsed.has_errors() {
-        return Err(Error::parse(
-            path.to_path_buf(),
-            "syntax error in migration file".to_string(),
-        ));
-    }
 
     let extractor = MigrationExtractor::new(&parsed);
     let migration = extractor
@@ -354,10 +363,11 @@ fn output_default(diagnostics: &[Diagnostic]) {
         };
 
         println!(
-            "{}: {} [{}]",
+            "{}: {} [{} {}]",
             severity_str,
             diag.message,
-            diag.rule_id.cyan()
+            diag.rule_id.cyan(),
+            diag.rule_name.cyan(),
         );
         println!(
             "  {} {}:{}",
@@ -487,12 +497,16 @@ fn output_compact(diagnostics: &[Diagnostic]) {
             Severity::Warning => "W",
         };
         println!(
-            "{}:{}: {}: {} [{}]",
+            "{}:{}: {}: [{} {}] {}",
             diag.path.display(),
             diag.span.start_line,
             severity_char,
             diag.rule_id,
-            diag.message
+            diag.rule_name,
+            diag.message,
         );
+        if let Some(help) = &diag.help {
+            println!("  help: {}", help);
+        }
     }
 }

@@ -406,7 +406,10 @@ class Migration(migrations.Migration):
             .arg("compact")
             .assert()
             .failure()
-            .stdout(predicate::str::contains("E: R001"));
+            // Compact format: `path:line: SEV: [RULE_ID rule-name] message`.
+            .stdout(predicate::str::contains(
+                "E: [R001 non-concurrent-add-index]",
+            ));
     }
 }
 
@@ -417,6 +420,9 @@ class Migration(migrations.Migration):
 mod rule_selection {
     use super::*;
 
+    // This fixture triggers exactly R001 (non-concurrent AddIndex) and
+    // R016 (non-concurrent RemoveIndex). Tests in this module rely on
+    // those being the only diagnostics emitted.
     const MIGRATION_WITH_MULTIPLE_ISSUES: &str = r#"
 from django.db import migrations, models
 
@@ -489,6 +495,137 @@ class Migration(migrations.Migration):
             .assert()
             .success()
             .code(0);
+    }
+
+    #[test]
+    fn cli_ignore_is_additive_to_config_ignore() {
+        let temp = setup_migrations(&[("0001_multi.py", MIGRATION_WITH_MULTIPLE_ISSUES)]);
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"ignore = ["R016"]"#,
+        )
+        .unwrap();
+
+        // Config ignores R016, CLI adds R001. Both should be suppressed and
+        // the run should exit clean.
+        zdm()
+            .current_dir(temp.path())
+            .arg("--ignore")
+            .arg("R001")
+            .assert()
+            .success()
+            .code(0);
+    }
+
+    #[test]
+    fn cli_select_replaces_config_select() {
+        let temp = setup_migrations(&[("0001_multi.py", MIGRATION_WITH_MULTIPLE_ISSUES)]);
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"select = ["R001"]"#,
+        )
+        .unwrap();
+
+        // Config selects R001 only; CLI overrides with R016 only. R001 must
+        // not be reported; R016 must.
+        zdm()
+            .current_dir(temp.path())
+            .arg("--select")
+            .arg("R016")
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("R001").not())
+            .stdout(predicate::str::contains("R016"));
+    }
+
+    const MIGRATION_WITH_IGNORE_COMMENTS: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(  # zdm: ignore R001
+            model_name='product',
+            index=models.Index(fields=['name'], name='product_name_idx'),
+        ),
+        migrations.RemoveIndex(
+            model_name='product',
+            name='old_idx',
+        ),
+    ]
+"#;
+
+    #[test]
+    fn inline_ignore_directive_suppresses_diagnostic() {
+        // The AddIndex carries `# zdm: ignore R001`, so R001 should be
+        // silent on that operation. RemoveIndex has no directive, so
+        // R016 still fires and the run exits non-zero.
+        let temp = setup_migrations(&[("0001.py", MIGRATION_WITH_IGNORE_COMMENTS)]);
+        zdm()
+            .arg(temp.path())
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("R001").not())
+            .stdout(predicate::str::contains("R016"));
+    }
+
+    const MIGRATION_WITH_FULL_IGNORE: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        # zdm: ignore R001, R016
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(fields=['name'], name='product_name_idx'),
+        ),
+        migrations.RemoveIndex(  # zdm: ignore R016
+            model_name='product',
+            name='old_idx',
+        ),
+    ]
+"#;
+
+    #[test]
+    fn inline_ignore_directive_above_and_same_line_both_work() {
+        // R001 is suppressed by a comment on the line above AddIndex;
+        // R016 is suppressed by a same-line comment on RemoveIndex.
+        // Nothing else fires, so the run exits clean.
+        let temp = setup_migrations(&[("0001.py", MIGRATION_WITH_FULL_IGNORE)]);
+        zdm().arg(temp.path()).assert().success().code(0);
+    }
+
+    const MIGRATION_WITH_NON_MATCHING_IGNORE: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        # zdm: ignore R015
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(fields=['name'], name='product_name_idx'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn inline_ignore_directive_for_different_rule_does_not_suppress() {
+        // The user wrote `# zdm: ignore R015`, but R001 is what actually
+        // fires on AddIndex. R001 must still be reported.
+        let temp = setup_migrations(&[("0001.py", MIGRATION_WITH_NON_MATCHING_IGNORE)]);
+        zdm()
+            .arg(temp.path())
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("R001"));
     }
 }
 

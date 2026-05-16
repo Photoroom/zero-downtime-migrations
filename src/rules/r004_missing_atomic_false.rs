@@ -50,7 +50,6 @@ impl Rule for R004MissingAtomicFalse {
                     "Add `atomic = False` to the Migration class to allow concurrent operations"
                         .to_string(),
                 ),
-                fix: None,
             });
         }
 

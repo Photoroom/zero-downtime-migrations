@@ -14,10 +14,6 @@ default-run = "zdm"
 name = "zdm"
 path = "src/main.rs"
 
-[[bin]]
-name = "zero-downtime-migrations"
-path = "src/main.rs"
-
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

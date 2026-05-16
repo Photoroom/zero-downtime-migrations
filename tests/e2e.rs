@@ -13,9 +13,14 @@ fn zdm() -> Command {
     cargo_bin_cmd!("zdm")
 }
 
-/// Path to the test fixtures directory
+/// Path to the per-rule test fixtures directory.
 fn fixtures_dir() -> &'static Path {
     Path::new("tests/fixtures/rules")
+}
+
+/// Path to the test fixtures root (parent of `rules/` and other fixture trees).
+fn fixtures_root() -> &'static Path {
+    Path::new("tests/fixtures")
 }
 
 // =============================================================================
@@ -57,19 +62,13 @@ fn e2e_r001_pass_add_index_on_new_model() {
 #[test]
 fn e2e_r010_pass_nullable_field() {
     let fixture = fixtures_dir().join("R010/pass_nullable_field.py");
-    if !fixture.exists() {
-        return; // Skip if fixture doesn't exist
-    }
 
     zdm().arg(&fixture).assert().success().code(0);
 }
 
 #[test]
 fn e2e_r010_fail_not_null_without_default() {
-    let fixture = fixtures_dir().join("R010/fail_not_null_without_default.py");
-    if !fixture.exists() {
-        return; // Skip if fixture doesn't exist
-    }
+    let fixture = fixtures_dir().join("R010/fail_add_field_not_null.py");
 
     zdm()
         .arg(&fixture)
@@ -85,10 +84,7 @@ fn e2e_r010_fail_not_null_without_default() {
 
 #[test]
 fn e2e_r016_fail_non_concurrent_remove_index() {
-    let fixture = fixtures_dir().join("R016/fail_non_concurrent_remove_index.py");
-    if !fixture.exists() {
-        return; // Skip if fixture doesn't exist
-    }
+    let fixture = fixtures_dir().join("R016/fail_remove_index_non_concurrent.py");
 
     zdm()
         .arg(&fixture)
@@ -102,11 +98,109 @@ fn e2e_r016_fail_non_concurrent_remove_index() {
 #[test]
 fn e2e_r016_pass_concurrent_remove_index() {
     let fixture = fixtures_dir().join("R016/pass_concurrent_remove_index.py");
-    if !fixture.exists() {
-        return; // Skip if fixture doesn't exist
-    }
 
     zdm().arg(&fixture).assert().success().code(0);
+}
+
+// =============================================================================
+// Coverage for previously-orphan fixtures.
+//
+// These fixture files lived on disk but had no e2e test referencing them
+// before this PR, so they masqueraded as coverage. The tests below pin
+// each one to a concrete expected outcome so a regression in the rule
+// will surface here. R012 is the only Warning in the set; everything
+// else is Error (exit 1).
+// =============================================================================
+
+#[test]
+fn e2e_r002_fail_unique_constraint() {
+    let fixture = fixtures_dir().join("R002/fail_unique_constraint.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R002"));
+}
+
+#[test]
+fn e2e_r003_fail_run_sql_create_index() {
+    let fixture = fixtures_dir().join("R003/fail_run_sql_create_index.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R003"))
+        .stdout(predicate::str::contains("CONCURRENTLY"));
+}
+
+#[test]
+fn e2e_r006_fail_add_field_fk() {
+    let fixture = fixtures_dir().join("R006/fail_add_field_fk.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R006"));
+}
+
+#[test]
+fn e2e_r011_fail_rename_field() {
+    let fixture = fixtures_dir().join("R011/fail_rename_field.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R011"));
+}
+
+#[test]
+fn e2e_r012_fail_run_python_irreversible() {
+    // R012 is a Warning, so the run still exits 0 unless the user opts
+    // into --warnings-as-errors; assert both the warning surfaces and
+    // the exit code reflects the intended severity policy.
+    let fixture = fixtures_dir().join("R012/fail_run_python_irreversible.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .success()
+        .code(0)
+        .stdout(predicate::str::contains("R012"));
+}
+
+#[test]
+fn e2e_r014_fail_model_import() {
+    // The fixture also lacks a reverse_code on its RunPython, so R012
+    // (Warning) fires alongside R014 (Error). Substring matching on
+    // R014 is enough — we just need the rule under test to surface.
+    let fixture = fixtures_dir().join("R014/fail_model_import.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R014"));
+}
+
+#[test]
+fn e2e_r015_fail_alter_field_not_null() {
+    let fixture = fixtures_dir().join("R015/fail_alter_field_not_null.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R015"));
 }
 
 // =============================================================================
@@ -117,11 +211,7 @@ fn e2e_r016_pass_concurrent_remove_index() {
 fn e2e_multiple_rules_detect_all() {
     // Lint multiple failing fixtures at once
     let r001_fail = fixtures_dir().join("R001/fail_non_concurrent_add_index.py");
-    let r016_fail = fixtures_dir().join("R016/fail_non_concurrent_remove_index.py");
-
-    if !r001_fail.exists() || !r016_fail.exists() {
-        return;
-    }
+    let r016_fail = fixtures_dir().join("R016/fail_remove_index_non_concurrent.py");
 
     zdm()
         .arg(&r001_fail)
@@ -206,15 +296,33 @@ fn e2e_select_rule_only_checks_that_rule() {
 
 #[test]
 fn e2e_scan_directory_finds_all_issues() {
-    let r001_dir = fixtures_dir().join("R001");
+    // Scan a Django-style app/migrations layout containing one safe and
+    // one unsafe migration. Directory discovery only descends into
+    // `migrations/` subdirectories, which is why the per-rule fixture dirs
+    // (tests/fixtures/rules/R*/) can't be used here directly.
+    let scan_root = fixtures_root().join("scan");
 
-    let output = zdm().arg(&r001_dir).assert().get_output().stdout.clone();
+    let output = zdm()
+        .arg(scan_root)
+        .assert()
+        .failure()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
 
     let output_str = String::from_utf8(output).unwrap();
 
-    // Should find the failing migration but not report issues for passing ones
-    if output_str.contains("R001") {
-        // Found a violation - that's expected for the fail_ file
-        assert!(output_str.contains("fail_non_concurrent_add_index.py"));
-    }
+    assert!(
+        output_str.contains("R001"),
+        "expected R001 violation in output, got: {output_str}"
+    );
+    assert!(
+        output_str.contains("0002_unsafe_index.py"),
+        "expected unsafe fixture in output, got: {output_str}"
+    );
+    assert!(
+        !output_str.contains("0001_initial.py"),
+        "safe fixture should not be reported, got: {output_str}"
+    );
 }

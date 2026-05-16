@@ -53,7 +53,6 @@ impl Rule for R002UniqueConstraintWithoutIndex {
                              then add the constraint referencing that index"
                                 .to_string(),
                         ),
-                        fix: None,
                     });
                 }
             }

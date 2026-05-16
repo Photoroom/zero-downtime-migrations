@@ -14,22 +14,23 @@ A standalone Rust CLI tool that statically analyzes Django migration files to ca
 
 ## Installation
 
+> **Breaking change:** the `zero-downtime-migrations` command alias has been removed. Use `zdm`. (`alias zero-downtime-migrations=zdm` in your shell is a one-line workaround if you depended on the old name.)
+
 ```bash
-# Install via pip
-pip install zero-downtime-migrations
+# Install via pip (PyPI package is django-zdm; binary is `zdm`)
+pip install django-zdm
 
 # Or use uvx to run without installing
-uvx zero-downtime-migrations .
+uvx --from django-zdm zdm .
 
 # Or install with pipx
-pipx install zero-downtime-migrations
+pipx install django-zdm
 ```
 
 ## Usage
 
 ```bash
-# These are equivalent
-zero-downtime-migrations app/migrations/0042_add_index.py
+# Lint a single migration
 zdm app/migrations/0042_add_index.py
 
 # Lint all migrations in a directory
@@ -74,22 +75,23 @@ zdm --warnings-as-errors .
 | R003 | runsql-create-index | Error | Use `AddIndexConcurrently` instead of raw SQL `CREATE INDEX` |
 | R004 | missing-atomic-false | Error | Non-atomic migrations require `atomic = False` |
 | R005 | remove-field-without-separate | Error | Use `SeparateDatabaseAndState` to remove fields safely |
-| R006 | add-field-foreign-key | Warning | Adding FK creates index and validates constraint |
-| R007 | fk-without-concurrent-index | Warning | Foreign keys should have a concurrent index |
-| R008 | disallowed-file-changes | Warning | Don't change app code alongside migrations |
-| R009 | separate-db-state-same-pr | Warning | Don't deploy both steps of `SeparateDatabaseAndState` together |
+| R006 | add-field-foreign-key | Error | Adding FK creates index and validates constraint (merged R007) |
+| R008 | disallowed-file-changes | Error | Don't change app code alongside migrations |
+| R009 | separate-db-state-same-pr | Error | Don't deploy both steps of `SeparateDatabaseAndState` together |
 | R010 | add-field-not-null | Error | Adding NOT NULL field without default rewrites table |
-| R011 | rename-field | Warning | Renaming fields can break running code |
+| R011 | rename-field | Error | Renaming fields can break running code |
 | R012 | irreversible-run-python | Warning | `RunPython` should have a reverse function |
 | R013 | irreversible-run-sql | Warning | `RunSQL` should have a reverse SQL |
 | R014 | model-imports | Error | Don't import models in `RunPython` |
 | R015 | alter-field-not-null | Error | Changing field to NOT NULL validates all rows |
 | R016 | non-concurrent-remove-index | Error | Use `RemoveIndexConcurrently` instead of `RemoveIndex` |
-| R017 | non-concurrent-add-constraint | Warning | Adding CHECK/FK constraints validates all rows |
+| R017 | non-concurrent-add-constraint | Error | Adding a CHECK constraint validates all rows |
 
 ### CreateModel Exemption
 
-Several rules (R001, R002, R006, R007, R010, R017) automatically exempt operations that target models created in the same migration. This is because operations on newly created (empty) tables don't cause the locking issues these rules detect.
+Several rules (R001, R002, R006, R010, R017) automatically exempt operations that target models created in the same migration. This is because operations on newly created (empty) tables don't cause the locking issues these rules detect.
+
+> **Note:** R007 (`fk-without-concurrent-index`) was merged into R006 and retired. Its concern — that an FK on an existing table should be preceded by `AddIndexConcurrently` — is now part of R006's check, including the order-aware exemption (a concurrent index later in the same migration does not protect the FK).
 
 For example, this migration will NOT trigger R001:
 
@@ -110,6 +112,27 @@ class Migration(migrations.Migration):
 ### R015 Limitation
 
 R015 (alter-field-not-null) cannot determine whether a field was previously nullable. It flags ALL `AlterField` operations where the resulting field is NOT NULL, which may produce false positives when the field was already NOT NULL. This is a fundamental limitation of static analysis without schema history. Use `# zdm: ignore R015` inline comments for legitimate `AlterField` operations that don't change nullability.
+
+### Inline Suppression
+
+You can silence specific rules on a per-operation basis with a comment:
+
+```python
+operations = [
+    # zdm: ignore R001
+    migrations.AddIndex(
+        model_name='order',
+        index=models.Index(fields=['created_at'], name='order_idx'),
+    ),
+    migrations.AlterField(  # zdm: ignore R015, R010
+        model_name='product',
+        name='sku',
+        field=models.CharField(max_length=50),
+    ),
+]
+```
+
+The comment can sit on the line just above the operation or on the same line as any line in the operation's range. Multiple rule IDs may be listed, separated by commas.
 
 ## Configuration
 
@@ -142,7 +165,7 @@ Add to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/Photoroom/zero-downtime-migrations
-    rev: v0.1.0
+    rev: v0.3.2
     hooks:
       - id: zdm
 ```
@@ -152,7 +175,7 @@ Or use diff mode to only check changed migrations:
 ```yaml
 repos:
   - repo: https://github.com/Photoroom/zero-downtime-migrations
-    rev: v0.1.0
+    rev: v0.3.2
     hooks:
       - id: zdm-diff
 ```
@@ -164,7 +187,7 @@ pre-commit is validating, rather than the previous `HEAD` commit.
 
 ```yaml
 - name: Install zdm
-  run: pip install zero-downtime-migrations
+  run: pip install django-zdm
 
 - name: Lint migrations
   run: zdm --diff origin/main
@@ -177,7 +200,7 @@ pre-commit is validating, rather than the previous `HEAD` commit.
 | **Requires Django installed** | No | Yes | Yes |
 | **Requires project setup** | No | Yes (settings.py) | Yes (full environment) |
 | **Checks for missing migrations** | No | No | Yes |
-| **Checks for unsafe operations** | Yes (17 rules) | Yes (~8 rules) | No |
+| **Checks for unsafe operations** | Yes (16 rules) | Yes (~8 rules) | No |
 | **Can run without database** | Yes | Yes | No |
 | **Language** | Rust | Python | Python |
 

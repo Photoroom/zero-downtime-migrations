@@ -1,5 +1,6 @@
 //! Extracts typed migration operations from tree-sitter nodes.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use tree_sitter::Node;
@@ -13,21 +14,81 @@ use crate::diagnostics::Span;
 use crate::error::Result;
 use crate::parser::ParsedMigration;
 
-/// Check if text contains a keyword assignment pattern, handling whitespace variations.
-/// e.g., matches both "null=True" and "null = True"
+/// Check if `text` contains a `keyword=value` assignment that sits at a
+/// keyword-argument boundary inside a call. Both `null=True` and
+/// `null = True` match, but `not_null=True` (no boundary before) and
+/// `null=Truthy` (no boundary after the value) do not.
 fn contains_keyword_assignment(text: &str, keyword: &str, value: &str) -> bool {
-    // Normalize whitespace: remove all spaces and check
-    let normalized = text.replace(' ', "");
-    let pattern = format!("{}={}", keyword, value);
-    normalized.contains(&pattern)
+    let normalized = strip_whitespace(text);
+    let value_bytes = value.as_bytes();
+    for after_eq in keyword_eq_positions(&normalized, keyword) {
+        if !normalized[after_eq..].starts_with(value_bytes) {
+            continue;
+        }
+        let next = normalized
+            .get(after_eq + value_bytes.len())
+            .copied()
+            .unwrap_or(b')');
+        if matches!(next, b',' | b')') {
+            return true;
+        }
+    }
+    false
 }
 
-/// Check if text contains a keyword assignment with any value.
-/// e.g., matches "default=", "default =", "default= ", "default = "
+/// Check if `text` contains `keyword=...` where `keyword` is a complete
+/// kwarg name (preceded by `(`, `,`, or start of text).
 fn contains_keyword_with_value(text: &str, keyword: &str) -> bool {
-    // Check if keyword appears followed by = (with optional whitespace)
-    let normalized = text.replace(' ', "");
-    normalized.contains(&format!("{}=", keyword))
+    let normalized = strip_whitespace(text);
+    !keyword_eq_positions(&normalized, keyword).is_empty()
+}
+
+/// Indices in `normalized` just after each `<keyword>=` whose keyword sits
+/// at a kwarg boundary (preceded by `(`, `,`, or start of text).
+fn keyword_eq_positions(normalized: &[u8], keyword: &str) -> Vec<usize> {
+    let kw_eq: Vec<u8> = keyword.bytes().chain(std::iter::once(b'=')).collect();
+    let mut hits = Vec::new();
+    for i in 0..normalized.len() {
+        if !normalized[i..].starts_with(&kw_eq) {
+            continue;
+        }
+        let prev = if i == 0 { b'(' } else { normalized[i - 1] };
+        if !matches!(prev, b'(' | b',') {
+            continue;
+        }
+        hits.push(i + kw_eq.len());
+    }
+    hits
+}
+
+fn strip_whitespace(text: &str) -> Vec<u8> {
+    text.bytes().filter(|b| !b.is_ascii_whitespace()).collect()
+}
+
+/// Parse a `# zdm: ignore RXXX[, RYYY]` comment into its rule-ID set,
+/// returning `None` if the comment does not match the suppression form.
+/// Accepts both `# zdm: ignore RXXX` and the slightly lax `# zdm:ignore RXXX`.
+/// Rule IDs are returned in their normalised upper-case form.
+fn parse_ignore_directive(comment: &str) -> Option<Vec<String>> {
+    let body = comment.trim_start_matches('#').trim_start();
+    let body = body.strip_prefix("zdm")?.trim_start();
+    let body = body.strip_prefix(':')?.trim_start();
+    let body = body.strip_prefix("ignore")?;
+    // Require whitespace (or end-of-string) after `ignore`, so that
+    // `ignored_attribute` doesn't accidentally match.
+    if !body.is_empty() && !body.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let ids: Vec<String> = body
+        .split(',')
+        .map(|s| s.trim().to_ascii_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if ids.is_empty() {
+        None
+    } else {
+        Some(ids)
+    }
 }
 
 /// Extracts migration operations from a parsed Python file.
@@ -46,6 +107,7 @@ impl<'a> MigrationExtractor<'a> {
         let operations = self.extract_operations();
         let imports = self.extract_imports();
         let is_non_atomic = self.parsed.is_non_atomic();
+        let line_ignores = self.extract_line_ignores();
 
         // Track created models for exemption
         let created_models: Vec<String> = operations
@@ -63,7 +125,20 @@ impl<'a> MigrationExtractor<'a> {
             operations,
             imports,
             created_models,
+            line_ignores,
         })
+    }
+
+    /// Walk every comment in the parse tree and collect any
+    /// `# zdm: ignore RXXX[, RYYY]` directives into a line → rule-ID map.
+    fn extract_line_ignores(&self) -> BTreeMap<usize, BTreeSet<String>> {
+        let mut map: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
+        for (line, text) in self.parsed.all_comments() {
+            if let Some(ids) = parse_ignore_directive(&text) {
+                map.entry(line).or_default().extend(ids);
+            }
+        }
+        map
     }
 
     /// Extract all operations from the migration.
@@ -215,7 +290,7 @@ impl<'a> MigrationExtractor<'a> {
                                 field_type,
                                 is_nullable,
                                 has_default,
-                                // FK target extraction not implemented: R006/R007 only need to know
+                                // FK target extraction not implemented: R006 only needs to know
                                 // a field is a ForeignKey, not which model it references.
                                 references: None,
                                 raw_text,
@@ -264,12 +339,27 @@ impl<'a> MigrationExtractor<'a> {
     }
 
     /// Extract RunSQL operation data.
+    ///
+    /// Both `sql` and `reverse_sql` are extracted from either their keyword
+    /// argument or their corresponding positional slot (0 for `sql`, 1 for
+    /// `reverse_sql`, per Django's `RunSQL(sql, reverse_sql=None, ...)`
+    /// signature). For each, a bare identifier value is resolved against
+    /// module-level `NAME = "..."` assignments so that
+    /// `RunSQL(sql=MY_SQL_CONST)` does not slip through as if the SQL were
+    /// the literal text `MY_SQL_CONST`. Non-literal, non-resolvable values
+    /// (function calls, lambdas, etc.) yield `None` so downstream rules
+    /// fall back to the conservative "no SQL extracted" path rather than
+    /// being misled by raw node text.
     fn extract_run_sql_operation(&self, args: Node) -> RunSQLOperation {
         let sql = self
-            .get_keyword_arg_string(args, "sql")
-            .or_else(|| self.get_first_positional_string(args))
+            .get_keyword_arg_value(args, "sql")
+            .or_else(|| self.get_nth_positional_value(args, 0))
+            .and_then(|v| self.resolve_string_value(v))
             .unwrap_or_default();
-        let reverse_sql = self.get_keyword_arg_string(args, "reverse_sql");
+        let reverse_sql = self
+            .get_keyword_arg_value(args, "reverse_sql")
+            .or_else(|| self.get_nth_positional_value(args, 1))
+            .and_then(|v| self.resolve_string_value(v));
 
         RunSQLOperation { sql, reverse_sql }
     }
@@ -278,11 +368,17 @@ impl<'a> MigrationExtractor<'a> {
     fn extract_run_python_operation(&self, args: Node) -> RunPythonOperation {
         let code = self
             .get_keyword_arg_string(args, "code")
-            .or_else(|| self.get_nth_positional_identifier(args, 0))
+            .or_else(|| self.get_nth_positional_arg(args, 0))
             .unwrap_or_default();
+        // Treat an explicit Python `None` (`RunPython(forward, None)` or
+        // `reverse_code=None`) as no reverse. Django itself flags that
+        // shape as irreversible; without the filter, the helpers above
+        // return the literal text `"None"` and downstream code mistakes
+        // it for a real callable name.
         let reverse_code = self
             .get_keyword_arg_string(args, "reverse_code")
-            .or_else(|| self.get_nth_positional_identifier(args, 1));
+            .or_else(|| self.get_nth_positional_arg(args, 1))
+            .filter(|s| s != "None");
 
         RunPythonOperation { code, reverse_code }
     }
@@ -316,11 +412,71 @@ impl<'a> MigrationExtractor<'a> {
         self.parsed
             .get_imports()
             .into_iter()
-            .map(|node| Import {
-                text: self.node_text(node).to_string(),
-                span: Span::from_node(&node),
+            .map(|node| {
+                let (module, names) = self.extract_import_parts(node);
+                Import {
+                    module,
+                    names,
+                    span: Span::from_node(&node),
+                }
             })
             .collect()
+    }
+
+    /// For an `import_from_statement`, return the module path and the list
+    /// of imported names. For a plain `import_statement` returns `(None,
+    /// names_imported)` so callers can match on the absence of a module.
+    fn extract_import_parts(&self, node: Node) -> (Option<String>, Vec<String>) {
+        if node.kind() != "import_from_statement" {
+            // `import X` / `import X as Y` — module is the dotted path.
+            let mut names = Vec::new();
+            for child in node.named_children(&mut node.walk()) {
+                match child.kind() {
+                    "dotted_name" | "identifier" => {
+                        names.push(self.node_text(child).to_string());
+                    }
+                    "aliased_import" => {
+                        if let Some(orig) = child.child_by_field_name("name") {
+                            names.push(self.node_text(orig).to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return (None, names);
+        }
+
+        let module = node
+            .child_by_field_name("module_name")
+            .map(|m| self.node_text(m).to_string());
+
+        let mut names = Vec::new();
+        // Imported names appear as named children that are not the
+        // module_name field. Tree-sitter-python tags `module_name` as a
+        // field but the children iterator still yields it; filter by id.
+        let module_id = node.child_by_field_name("module_name").map(|m| m.id());
+        for child in node.named_children(&mut node.walk()) {
+            if Some(child.id()) == module_id {
+                continue;
+            }
+            match child.kind() {
+                "dotted_name" | "identifier" => {
+                    names.push(self.node_text(child).to_string());
+                }
+                "aliased_import" => {
+                    if let Some(orig) = child.child_by_field_name("name") {
+                        names.push(self.node_text(orig).to_string());
+                    }
+                }
+                // `from X import *` — record as a wildcard sentinel so
+                // matchers can decide whether to treat it as broad.
+                "wildcard_import" => {
+                    names.push("*".to_string());
+                }
+                _ => {}
+            }
+        }
+        (module, names)
     }
 
     /// Get a keyword argument value as a string.
@@ -339,26 +495,107 @@ impl<'a> MigrationExtractor<'a> {
         None
     }
 
-    /// Get the first positional string argument.
-    fn get_first_positional_string(&self, args: Node) -> Option<String> {
+    /// Get the value node of a keyword argument, if present.
+    fn get_keyword_arg_value(&self, args: Node<'a>, key: &str) -> Option<Node<'a>> {
         for child in args.children(&mut args.walk()) {
-            if child.kind() == "string" {
-                return Some(self.extract_string_value(child));
+            if child.kind() != "keyword_argument" {
+                continue;
+            }
+            let Some(name) = child.child_by_field_name("name") else {
+                continue;
+            };
+            if self.node_text(name) != key {
+                continue;
+            }
+            return child.child_by_field_name("value");
+        }
+        None
+    }
+
+    /// Get the Nth positional value-node (skipping keyword arguments and
+    /// comments). Mirrors `get_nth_positional_arg` but yields the Node so
+    /// callers can branch on its kind.
+    fn get_nth_positional_value(&self, args: Node<'a>, n: usize) -> Option<Node<'a>> {
+        let mut count = 0;
+        for child in args.named_children(&mut args.walk()) {
+            if matches!(child.kind(), "keyword_argument" | "comment") {
+                continue;
+            }
+            if count == n {
+                return Some(child);
+            }
+            count += 1;
+        }
+        None
+    }
+
+    /// Resolve a value node to a string: directly if it's a `string`
+    /// literal, or by following an `identifier` to a module-level
+    /// `NAME = "..."` assignment. Anything else (calls, lambdas, dict
+    /// comprehensions, etc.) yields `None` so callers don't accidentally
+    /// treat raw node text as the value.
+    fn resolve_string_value(&self, node: Node<'_>) -> Option<String> {
+        match node.kind() {
+            "string" => Some(self.extract_string_value(node)),
+            "identifier" => {
+                let name = self.node_text(node).to_string();
+                self.resolve_module_string_binding(&name)
+            }
+            _ => None,
+        }
+    }
+
+    /// Find a module-level `name = "string-literal"` assignment and return
+    /// its right-hand side. Only one level of indirection: chains like
+    /// `A = B; B = "..."` are not followed.
+    fn resolve_module_string_binding(&self, name: &str) -> Option<String> {
+        let root = self.parsed.root_node();
+        let source = self.parsed.source_bytes();
+        for child in root.children(&mut root.walk()) {
+            if child.kind() != "expression_statement" {
+                continue;
+            }
+            let Some(assignment) = child.named_child(0) else {
+                continue;
+            };
+            if assignment.kind() != "assignment" {
+                continue;
+            }
+            let Some(left) = assignment.child_by_field_name("left") else {
+                continue;
+            };
+            if left.utf8_text(source).ok() != Some(name) {
+                continue;
+            }
+            let Some(right) = assignment.child_by_field_name("right") else {
+                continue;
+            };
+            if right.kind() == "string" {
+                return Some(self.extract_string_value(right));
             }
         }
         None
     }
 
-    /// Get the Nth positional identifier argument.
-    fn get_nth_positional_identifier(&self, args: Node, n: usize) -> Option<String> {
+    /// Get the textual source of the Nth positional argument, regardless
+    /// of expression shape. Skips `keyword_argument` and `comment` named
+    /// children so that e.g. `RunPython(forward, reverse_code=rev)`
+    /// returns `forward` for `n == 0` and yields nothing for `n == 1`,
+    /// and `RunPython(forward, # note\n backward)` returns `backward` for
+    /// `n == 1`. The returned string is the raw node text (e.g.
+    /// `migrations.RunPython.noop`, `helpers.fwd`, `(forward)`, or
+    /// `make_forward()`); callers that need a specific shape should
+    /// inspect it further.
+    fn get_nth_positional_arg(&self, args: Node, n: usize) -> Option<String> {
         let mut count = 0;
-        for child in args.children(&mut args.walk()) {
-            if child.kind() == "identifier" {
-                if count == n {
-                    return Some(self.node_text(child).to_string());
-                }
-                count += 1;
+        for child in args.named_children(&mut args.walk()) {
+            if matches!(child.kind(), "keyword_argument" | "comment") {
+                continue;
             }
+            if count == n {
+                return Some(self.node_text(child).to_string());
+            }
+            count += 1;
         }
         None
     }
@@ -523,6 +760,178 @@ class Migration(migrations.Migration):
         }
     }
 
+    const RUN_SQL_WITH_MODULE_BINDING: &str = r#"
+from django.db import migrations
+
+CREATE_SQL = "CREATE INDEX CONCURRENTLY idx ON tbl (col);"
+DROP_SQL = "DROP INDEX idx;"
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL(sql=CREATE_SQL, reverse_sql=DROP_SQL),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_run_sql_resolves_identifier_bindings() {
+        // The previous extractor took the raw identifier text ("CREATE_SQL")
+        // as the SQL. Now we follow the assignment to the literal so R003
+        // and R013 see the real SQL.
+        let parsed = ParsedMigration::parse(RUN_SQL_WITH_MODULE_BINDING).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        if let OperationData::RunSQL(data) = &migration.operations[0].data {
+            assert_eq!(data.sql, "CREATE INDEX CONCURRENTLY idx ON tbl (col);");
+            assert_eq!(data.reverse_sql.as_deref(), Some("DROP INDEX idx;"));
+        } else {
+            panic!("Expected RunSQL data");
+        }
+    }
+
+    const RUN_SQL_POSITIONAL_LITERAL: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL("CREATE INDEX CONCURRENTLY a ON tbl (c);", "DROP INDEX a;"),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_run_sql_positional_reverse_sql() {
+        let parsed = ParsedMigration::parse(RUN_SQL_POSITIONAL_LITERAL).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        if let OperationData::RunSQL(data) = &migration.operations[0].data {
+            assert_eq!(data.sql, "CREATE INDEX CONCURRENTLY a ON tbl (c);");
+            assert_eq!(data.reverse_sql.as_deref(), Some("DROP INDEX a;"));
+        } else {
+            panic!("Expected RunSQL data");
+        }
+    }
+
+    const RUN_SQL_UNRESOLVABLE: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL(sql=undefined_const),
+    ]
+"#;
+
+    const IGNORE_DIRECTIVE_SAMPLES: &str = r#"
+from django.db import migrations
+
+# zdm: ignore R015
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddField(  # zdm: ignore R001, R010
+            model_name='order',
+            name='x',
+            field=None,
+        ),
+        migrations.RunSQL("UPDATE t SET c=1"),  # zdm:ignore R013
+    ]
+"#;
+
+    #[test]
+    fn test_extract_line_ignores() {
+        let parsed = ParsedMigration::parse(IGNORE_DIRECTIVE_SAMPLES).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        // The comment on its own line.
+        let line_r015 = *migration
+            .line_ignores
+            .iter()
+            .find(|(_, set)| set.contains("R015"))
+            .map(|(line, _)| line)
+            .expect("R015 ignore present");
+        assert!(line_r015 > 1, "expected a non-zero line for R015");
+
+        // The same-line comment carries both R001 and R010.
+        let ids_for_addfield = migration
+            .line_ignores
+            .values()
+            .find(|set| set.contains("R001") && set.contains("R010"))
+            .expect("R001+R010 multi-id ignore present");
+        assert_eq!(ids_for_addfield.len(), 2);
+
+        // Lax `# zdm:ignore` (no space after the colon) still works.
+        assert!(migration
+            .line_ignores
+            .values()
+            .any(|set| set.contains("R013")));
+    }
+
+    #[test]
+    fn test_parse_ignore_directive_rejects_non_directives() {
+        assert!(parse_ignore_directive("# normal comment").is_none());
+        assert!(parse_ignore_directive("# zdm: noqa R001").is_none());
+        assert!(parse_ignore_directive("# zdm: ignored R001").is_none());
+        assert!(parse_ignore_directive("# zdm: ignore").is_none());
+        // Case is normalised on rule IDs.
+        let ids = parse_ignore_directive("# zdm: ignore r001, r002").unwrap();
+        assert_eq!(ids, vec!["R001".to_string(), "R002".to_string()]);
+    }
+
+    #[test]
+    fn test_is_rule_suppressed_at_within_span_and_above() {
+        let parsed = ParsedMigration::parse(IGNORE_DIRECTIVE_SAMPLES).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        // Same-line suppression: AddField's `# zdm: ignore R001, R010`
+        // sits on the call's first line.
+        let addfield = migration
+            .operations
+            .iter()
+            .find(|op| op.op_type == OperationType::AddField)
+            .unwrap();
+        assert!(migration.is_rule_suppressed_at(
+            "R001",
+            addfield.span.start_line,
+            addfield.span.end_line,
+        ));
+        assert!(migration.is_rule_suppressed_at(
+            "R010",
+            addfield.span.start_line,
+            addfield.span.end_line,
+        ));
+
+        // Different rule on the same span is not suppressed.
+        assert!(!migration.is_rule_suppressed_at(
+            "R016",
+            addfield.span.start_line,
+            addfield.span.end_line,
+        ));
+    }
+
+    #[test]
+    fn test_extract_run_sql_unresolvable_identifier_yields_empty() {
+        // Unknown identifier: no module-level binding, so we report empty
+        // SQL rather than fabricating "undefined_const" as the SQL text.
+        let parsed = ParsedMigration::parse(RUN_SQL_UNRESOLVABLE).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        if let OperationData::RunSQL(data) = &migration.operations[0].data {
+            assert!(data.sql.is_empty());
+            assert!(data.reverse_sql.is_none());
+        } else {
+            panic!("Expected RunSQL data");
+        }
+    }
+
     #[test]
     fn test_extract_run_python_operation() {
         let parsed = ParsedMigration::parse(RUN_PYTHON_MIGRATION).unwrap();
@@ -537,6 +946,47 @@ class Migration(migrations.Migration):
             assert_eq!(data.code, "forward");
             assert!(data.reverse_code.is_some());
             assert!(data.is_reversible());
+        } else {
+            panic!("Expected RunPython data");
+        }
+    }
+
+    const RUN_PYTHON_WITH_INTER_ARG_COMMENT: &str = r#"
+from django.db import migrations
+
+
+def forward(apps, schema_editor):
+    pass
+
+
+def backward(apps, schema_editor):
+    pass
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunPython(
+            forward,
+            # historical context for the reverse
+            backward,
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_run_python_skips_inter_arg_comment() {
+        // Tree-sitter-python emits comments as named children of
+        // `argument_list`. Without an explicit skip, the comment between
+        // `forward` and `backward` would be returned as `reverse_code` and
+        // `backward` would be lost.
+        let parsed = ParsedMigration::parse(RUN_PYTHON_WITH_INTER_ARG_COMMENT).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        if let OperationData::RunPython(data) = &migration.operations[0].data {
+            assert_eq!(data.code, "forward");
+            assert_eq!(data.reverse_code.as_deref(), Some("backward"));
         } else {
             panic!("Expected RunPython data");
         }
@@ -646,7 +1096,7 @@ class Migration(migrations.Migration):
 
     #[test]
     fn test_contains_keyword_assignment() {
-        // Test the helper function directly
+        // Whitespace variants of the positive case.
         assert!(contains_keyword_assignment("null=True", "null", "True"));
         assert!(contains_keyword_assignment("null = True", "null", "True"));
         assert!(contains_keyword_assignment("null  =  True", "null", "True"));
@@ -655,9 +1105,34 @@ class Migration(migrations.Migration):
             "null",
             "True"
         ));
+
+        // Wrong value.
         assert!(!contains_keyword_assignment("null=False", "null", "True"));
+
+        // Lookalike keywords. The old substring-only implementation matched
+        // these because, after stripping whitespace, "nullable=True" /
+        // "not_null=True" each contain the substring "null=True".
         assert!(!contains_keyword_assignment(
             "nullable=True",
+            "null",
+            "True"
+        ));
+        assert!(!contains_keyword_assignment(
+            "models.CharField(not_null=True)",
+            "null",
+            "True"
+        ));
+
+        // Lookalike values: "True" appearing as a prefix of "Truthy".
+        assert!(!contains_keyword_assignment(
+            "models.CharField(null=Truthy)",
+            "null",
+            "True"
+        ));
+
+        // Real usage with surrounding kwargs.
+        assert!(contains_keyword_assignment(
+            "models.CharField(max_length=50, null=True, default='x')",
             "null",
             "True"
         ));
@@ -669,6 +1144,20 @@ class Migration(migrations.Migration):
         assert!(contains_keyword_with_value("default = 'foo'", "default"));
         assert!(contains_keyword_with_value("default=None", "default"));
         assert!(!contains_keyword_with_value("no_default_here", "default"));
+
+        // Lookalike keyword: "my_default=5" should not match the keyword
+        // "default" because `default` is not at a kwarg boundary.
+        assert!(!contains_keyword_with_value("my_default=5", "default"));
+        assert!(!contains_keyword_with_value(
+            "models.CharField(my_default=5)",
+            "default"
+        ));
+
+        // Real usage.
+        assert!(contains_keyword_with_value(
+            "models.CharField(max_length=50, default='x')",
+            "default"
+        ));
     }
 
     const FIELD_WITH_WHITESPACE_NULLABLE: &str = r#"

@@ -66,7 +66,6 @@ impl Rule for R015AlterFieldNotNull {
                                  to check existing rows without locking"
                                     .to_string(),
                             ),
-                            fix: None,
                         });
                     }
                 }
