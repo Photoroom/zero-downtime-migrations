@@ -142,7 +142,7 @@ Add to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/Photoroom/zero-downtime-migrations
-    rev: v0.1.0
+    rev: v0.3.2
     hooks:
       - id: zdm
 ```
@@ -152,7 +152,7 @@ Or use diff mode to only check changed migrations:
 ```yaml
 repos:
   - repo: https://github.com/Photoroom/zero-downtime-migrations
-    rev: v0.1.0
+    rev: v0.3.2
     hooks:
       - id: zdm-diff
 ```
