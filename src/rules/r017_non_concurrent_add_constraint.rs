@@ -58,7 +58,6 @@ impl Rule for R017NonConcurrentAddConstraint {
                              ALTER TABLE VALIDATE CONSTRAINT ..."
                                 .to_string(),
                         ),
-                        fix: None,
                     });
                 }
             }

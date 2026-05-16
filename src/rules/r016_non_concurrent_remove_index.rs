@@ -45,7 +45,6 @@ impl Rule for R016NonConcurrentRemoveIndex {
                      django.contrib.postgres.operations"
                         .to_string(),
                 ),
-                fix: None,
             });
         }
 

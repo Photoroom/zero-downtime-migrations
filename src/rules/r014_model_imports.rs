@@ -46,7 +46,6 @@ impl Rule for R014ModelImports {
                          the historical model state instead of importing directly"
                             .to_string(),
                     ),
-                    fix: None,
                 });
             }
         }

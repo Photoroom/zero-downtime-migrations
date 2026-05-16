@@ -7,6 +7,6 @@ mod diagnostic;
 mod severity;
 mod span;
 
-pub use diagnostic::{Diagnostic, Diagnostics, Fix};
+pub use diagnostic::Diagnostic;
 pub use severity::Severity;
 pub use span::Span;

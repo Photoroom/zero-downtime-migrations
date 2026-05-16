@@ -46,7 +46,6 @@ impl Rule for R012IrreversibleRunPython {
                              RunPython(forward, migrations.RunPython.noop) if no reverse is needed"
                                 .to_string(),
                         ),
-                        fix: None,
                     });
                 }
             }

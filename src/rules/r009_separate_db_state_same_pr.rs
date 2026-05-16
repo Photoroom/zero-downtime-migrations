@@ -74,7 +74,6 @@ impl ChangesetRule for R009SeparateDbStateSamePr {
                      migration in a separate PR."
                         .to_string(),
                 ),
-                fix: None,
             });
         }
 

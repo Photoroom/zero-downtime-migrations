@@ -46,7 +46,6 @@ impl Rule for R013IrreversibleRunSQL {
                              RunSQL(sql, migrations.RunSQL.noop) if no reverse is needed"
                                 .to_string(),
                         ),
-                        fix: None,
                     });
                 }
             }

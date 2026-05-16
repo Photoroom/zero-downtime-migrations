@@ -71,7 +71,6 @@ impl ChangesetRule for R008DisallowedFileChanges {
                          Split this PR into separate changes or add the pattern to allowed-file-patterns."
                             .to_string(),
                     ),
-                    fix: None,
                 });
             }
         }

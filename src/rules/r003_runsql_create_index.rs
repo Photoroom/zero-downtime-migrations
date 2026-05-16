@@ -53,7 +53,6 @@ impl Rule for R003RunSQLCreateIndex {
                         help: Some(
                             "Use CREATE INDEX CONCURRENTLY to avoid table locks".to_string(),
                         ),
-                        fix: None,
                     });
                 }
             }

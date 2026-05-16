@@ -90,7 +90,6 @@ impl Rule for R006AddFieldForeignKey {
                              constraint."
                                 .to_string(),
                         ),
-                        fix: None,
                     });
                 }
                 _ => {}

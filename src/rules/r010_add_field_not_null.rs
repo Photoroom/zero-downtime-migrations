@@ -56,7 +56,6 @@ impl Rule for R010AddFieldNotNull {
                                  remove null=True in a separate migration, or 2) Provide a default value"
                                     .to_string(),
                             ),
-                            fix: None,
                         });
                     }
                 }

@@ -44,7 +44,6 @@ impl Rule for R011RenameField {
                      4) Remove old field. This allows gradual rollout."
                         .to_string(),
                 ),
-                fix: None,
             });
         }
 
