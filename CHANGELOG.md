@@ -1,9 +1,12 @@
 # Changelog
 
-## 0.4.0
+## Unreleased
 
-User-visible behaviour changes; warrants a minor bump rather than a
-patch.
+Accumulating changes since 0.3.2. The notes below describe the
+user-visible behaviour shifts; the actual release tag and version
+bump will land in a separate commit when we cut the next version.
+Severity flips and behavioural widenings will likely warrant a
+minor bump (`0.4.0`) rather than a patch.
 
 ### Rules
 
