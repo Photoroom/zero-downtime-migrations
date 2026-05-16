@@ -16,7 +16,7 @@
 //! from the source) is silently skipped to avoid false positives on
 //! unrecognised classes.
 
-use crate::ast::{ConstraintType, Migration, OperationData, OperationType};
+use crate::ast::{ConstraintType, Migration, ModelOperation, OperationData, OperationType};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::rules::{Rule, RuleContext};
 
@@ -44,16 +44,30 @@ impl Rule for R017NonConcurrentAddConstraint {
     }
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
+        // Walk in source order so the fresh-model exemption only
+        // honours CreateModel ops that ran *before* the AddConstraint.
+        // The previous order-blind `is_model_created` lookup would
+        // silently exempt an AddConstraint placed above its
+        // CreateModel — the same false negative R002 and R016 fixed
+        // earlier in this PR.
         let mut diagnostics = Vec::new();
+        let mut created_so_far: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
-        for op in migration.operations_of_type(OperationType::AddConstraint) {
+        for op in &migration.operations {
+            if op.op_type == OperationType::CreateModel {
+                if let OperationData::Model(ModelOperation { name, .. }) = &op.data {
+                    created_so_far.insert(name.to_lowercase());
+                }
+                continue;
+            }
+            if op.op_type != OperationType::AddConstraint {
+                continue;
+            }
             let OperationData::Constraint(data) = &op.data else {
                 continue;
             };
-            // Skip if model was created in same migration — no rows
-            // yet, so no validation lock and no live traffic to block
-            // while building any index.
-            if migration.is_model_created(&data.model_name) {
+            if created_so_far.contains(&data.model_name.to_lowercase()) {
                 continue;
             }
 
@@ -243,5 +257,38 @@ class Migration(migrations.Migration):
         // CheckConstraint on a model created in same migration should be exempt
         let diagnostics = check_migration(CREATE_MODEL_WITH_CHECK_CONSTRAINT);
         assert!(diagnostics.is_empty());
+    }
+
+    const ADDCONSTRAINT_BEFORE_CREATEMODEL_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddConstraint(
+            model_name='product',
+            constraint=models.CheckConstraint(check=models.Q(price__gte=0), name='positive_price'),
+        ),
+        migrations.CreateModel(
+            name='Product',
+            fields=[
+                ('id', models.AutoField(primary_key=True)),
+                ('price', models.DecimalField()),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_addconstraint_before_createmodel_is_not_exempted() {
+        // Order-aware exemption: a CreateModel that runs *after* the
+        // AddConstraint cannot retroactively make the AddConstraint
+        // safe. The previous `is_model_created` lookup was
+        // order-blind and silently exempted this — the same false
+        // negative R002 and R016 fixed earlier in this PR.
+        let diagnostics = check_migration(ADDCONSTRAINT_BEFORE_CREATEMODEL_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R017");
     }
 }

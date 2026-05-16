@@ -9,7 +9,7 @@
 //! same operation with overlapping prescriptions; R007 was retired and
 //! its order-aware concurrent-index exemption is now part of R006.
 
-use crate::ast::{Migration, OperationData, OperationType};
+use crate::ast::{Migration, ModelOperation, OperationData, OperationType};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::rules::{Rule, RuleContext};
 
@@ -38,17 +38,20 @@ impl Rule for R006AddFieldForeignKey {
     }
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
-        // Walk operations in order so the AddIndexConcurrently exemption is
-        // only honored when the index appeared *before* the FK in this
-        // migration — otherwise the FK would still acquire its lock before
-        // the index exists. The exemption additionally requires the index
-        // to *lead with* the FK column: Postgres can use a btree's leading
-        // prefix for FK lookups/joins, but not a non-leading column, so
-        // an index on `(status, customer)` does nothing for an FK on
-        // `customer`. The previous heuristic exempted any index whose
-        // column set contained the FK column, which silently shipped that
-        // false negative.
+        // Walk operations in order. Two bookkeeping pieces matter:
+        //   - `created_so_far`: models created *before* the AddField,
+        //     so a CreateModel placed below the AddField doesn't
+        //     retroactively exempt (the same order-blindness fixed in
+        //     R002 and R016).
+        //   - `leading_columns`: concurrent indexes that appeared
+        //     before the AddField and *lead with* the FK column.
+        //     Postgres can use a btree's leading prefix for FK
+        //     lookups/joins, but not a non-leading column, so an
+        //     index on `(status, customer)` does nothing for an FK on
+        //     `customer`.
         let mut diagnostics = Vec::new();
+        let mut created_so_far: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut leading_columns: std::collections::HashMap<
             String,
             std::collections::HashSet<String>,
@@ -56,6 +59,11 @@ impl Rule for R006AddFieldForeignKey {
 
         for op in &migration.operations {
             match op.op_type {
+                OperationType::CreateModel => {
+                    if let OperationData::Model(ModelOperation { name, .. }) = &op.data {
+                        created_so_far.insert(name.to_lowercase());
+                    }
+                }
                 OperationType::AddIndexConcurrently => {
                     if let OperationData::Index(idx) = &op.data {
                         if let Some(first) = idx.columns.first() {
@@ -75,8 +83,7 @@ impl Rule for R006AddFieldForeignKey {
                         continue;
                     }
 
-                    // Exempt if the model was just created in this migration.
-                    if migration.is_model_created(&data.model_name) {
+                    if created_so_far.contains(&data.model_name.to_lowercase()) {
                         continue;
                     }
                     // Exempt if a concurrent index whose leading column
@@ -471,6 +478,39 @@ class Migration(migrations.Migration):
         ),
     ]
 "#;
+
+    const ADDFIELD_FK_BEFORE_CREATEMODEL_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddField(
+            model_name='order',
+            name='customer',
+            field=models.ForeignKey(on_delete=models.CASCADE, to='app.customer'),
+        ),
+        migrations.CreateModel(
+            name='Order',
+            fields=[
+                ('id', models.BigAutoField(primary_key=True)),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_addfield_fk_before_createmodel_is_not_exempted() {
+        // Order-aware exemption: a CreateModel that runs *after* the
+        // AddField cannot retroactively make the AddField safe. The
+        // previous `is_model_created` lookup was order-blind and
+        // silently exempted this — the same false negative R002 and
+        // R016 fixed earlier in this PR.
+        let diagnostics = check_migration(ADDFIELD_FK_BEFORE_CREATEMODEL_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R006");
+    }
 
     #[test]
     fn test_add_fk_with_db_column_is_false_positive() {
