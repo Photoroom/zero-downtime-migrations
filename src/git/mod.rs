@@ -231,24 +231,31 @@ impl GitRepo {
     }
 
     /// Read the staged contents of a file from the git index.
+    ///
+    /// `path` may be absolute (inside the repo root) or already
+    /// repo-relative. The function does not touch the filesystem to
+    /// resolve `path` — earlier code called `path.canonicalize()` to cope
+    /// with macOS-style `/tmp` ↔ `/private/tmp` aliases, but that
+    /// required `path` to exist on disk, which is wrong for a function
+    /// whose purpose is to read content that may exist only in the
+    /// index. The size cap from `parser::check_size` is applied against
+    /// the index entry's `file_size` *before* the blob is materialised,
+    /// so a 1 GB staged file can't force libgit2 to allocate a 1 GB
+    /// buffer just to be rejected afterwards.
     pub fn read_staged_file(&self, path: &Path) -> Result<String> {
         let root = self.root()?;
-        let relative_path = match path.strip_prefix(&root) {
-            Ok(relative) => relative.to_path_buf(),
-            Err(_) => {
-                let canonical_root = root.canonicalize().map_err(|e| Error::io(e, &root))?;
-                let canonical_path = path.canonicalize().map_err(|e| Error::io(e, path))?;
-                canonical_path
-                    .strip_prefix(canonical_root)
-                    .map(|relative| relative.to_path_buf())
-                    .map_err(|_| {
-                        Error::git_error_msg(format!(
-                            "File '{}' is not inside repository '{}'",
-                            path.display(),
-                            root.display()
-                        ))
-                    })?
-            }
+        let relative_path: PathBuf = if path.is_absolute() {
+            path.strip_prefix(&root)
+                .map_err(|_| {
+                    Error::git_error_msg(format!(
+                        "File '{}' is not inside repository '{}'",
+                        path.display(),
+                        root.display()
+                    ))
+                })?
+                .to_path_buf()
+        } else {
+            path.to_path_buf()
         };
 
         let index = self
@@ -261,6 +268,9 @@ impl GitRepo {
                 relative_path.display()
             ))
         })?;
+        // Reject oversized staged blobs before `find_blob` forces libgit2
+        // to inflate the object data.
+        crate::parser::check_size(path, u64::from(entry.file_size))?;
         let blob = self
             .repo
             .find_blob(entry.id)
@@ -750,21 +760,87 @@ mod tests {
     #[test]
     fn test_read_staged_file_ignores_unstaged_worktree_changes() {
         let (temp, repo) = create_test_repo();
+        // Use `repo.root()` consistently so the prefix matches libgit2's
+        // view; on macOS `temp.path()` and `repo.root()` can differ in
+        // /tmp vs /private/tmp.
+        let root = repo.root().unwrap();
 
-        fs::write(temp.path().join("README.md"), "# Test").unwrap();
+        fs::write(root.join("README.md"), "# Test").unwrap();
         commit(&temp, "Initial");
 
-        fs::write(temp.path().join("file.py"), "staged").unwrap();
+        fs::write(root.join("file.py"), "staged").unwrap();
         Command::new("git")
             .args(["add", "file.py"])
-            .current_dir(temp.path())
+            .current_dir(&root)
             .output()
             .unwrap();
 
-        fs::write(temp.path().join("file.py"), "unstaged").unwrap();
+        fs::write(root.join("file.py"), "unstaged").unwrap();
 
-        let content = repo.read_staged_file(&temp.path().join("file.py")).unwrap();
+        let content = repo.read_staged_file(&root.join("file.py")).unwrap();
         assert_eq!(content, "staged");
+    }
+
+    // Note: a portable regression test for the old `canonicalize` path
+    // would require manufacturing a repo whose libgit2 workdir prefix
+    // differs from the path the caller hands in (the macOS
+    // `/tmp` ↔ `/private/tmp` case) AND the worktree copy being absent.
+    // That's hard to construct cross-platform; the relative-path test
+    // below covers the only branch that survives in the new code, and
+    // the absolute path under `repo.root()` is covered by
+    // `test_read_staged_file_ignores_unstaged_worktree_changes` above.
+
+    #[test]
+    fn test_read_staged_file_accepts_repo_relative_path() {
+        // Relative paths skip `strip_prefix` entirely; this is the path
+        // a caller would take if they had the repo-relative form already
+        // and never reconstructed an absolute path. It exercises the
+        // is_absolute=false branch independently of any disk presence.
+        let (temp, repo) = create_test_repo();
+        let root = repo.root().unwrap();
+
+        fs::write(root.join("README.md"), "# Test").unwrap();
+        commit(&temp, "Initial");
+
+        fs::write(root.join("file.py"), "v1").unwrap();
+        Command::new("git")
+            .args(["add", "file.py"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let content = repo.read_staged_file(Path::new("file.py")).unwrap();
+        assert_eq!(content, "v1");
+    }
+
+    #[test]
+    fn test_read_staged_file_rejects_oversized_blob() {
+        // The size check must run *before* `find_blob`, so a multi-GB
+        // staged blob can't force libgit2 to inflate it just to reject
+        // it. We can't easily stage a GB-sized file in CI, but
+        // `MAX_FILE_SIZE` is 10 MB, so a 10 MB + 1 byte file is enough
+        // to drive the new pre-allocation guard.
+        let (temp, repo) = create_test_repo();
+        let root = repo.root().unwrap();
+
+        fs::write(root.join("README.md"), "# Test").unwrap();
+        commit(&temp, "Initial");
+
+        let payload = vec![b'a'; (crate::parser::MAX_FILE_SIZE as usize) + 1];
+        fs::write(root.join("huge.py"), &payload).unwrap();
+        Command::new("git")
+            .args(["add", "huge.py"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        match repo.read_staged_file(&root.join("huge.py")) {
+            Err(Error::FileTooLarge { size, max_size, .. }) => {
+                assert_eq!(size, crate::parser::MAX_FILE_SIZE + 1);
+                assert_eq!(max_size, crate::parser::MAX_FILE_SIZE);
+            }
+            other => panic!("expected FileTooLarge, got {other:?}"),
+        }
     }
 
     #[test]
