@@ -9,6 +9,7 @@ use super::{Severity, Span};
 /// Each diagnostic contains all the information needed to display
 /// a rich error message to the user.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Diagnostic {
     /// The rule ID (e.g., "R001").
     pub rule_id: &'static str,

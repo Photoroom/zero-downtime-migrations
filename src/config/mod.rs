@@ -31,6 +31,7 @@ use crate::error::{Error, Result};
 /// (config-from-Rust callers); enforcing this via setters would be
 /// cleaner but isn't done yet.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct Config {
     /// Rules to select (if empty, all rules are selected).
     pub select: HashSet<String>,
@@ -269,6 +270,7 @@ struct Tool {
 /// Configuration from a file (all fields optional for merging).
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct FileConfig {
     /// Rules to select.
     pub select: Option<Vec<String>>,

@@ -49,6 +49,7 @@ use crate::config::Config;
 use crate::diagnostics::{Diagnostic, Severity};
 
 /// Context passed to rules during linting.
+#[non_exhaustive]
 pub struct RuleContext<'a> {
     /// The configuration.
     pub config: &'a Config,

@@ -14,7 +14,16 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// The main error type for zdm.
+///
+/// `#[non_exhaustive]` so downstream code that exhaustively
+/// matches on the variants doesn't break when we add a new error
+/// path. The `UnknownRule` variant also gained an `available`
+/// field during this PR's review pass — pre-existing callers of
+/// `Error::unknown_rule` were updated in lockstep, but
+/// out-of-tree callers constructing the variant by struct-literal
+/// would have broken silently before this attribute landed.
 #[derive(Error, Debug, Diagnostic)]
+#[non_exhaustive]
 pub enum Error {
     /// File I/O error
     #[error("Failed to read file: {path}")]

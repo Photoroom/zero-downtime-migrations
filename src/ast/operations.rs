@@ -4,6 +4,7 @@ use crate::diagnostics::Span;
 
 /// A Django migration operation.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Operation {
     /// The type of operation.
     pub op_type: OperationType,
@@ -15,6 +16,7 @@ pub struct Operation {
 
 /// The type of a Django migration operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum OperationType {
     // Index operations
     AddIndex,
@@ -106,6 +108,7 @@ impl OperationType {
 
 /// Operation-specific data.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum OperationData {
     /// Index operation data.
     Index(IndexOperation),
@@ -127,6 +130,7 @@ pub enum OperationData {
 
 /// Data for index operations (AddIndex, RemoveIndex, etc.).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct IndexOperation {
     /// The model name (lowercase).
     pub model_name: String,
@@ -154,6 +158,7 @@ pub struct IndexOperation {
 
 /// Data for model operations (CreateModel, DeleteModel, etc.).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ModelOperation {
     /// The model name.
     pub name: String,
@@ -165,6 +170,7 @@ pub struct ModelOperation {
 
 /// A field definition in CreateModel.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FieldDefinition {
     /// The field name.
     pub name: String,
@@ -180,6 +186,7 @@ pub struct FieldDefinition {
 
 /// Data for field operations (AddField, RemoveField, etc.).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FieldOperation {
     /// The model name.
     pub model_name: String,
@@ -195,6 +202,7 @@ pub struct FieldOperation {
 
 /// Field information for AddField/AlterField.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FieldInfo {
     /// The field type (e.g., "CharField", "ForeignKey").
     pub field_type: String,
@@ -210,6 +218,7 @@ pub struct FieldInfo {
 
 /// Data for constraint operations.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConstraintOperation {
     /// The model name.
     pub model_name: String,
@@ -225,6 +234,7 @@ pub struct ConstraintOperation {
 /// `CheckConstraint`, `ExclusionConstraint`); foreign keys are added via
 /// `AddField`, not `AddConstraint`, so they don't appear here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConstraintType {
     Unique,
     Check,
@@ -234,6 +244,7 @@ pub enum ConstraintType {
 
 /// Data for RunSQL operations.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RunSQLOperation {
     /// The forward SQL statement.
     pub sql: String,
@@ -394,6 +405,7 @@ mod tests {
 
 /// Data for RunPython operations.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RunPythonOperation {
     /// The forward function name.
     pub code: String,
@@ -410,6 +422,7 @@ impl RunPythonOperation {
 
 /// Data for SeparateDatabaseAndState operations.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SeparateDatabaseAndStateOperation {
     /// Whether state_operations is present.
     pub has_state_operations: bool,

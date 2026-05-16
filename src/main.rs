@@ -515,6 +515,13 @@ fn output_default(diagnostics: &[Diagnostic]) {
         let severity_str = match diag.severity {
             Severity::Error => "error".red().bold(),
             Severity::Warning => "warning".yellow().bold(),
+            // `Severity` is `#[non_exhaustive]`; render any
+            // future variant the binary doesn't yet know about
+            // as a plain string so the diagnostic still shows up.
+            _ => format!("{:?}", diag.severity)
+                .to_lowercase()
+                .normal()
+                .bold(),
         };
 
         // Messages are single-line by convention (R008 etc. interpolate
@@ -655,6 +662,10 @@ fn output_compact(diagnostics: &[Diagnostic]) {
         let severity_char = match diag.severity {
             Severity::Error => "E",
             Severity::Warning => "W",
+            // `Severity` is `#[non_exhaustive]`; unknown future
+            // variants get a generic marker so the compact line
+            // still parses.
+            _ => "?",
         };
         println!(
             "{}:{}: {}: [{} {}] {}",

@@ -2,6 +2,7 @@
 
 /// The severity level of a diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Severity {
     /// A warning that should be reviewed but doesn't block CI.
     Warning,

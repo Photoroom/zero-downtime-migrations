@@ -7,6 +7,7 @@ use std::ops::Range;
 /// Spans are used to highlight the exact location of an issue
 /// in the migration file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Span {
     /// Byte offset of the start of the span (0-indexed).
     pub start: usize,

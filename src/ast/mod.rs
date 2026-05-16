@@ -16,7 +16,11 @@ use std::path::PathBuf;
 use crate::diagnostics::Span;
 
 /// A parsed Django migration file with extracted operations.
+///
+/// `#[non_exhaustive]` so future fields (new spans, new metadata)
+/// are additive — out-of-tree code must destructure with `..`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Migration {
     /// The file path of the migration.
     pub path: PathBuf,
@@ -27,7 +31,19 @@ pub struct Migration {
     /// Import statements that may be relevant for linting.
     pub imports: Vec<Import>,
     /// Model names created in this migration (for exemption tracking).
-    pub created_models: Vec<String>,
+    ///
+    /// **Order-blind** — the field is a flat list with no record of
+    /// where each `CreateModel` appeared relative to the operation
+    /// being evaluated. Out-of-tree consumers building custom rules
+    /// must not consult it for exemption decisions (it ships the
+    /// exact false negative that `is_model_created` was deprecated
+    /// for). Use the order-aware pattern from R001/R002/R006/
+    /// R010/R016/R017 instead: walk `operations` in source order
+    /// and track a local `created_so_far: HashSet<String>`.
+    ///
+    /// Demoted to `pub(crate)` so it can't be misused from outside
+    /// the crate while we figure out a safer accessor.
+    pub(crate) created_models: Vec<String>,
     /// Operations extracted from
     /// `SeparateDatabaseAndState(database_operations=[...])` arms in this
     /// migration. These represent the "database-side" half of a two-step
@@ -116,6 +132,7 @@ impl Migration {
 
 /// An import statement in the migration file.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Import {
     /// For `from X import ...`, the module path `X`. `None` for plain
     /// `import X` statements (the matcher `is_direct_model_import`
