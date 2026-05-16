@@ -152,11 +152,13 @@ exclude = ["**/test_migrations/**"]
 Settings are applied in this order (highest to lowest priority):
 
 1. **CLI flags** (`--select`, `--ignore`, `--warnings-as-errors`)
-2. **`zero-downtime-migrations.toml`** in the current directory
-3. **`pyproject.toml`** `[tool.zdm]` section
+2. **`zero-downtime-migrations.toml`** found by walking up the directory tree
+3. **`pyproject.toml`** `[tool.zdm]` section in the same directory
 4. **Default values**
 
-CLI flags always override config file settings. If both `zero-downtime-migrations.toml` and `pyproject.toml` exist, the standalone file takes precedence.
+The config search starts in the current working directory and walks upward, stopping at the first directory that contains either config file. The walk also stops at any directory containing a `.git` entry (the project root) or at the filesystem root — so running `zdm` from `repo/apps/myapp/migrations/` picks up `repo/zero-downtime-migrations.toml`, but a stray config above the repo is ignored.
+
+CLI flags always override config file settings. If both `zero-downtime-migrations.toml` and `pyproject.toml` exist in the same directory, the standalone file takes precedence; multi-level merging is not performed.
 
 ## Pre-commit Integration
 

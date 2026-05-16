@@ -48,11 +48,59 @@ impl Config {
         selected && !ignored
     }
 
-    /// Load configuration from a directory, searching for config files.
-    /// Glob patterns in `exclude` and `allowed_file_patterns` are validated
-    /// at load time; an invalid pattern surfaces as `Error::InvalidGlobPattern`
-    /// instead of being silently dropped at the match site.
+    /// Load configuration from a directory, walking up the directory
+    /// tree until a config file is found, the search hits a directory
+    /// containing a `.git` entry (project root), or the filesystem
+    /// root is reached. This lets developers run `zdm` from a
+    /// subdirectory of their project without losing the repo-level
+    /// configuration.
+    ///
+    /// At each level, both `pyproject.toml` and
+    /// `zero-downtime-migrations.toml` are tried (standalone wins
+    /// where both are present). The walk stops at the first level
+    /// that has either file — multi-level merging would surprise
+    /// users with `[tool.zdm]` blocks scattered across nested
+    /// pyprojects.
+    ///
+    /// Glob patterns in `exclude` and `allowed_file_patterns` are
+    /// validated at load time; an invalid pattern surfaces as
+    /// `Error::InvalidGlobPattern` instead of being silently dropped
+    /// at the match site.
     pub fn load_from_directory(dir: &Path) -> Result<Self> {
+        let config_dir = Self::find_config_dir(dir);
+        let search_dir = config_dir.as_deref().unwrap_or(dir);
+        Self::load_from_single_dir(search_dir)
+    }
+
+    /// Walk upward from `start` looking for the first directory that
+    /// contains either `pyproject.toml` or
+    /// `zero-downtime-migrations.toml`. Stop at any directory that
+    /// holds a `.git` entry (the repository root — a config above the
+    /// repo would belong to a parent project and is not ours to read)
+    /// or when the filesystem root is reached. Returns `None` if no
+    /// config file is found within those bounds.
+    fn find_config_dir(start: &Path) -> Option<std::path::PathBuf> {
+        let mut current = start;
+        loop {
+            if current.join("pyproject.toml").exists()
+                || current.join("zero-downtime-migrations.toml").exists()
+            {
+                return Some(current.to_path_buf());
+            }
+            // `.git` can be a directory (regular repo) or a file
+            // (worktree / submodule with a gitdir pointer); accept
+            // either form as the stop signal.
+            if current.join(".git").exists() {
+                return None;
+            }
+            current = current.parent()?;
+        }
+    }
+
+    /// Load whichever config files exist in a single directory,
+    /// merging them with the documented precedence (standalone
+    /// overrides pyproject) and validating glob patterns.
+    fn load_from_single_dir(dir: &Path) -> Result<Self> {
         let mut config = Config::default();
 
         // Try pyproject.toml first (lowest precedence of file configs)
@@ -417,5 +465,106 @@ exclude = ["**/test_migrations/**", "**/fixtures/**"]
             }
             other => panic!("expected InvalidGlobPattern, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_load_walks_up_to_find_config() {
+        // Drop a config in the repo root, then invoke load from a
+        // deeply nested subdirectory. The walk-up should pick up the
+        // root config so developers don't have to cd to the project
+        // root.
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"ignore = ["R001"]"#,
+        )
+        .unwrap();
+
+        let nested = temp.path().join("apps/myapp/migrations");
+        fs::create_dir_all(&nested).unwrap();
+
+        let config = Config::load_from_directory(&nested).unwrap();
+        assert!(config.ignore.contains("R001"));
+    }
+
+    #[test]
+    fn test_walk_stops_at_git_directory() {
+        // A `.git` entry marks the project root. A config above the
+        // repo would belong to a parent project and is not ours to
+        // read — the walk must stop and fall back to defaults.
+        let temp = TempDir::new().unwrap();
+        // Parent-of-repo config that should NOT be picked up.
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"ignore = ["R002"]"#,
+        )
+        .unwrap();
+
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let nested = repo.join("apps/myapp");
+        fs::create_dir_all(&nested).unwrap();
+
+        let config = Config::load_from_directory(&nested).unwrap();
+        assert!(
+            !config.ignore.contains("R002"),
+            "config above the .git directory should not be loaded",
+        );
+    }
+
+    #[test]
+    fn test_walk_stops_at_git_file_worktree() {
+        // In a git worktree the `.git` entry is a FILE (containing a
+        // gitdir pointer), not a directory. The walk should treat
+        // either form as the repo boundary.
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"ignore = ["R003"]"#,
+        )
+        .unwrap();
+
+        let worktree = temp.path().join("worktree");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(worktree.join(".git"), "gitdir: /some/git/dir").unwrap();
+        let nested = worktree.join("apps/myapp");
+        fs::create_dir_all(&nested).unwrap();
+
+        let config = Config::load_from_directory(&nested).unwrap();
+        assert!(!config.ignore.contains("R003"));
+    }
+
+    #[test]
+    fn test_walk_picks_nearest_config() {
+        // When configs exist at multiple levels, the nearest one
+        // wins; multi-level merging would surprise users with
+        // `[tool.zdm]` blocks scattered across nested pyprojects.
+        let temp = TempDir::new().unwrap();
+        // Outer config: ignores R001.
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"ignore = ["R001"]"#,
+        )
+        .unwrap();
+
+        // Inner config: ignores R002 only. R001 must not bleed
+        // through from the outer config.
+        let inner = temp.path().join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(
+            inner.join("zero-downtime-migrations.toml"),
+            r#"ignore = ["R002"]"#,
+        )
+        .unwrap();
+
+        let nested = inner.join("apps/myapp");
+        fs::create_dir_all(&nested).unwrap();
+
+        let config = Config::load_from_directory(&nested).unwrap();
+        assert!(config.ignore.contains("R002"));
+        assert!(
+            !config.ignore.contains("R001"),
+            "outer config should not bleed through when the inner config exists",
+        );
     }
 }
