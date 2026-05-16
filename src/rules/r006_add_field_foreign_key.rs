@@ -49,6 +49,19 @@ impl Rule for R006AddFieldForeignKey {
         //     lookups/joins, but not a non-leading column, so an
         //     index on `(status, customer)` does nothing for an FK on
         //     `customer`.
+        //
+        // Known simplification: this exemption assumes the prior
+        // concurrent index is a plain btree without a `condition=`
+        // (partial) or `opclasses=` set. A partial index on the FK
+        // column doesn't help if the FK target row is filtered out
+        // of the index, and a hash/GiST/GIN index can't satisfy the
+        // FK enforcement lookup. The extractor doesn't surface
+        // those attributes yet, so a savvy attacker who adds an
+        // unrelated partial concurrent index could still trigger
+        // the exemption. In practice the AddIndexConcurrently →
+        // AddField(FK) pattern is almost always a plain btree;
+        // tightening this is tracked for a follow-up alongside
+        // partial/expression index extraction.
         let mut diagnostics = Vec::new();
         let mut created_so_far: std::collections::HashSet<String> =
             std::collections::HashSet::new();

@@ -81,11 +81,20 @@ impl Rule for R015AlterFieldNotNull {
                                  changing max_length or help_text), this is safe — add \
                                  `# zdm: ignore R015` to suppress.\n\n\
                                  If this is a genuine nullable → NOT NULL transition, use \
-                                 the four-step pattern:\n  \
-                                 1. ALTER TABLE ... ADD CONSTRAINT <name> CHECK (col IS NOT NULL) NOT VALID;\n  \
-                                 2. ALTER TABLE ... VALIDATE CONSTRAINT <name>;  -- table-scan without blocking writes\n  \
-                                 3. ALTER TABLE ... ALTER COLUMN col SET NOT NULL;  -- catalog-only, no scan, because the CHECK proves no NULLs\n  \
-                                 4. ALTER TABLE ... DROP CONSTRAINT <name>;  -- optional cleanup; the CHECK is now subsumed by the NOT NULL marker"
+                                 the four-step pattern. Pick a stable constraint name like \
+                                 `<table>_<col>_not_null` so step 4 can DROP it precisely \
+                                 (PostgreSQL ALTER TABLE ADD CONSTRAINT has no IF NOT EXISTS, \
+                                 so partially-applied migrations need to be cleaned up before \
+                                 re-running):\n  \
+                                 1. ALTER TABLE ... ADD CONSTRAINT <table>_<col>_not_null \
+                                 CHECK (col IS NOT NULL) NOT VALID;\n  \
+                                 2. ALTER TABLE ... VALIDATE CONSTRAINT <table>_<col>_not_null;  \
+                                 -- table-scan without blocking writes\n  \
+                                 3. ALTER TABLE ... ALTER COLUMN col SET NOT NULL;  \
+                                 -- catalog-only, no scan, because the validated CHECK proves no NULLs\n  \
+                                 4. ALTER TABLE ... DROP CONSTRAINT <table>_<col>_not_null;  \
+                                 -- recommended cleanup; the CHECK is subsumed by NOT NULL, \
+                                 but keeping both forces every INSERT to re-evaluate the predicate"
                                     .to_string(),
                             ),
                         });

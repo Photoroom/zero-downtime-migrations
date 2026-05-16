@@ -76,15 +76,15 @@ impl Rule for R002UniqueConstraintWithoutIndex {
                         help: Some(
                             "Django's AddConstraint cannot reuse a pre-built index. \
                              To avoid the lock, build the index concurrently first and \
-                             attach it via RunSQL:\n\
+                             attach it via two separate RunSQL operations:\n\
                              \n  \
-                             RunSQL(\n    \
-                                'CREATE UNIQUE INDEX CONCURRENTLY <name> ON <table> (<cols>);'\n    \
-                                'ALTER TABLE <table> ADD CONSTRAINT <name> UNIQUE USING INDEX <name>;',\n  \
-                             )\n\
+                             RunSQL('CREATE UNIQUE INDEX CONCURRENTLY <name> ON <table> (<cols>);'),\n  \
+                             RunSQL('ALTER TABLE <table> ADD CONSTRAINT <name> UNIQUE USING INDEX <name>;'),\n\
                              \n\
-                             The CREATE INDEX statement must run outside a transaction \
-                             (`atomic = False`)."
+                             Two operations are required because `CREATE INDEX CONCURRENTLY` \
+                             must run outside a transaction; bundling both statements in one \
+                             RunSQL would still be a single transaction. Set `atomic = False` \
+                             on the migration so RunSQL doesn't open one."
                                 .to_string(),
                         ),
                     });
