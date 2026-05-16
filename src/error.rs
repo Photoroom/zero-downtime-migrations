@@ -107,6 +107,20 @@ pub enum Error {
     #[error("Invalid path: {path}")]
     #[diagnostic(code(zdm::io::invalid_path))]
     InvalidPath { path: PathBuf },
+
+    /// A glob pattern from `exclude` or `allowed-file-patterns` could
+    /// not be compiled. Surfaced at config-load time so misconfigured
+    /// patterns fail loudly rather than being silently ignored at the
+    /// match site.
+    #[error("Invalid glob pattern '{pattern}': {message}")]
+    #[diagnostic(
+        code(zdm::config::invalid_glob),
+        help(
+            "Glob patterns use the `glob` crate's syntax: `**` matches any number \
+             of path segments, `*` matches any characters except `/`"
+        )
+    )]
+    InvalidGlobPattern { pattern: String, message: String },
 }
 
 impl Error {
