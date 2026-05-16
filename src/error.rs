@@ -120,7 +120,7 @@ pub enum Error {
     #[error("Unknown rule: {rule_id}")]
     #[diagnostic(
         code(zdm::rule::unknown),
-        help("Run 'zdm --list-rules' to see available rules")
+        help("Run 'zdm rule <id>' to see documentation for a specific rule")
     )]
     UnknownRule { rule_id: String },
 
