@@ -32,9 +32,15 @@ pub struct Migration {
     /// `SeparateDatabaseAndState(database_operations=[...])` arms in this
     /// migration. These represent the "database-side" half of a two-step
     /// deployment — they execute real schema changes without the
-    /// state-side preamble. State-side operations are deliberately not
-    /// surfaced because they're metadata-only and rules that look for
-    /// schema-locking patterns should ignore them. A rule that wants to
+    /// state-side preamble, so a rule that scans for schema-locking
+    /// patterns must inspect this field alongside `operations` to avoid
+    /// silently ignoring locks hidden inside an SDaS wrapper. R001 is
+    /// the first consumer; locking rules added later (R006, R017, etc.)
+    /// can opt in the same way.
+    ///
+    /// State-side operations are deliberately not surfaced because
+    /// they're metadata-only — Django updates its migration state
+    /// graph but doesn't touch the database. A rule that wants to
     /// inspect `state_operations` must walk the original
     /// `OperationData::SeparateDatabaseAndState` payload itself.
     pub wrapped_database_ops: Vec<Operation>,
