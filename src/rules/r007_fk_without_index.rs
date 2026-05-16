@@ -32,53 +32,59 @@ impl Rule for R007FKWithoutIndex {
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        // Collect models that have concurrent index operations
-        let models_with_concurrent_index: std::collections::HashSet<String> = migration
-            .operations
-            .iter()
-            .filter(|op| op.op_type == OperationType::AddIndexConcurrently)
-            .filter_map(|op| {
-                if let OperationData::Index(idx) = &op.data {
-                    Some(idx.model_name.to_lowercase())
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Walk operations in order, accumulating models that have had a
+        // concurrent index added so far. An AddField FK is only exempt when
+        // the concurrent index appeared *before* the FK in the operations
+        // list; otherwise the FK still acquires its lock before the index
+        // exists.
+        let mut indexed_concurrently: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
-        for op in migration.operations_of_type(OperationType::AddField) {
-            if let OperationData::Field(data) = &op.data {
-                if let Some(ref field) = data.field {
-                    if field.field_type == "ForeignKey" {
-                        // Exempt if the model was just created in this migration
-                        if migration.is_model_created(&data.model_name) {
-                            continue;
-                        }
-
-                        // Exempt if there's a concurrent index for the same model
-                        if models_with_concurrent_index.contains(&data.model_name.to_lowercase()) {
-                            continue;
-                        }
-
-                        diagnostics.push(Diagnostic {
-                            rule_id: self.id(),
-                            rule_name: self.name(),
-                            message: format!(
-                                "ForeignKey '{}' on '{}' may benefit from pre-created concurrent index",
-                                data.field_name, data.model_name
-                            ),
-                            severity: self.severity(),
-                            path: ctx.path.to_path_buf(),
-                            span: op.span,
-                            help: Some(
-                                "Consider creating the index first with AddIndexConcurrently, \
-                                 then adding the ForeignKey constraint in a separate step"
-                                    .to_string(),
-                            ),
-                            fix: None,
-                        });
+        for op in &migration.operations {
+            match op.op_type {
+                OperationType::AddIndexConcurrently => {
+                    if let OperationData::Index(idx) = &op.data {
+                        indexed_concurrently.insert(idx.model_name.to_lowercase());
                     }
                 }
+                OperationType::AddField => {
+                    let OperationData::Field(data) = &op.data else {
+                        continue;
+                    };
+                    let Some(field) = &data.field else { continue };
+                    if field.field_type != "ForeignKey" {
+                        continue;
+                    }
+
+                    // Exempt if the model was just created in this migration.
+                    if migration.is_model_created(&data.model_name) {
+                        continue;
+                    }
+                    // Exempt if a concurrent index for the same model appeared
+                    // earlier in this migration's operations.
+                    if indexed_concurrently.contains(&data.model_name.to_lowercase()) {
+                        continue;
+                    }
+
+                    diagnostics.push(Diagnostic {
+                        rule_id: self.id(),
+                        rule_name: self.name(),
+                        message: format!(
+                            "ForeignKey '{}' on '{}' may benefit from pre-created concurrent index",
+                            data.field_name, data.model_name
+                        ),
+                        severity: self.severity(),
+                        path: ctx.path.to_path_buf(),
+                        span: op.span,
+                        help: Some(
+                            "Consider creating the index first with AddIndexConcurrently, \
+                             then adding the ForeignKey constraint in a separate step"
+                                .to_string(),
+                        ),
+                        fix: None,
+                    });
+                }
+                _ => {}
             }
         }
 
@@ -181,5 +187,36 @@ class Migration(migrations.Migration):
         // FK on newly created model is exempt
         let diagnostics = check_migration(FK_ON_NEW_MODEL_GOOD);
         assert!(diagnostics.is_empty());
+    }
+
+    const FK_BEFORE_CONCURRENT_INDEX_BAD: &str = r#"
+from django.db import migrations, models
+from django.contrib.postgres.operations import AddIndexConcurrently
+
+
+class Migration(migrations.Migration):
+    atomic = False
+
+    operations = [
+        migrations.AddField(
+            model_name='order',
+            name='customer',
+            field=models.ForeignKey(on_delete=models.CASCADE, to='app.customer'),
+        ),
+        AddIndexConcurrently(
+            model_name='order',
+            index=models.Index(fields=['customer'], name='order_customer_idx'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_fk_before_concurrent_index_still_flagged() {
+        // Adding the FK first and the concurrent index afterwards does not
+        // avoid the table lock — the FK acquires it before the index exists.
+        // The previous set-based exemption silently let this through.
+        let diagnostics = check_migration(FK_BEFORE_CONCURRENT_INDEX_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R007");
     }
 }
