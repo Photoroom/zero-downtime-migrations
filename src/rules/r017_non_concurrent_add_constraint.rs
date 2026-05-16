@@ -20,8 +20,9 @@ impl Rule for R017NonConcurrentAddConstraint {
     }
 
     fn description(&self) -> &'static str {
-        "AddConstraint with CHECK or ForeignKey validates all existing rows, which locks \
-         the table. Add constraints with NOT VALID then VALIDATE separately."
+        "AddConstraint with a CHECK constraint validates every existing row, \
+         which locks the table. Add the constraint with NOT VALID, then \
+         VALIDATE in a separate migration."
     }
 
     fn severity(&self) -> Severity {
@@ -38,18 +39,15 @@ impl Rule for R017NonConcurrentAddConstraint {
                     continue;
                 }
 
-                // Check and ForeignKey constraints require full table validation
-                if matches!(
-                    data.constraint_type,
-                    ConstraintType::Check | ConstraintType::ForeignKey
-                ) {
+                // CHECK constraints require a full table scan when added without NOT VALID.
+                // (Foreign keys are added via AddField, not AddConstraint, so they are
+                // covered by R006/R007 rather than here.)
+                if data.constraint_type == ConstraintType::Check {
                     diagnostics.push(Diagnostic {
                         rule_id: self.id(),
                         rule_name: self.name(),
-                        message: format!(
-                            "AddConstraint with {:?} validates all rows",
-                            data.constraint_type
-                        ),
+                        message: "AddConstraint with a CHECK constraint validates all rows"
+                            .to_string(),
                         severity: self.severity(),
                         path: ctx.path.to_path_buf(),
                         span: op.span,

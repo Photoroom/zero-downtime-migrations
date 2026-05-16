@@ -201,13 +201,16 @@ pub struct ConstraintOperation {
     pub constraint_name: Option<String>,
 }
 
-/// Type of database constraint.
+/// Type of database constraint added via `migrations.AddConstraint`.
+///
+/// Django ships three constraint classes (`UniqueConstraint`,
+/// `CheckConstraint`, `ExclusionConstraint`); foreign keys are added via
+/// `AddField`, not `AddConstraint`, so they don't appear here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstraintType {
     Unique,
     Check,
     Exclusion,
-    ForeignKey,
     Unknown,
 }
 
