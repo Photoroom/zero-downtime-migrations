@@ -15,14 +15,14 @@ A standalone Rust CLI tool that statically analyzes Django migration files to ca
 ## Installation
 
 ```bash
-# Install via pip
-pip install zero-downtime-migrations
+# Install via pip (PyPI package is django-zdm; binaries are zdm and zero-downtime-migrations)
+pip install django-zdm
 
 # Or use uvx to run without installing
-uvx zero-downtime-migrations .
+uvx --from django-zdm zdm .
 
 # Or install with pipx
-pipx install zero-downtime-migrations
+pipx install django-zdm
 ```
 
 ## Usage
@@ -164,7 +164,7 @@ pre-commit is validating, rather than the previous `HEAD` commit.
 
 ```yaml
 - name: Install zdm
-  run: pip install zero-downtime-migrations
+  run: pip install django-zdm
 
 - name: Lint migrations
   run: zdm --diff origin/main
