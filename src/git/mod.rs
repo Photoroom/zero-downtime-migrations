@@ -369,9 +369,25 @@ mod tests {
 
     #[test]
     fn test_not_a_repo() {
+        // `is_err()` alone is too weak: an unrelated future error
+        // (e.g. an InvalidPath, an IO failure) would still pass. Pin
+        // the variant so a regression that swaps the error type
+        // — say, returning ParseError because some refactor wired
+        // GitRepo::open through a different boundary — fails loudly.
         let temp = TempDir::new().unwrap();
-        let result = GitRepo::open(temp.path());
-        assert!(result.is_err());
+        // `unwrap_err()` requires `Ok` to be Debug, which `GitRepo`
+        // isn't; pattern-match instead.
+        let Err(err) = GitRepo::open(temp.path()) else {
+            panic!("expected GitRepo::open to fail outside a repo")
+        };
+        assert!(
+            matches!(err, crate::error::Error::GitError { .. }),
+            "expected Error::GitError, got: {err:?}",
+        );
+        assert!(
+            err.to_string().contains("Failed to find git repository"),
+            "the error message should explain *what* failed, got: {err}",
+        );
     }
 
     #[test]
