@@ -56,7 +56,27 @@ impl ParsedMigration {
     /// Parse a migration file from a path.
     pub fn parse_file(path: &Path) -> Result<Self> {
         // Cap on-disk size before reading to bound memory.
-        let metadata = std::fs::metadata(path).map_err(|e| Error::file_read(path, e))?;
+        //
+        // `std::fs::metadata` follows symlinks, so a symlink to
+        // `/dev/zero` or `/dev/random` would report length 0 here,
+        // skip `check_size`, then OOM the process at
+        // `read_to_string`. Use `symlink_metadata` to stat the link
+        // itself, then reject any non-regular file outright — the
+        // size cap only meaningfully applies to regular files. A
+        // legitimate symlink-to-regular-file gets rejected too,
+        // mirroring the discovery walk's symlink policy (see
+        // src/discovery.rs:75) and giving the binary a single,
+        // consistent answer to "we don't open links".
+        let metadata = std::fs::symlink_metadata(path).map_err(|e| Error::file_read(path, e))?;
+        if !metadata.file_type().is_file() {
+            return Err(Error::file_read(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing to read non-regular file (symlink, fifo, device, etc.)",
+                ),
+            ));
+        }
         check_size(path, metadata.len())?;
 
         let source = std::fs::read_to_string(path).map_err(|e| Error::file_read(path, e))?;
@@ -596,5 +616,56 @@ class Container:
         let source = "#!/usr/bin/env python\n\nclass Migration:\n    operations = []\n";
         let parsed = ParsedMigration::parse(source).unwrap();
         assert!(parsed.find_migration_class().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_file_rejects_symlink_target() {
+        // `std::fs::metadata` follows symlinks, so a symlink to
+        // `/dev/zero` would report length 0 and skip the size cap,
+        // then OOM at `read_to_string`. The fix uses
+        // `symlink_metadata` and rejects any non-regular file
+        // outright. Pin both: the rejection fires, AND the error
+        // is the InvalidInput we constructed (so a future refactor
+        // that swaps the rejection out for a silent file-read
+        // surfaces here).
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::TempDir::new().unwrap();
+        let target = temp.path().join("real.py");
+        std::fs::write(&target, "class Migration:\n    operations = []\n").unwrap();
+        let link = temp.path().join("link.py");
+        symlink(&target, &link).unwrap();
+
+        let result = ParsedMigration::parse_file(&link);
+        match result {
+            Err(Error::FileRead { source, .. }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(
+                    source.to_string().contains("non-regular file"),
+                    "expected non-regular-file rejection, got: {source}",
+                );
+            }
+            other => panic!("expected FileRead InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_file_accepts_real_file_next_to_symlink() {
+        // Symmetry pin: the target of the symlink is a perfectly
+        // valid regular file and must parse if accessed directly,
+        // so the rejection is specifically about the symlink
+        // itself — not about any path in the same dir.
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::TempDir::new().unwrap();
+        let target = temp.path().join("real.py");
+        std::fs::write(&target, "class Migration:\n    operations = []\n").unwrap();
+        let link = temp.path().join("link.py");
+        symlink(&target, &link).unwrap();
+
+        // The link is rejected.
+        assert!(ParsedMigration::parse_file(&link).is_err());
+        // The target is accepted.
+        assert!(ParsedMigration::parse_file(&target).is_ok());
     }
 }

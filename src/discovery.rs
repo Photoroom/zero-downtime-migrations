@@ -33,7 +33,13 @@ pub fn discover_migrations_with_exclude(
         .collect::<Result<_>>()?;
 
     for path in paths {
-        if path.is_file() {
+        // `path.is_file()` transparently follows symlinks, so an
+        // explicitly-passed symlink to `/etc/passwd` or `/dev/zero`
+        // would otherwise reach the parser. The discovery WALK
+        // already rejects symlinked entries via `symlink_metadata`
+        // (see `discover_in_directory` below); apply the same
+        // policy here so the explicit-path branch matches.
+        if is_regular_file(path) {
             if is_migration_file(path) && !is_excluded(path, &patterns) {
                 migrations.push(path.clone());
             }
@@ -50,6 +56,17 @@ pub fn discover_migrations_with_exclude(
     migrations.dedup();
 
     Ok(migrations)
+}
+
+/// `true` iff `path` exists, is a regular file, and is not a
+/// symlink. `path.is_file()` from std follows links, which the
+/// CLI's symlink-rejection policy specifically forbids — use
+/// this helper everywhere a user-supplied path is being decided
+/// between "file" and "directory".
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false)
 }
 
 /// Check if a path matches any of the exclude patterns.

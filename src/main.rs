@@ -354,7 +354,17 @@ fn discover_migrations(
                 return Err(Error::path_not_found(path.clone()));
             }
 
-            if path.is_file() {
+            // `path.is_file()` follows symlinks, so an
+            // explicitly-passed symlink to e.g. `/etc/passwd`
+            // would otherwise reach the parser. Use
+            // `symlink_metadata` to stat the link itself — the
+            // CLI's symlink-rejection policy is uniform across
+            // the discovery walk, the explicit-path branch
+            // here, and the parser's size check.
+            let is_regular_file = std::fs::symlink_metadata(path)
+                .map(|m| m.file_type().is_file())
+                .unwrap_or(false);
+            if is_regular_file {
                 // Accept any .py file passed explicitly
                 if path.extension().is_some_and(|ext| ext == "py") {
                     // Check against exclude patterns

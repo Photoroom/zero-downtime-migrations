@@ -504,3 +504,57 @@ class Migration(migrations.Migration):
         "the injected `--> /etc/passwd:1` line must not appear unsanitized in output, got:\n{stdout}",
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn e2e_explicit_symlink_path_is_rejected_not_followed() {
+    // The discovery WALK rejects symlinked entries via
+    // `symlink_metadata` (since commit 6299212). The
+    // explicitly-passed-file branch in main.rs used to call
+    // `path.is_file()` which transparently follows symlinks, so a
+    // symlink to e.g. `/etc/passwd` could still reach the parser.
+    // This e2e pins that the binary now applies the same
+    // rejection on the explicit branch — the source under the
+    // symlink target must not appear in output, and the binary
+    // must not crash by trying to parse it as Python.
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join(".git")).unwrap();
+    let migrations_dir = temp.path().join("app").join("migrations");
+    fs::create_dir_all(&migrations_dir).unwrap();
+    fs::write(migrations_dir.join("__init__.py"), "").unwrap();
+
+    let real_target = temp.path().join("secret_real.py");
+    let real_content = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(fields=['name'], name='product_name_idx'),
+        ),
+    ]
+"#;
+    fs::write(&real_target, real_content).unwrap();
+
+    let symlink_path = migrations_dir.join("0001_link.py");
+    symlink(&real_target, &symlink_path).unwrap();
+
+    // Pass the symlink path explicitly. Without the fix, the
+    // explicit-path branch would follow the link, parse the
+    // target, and emit R001 against the symlink path.
+    let output = zdm().arg(&symlink_path).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !stdout.contains("R001") && !stderr.contains("R001"),
+        "explicit symlink path should be skipped, not followed and linted; \
+         got stdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+}

@@ -157,9 +157,7 @@ impl GitRepo {
     /// required `path` to exist on disk, which is wrong for a function
     /// whose purpose is to read content that may exist only in the
     /// index. The size cap from `parser::check_size` is applied against
-    /// the index entry's `file_size` *before* the blob is materialised,
-    /// so a 1 GB staged file can't force libgit2 to allocate a 1 GB
-    /// buffer just to be rejected afterwards.
+    /// the staged blob's object size before its content bytes are read.
     pub fn read_staged_file(&self, path: &Path) -> Result<String> {
         let root = self.root()?;
         let relative_path: PathBuf = if path.is_absolute() {
@@ -186,13 +184,11 @@ impl GitRepo {
                 relative_path.display()
             ))
         })?;
-        // Reject oversized staged blobs before `find_blob` forces libgit2
-        // to inflate the object data.
-        crate::parser::check_size(path, u64::from(entry.file_size))?;
         let blob = self
             .repo
             .find_blob(entry.id)
             .map_err(|e| Error::git_error_msg(format!("Failed to read staged file: {}", e)))?;
+        crate::parser::check_size(path, blob.size() as u64)?;
 
         std::str::from_utf8(blob.content())
             .map(|s| s.to_string())
