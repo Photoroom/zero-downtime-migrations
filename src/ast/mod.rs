@@ -70,6 +70,27 @@ impl Migration {
     }
 
     /// Check if a model was created in this migration.
+    ///
+    /// **Deprecated and order-blind.** Returns true if `model_name`
+    /// appears anywhere in `created_models`, regardless of whether
+    /// the `CreateModel` ran before or after the operation the
+    /// caller is checking. Every in-tree rule used to call this and
+    /// every one of them shipped the same false negative: a
+    /// `CreateModel` placed *below* a flagged op silently exempted
+    /// the op. R001, R002, R006, R010, R016, R017 all migrated to an
+    /// order-aware `created_so_far: HashSet<String>` walk during
+    /// this PR.
+    ///
+    /// Kept `pub` for out-of-tree consumers building custom rules
+    /// against the library API, but new rules should use the
+    /// order-aware pattern instead. A future major version may
+    /// remove this helper entirely.
+    #[deprecated(
+        note = "order-blind — exempts ops whose CreateModel runs LATER in the same migration. \
+                Use an order-aware walk: track created model names as you iterate \
+                `migration.operations`, and exempt only if the name was inserted \
+                *before* the flagged op (see R001/R002/R006/R010/R016/R017 for the pattern)."
+    )]
     pub fn is_model_created(&self, model_name: &str) -> bool {
         self.created_models
             .iter()

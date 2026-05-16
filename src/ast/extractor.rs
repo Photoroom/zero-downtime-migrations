@@ -871,6 +871,7 @@ class Migration(migrations.Migration):
     }
 
     #[test]
+    #[allow(deprecated)] // exercises `is_model_created` itself
     fn test_extract_created_models() {
         let parsed = ParsedMigration::parse(MULTI_OPERATION_MIGRATION).unwrap();
         let extractor = MigrationExtractor::new(&parsed);
@@ -1199,6 +1200,7 @@ class Migration(migrations.Migration):
 "#;
 
     #[test]
+    #[allow(deprecated)] // exercises `is_model_created` itself
     fn test_multiple_create_model_exemption() {
         let parsed = ParsedMigration::parse(MULTIPLE_CREATE_MODEL).unwrap();
         let extractor = MigrationExtractor::new(&parsed);
@@ -1227,6 +1229,7 @@ class Migration(migrations.Migration):
 "#;
 
     #[test]
+    #[allow(deprecated)] // exercises `is_model_created` itself
     fn test_addfield_on_existing_model_not_exempt() {
         let parsed = ParsedMigration::parse(ADDFIELD_EXISTING_MODEL).unwrap();
         let extractor = MigrationExtractor::new(&parsed);
@@ -1263,6 +1266,7 @@ class Migration(migrations.Migration):
 "#;
 
     #[test]
+    #[allow(deprecated)] // exercises `is_model_created` itself
     fn test_exemption_applies_selectively() {
         let parsed = ParsedMigration::parse(MIXED_OPERATIONS).unwrap();
         let extractor = MigrationExtractor::new(&parsed);
