@@ -3,7 +3,7 @@
 //! Concurrent index operations (AddIndexConcurrently, RemoveIndexConcurrently)
 //! cannot run inside a transaction. The migration must have `atomic = False`.
 
-use crate::ast::Migration;
+use crate::ast::{strip_sql_noise, Migration, OperationData};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::rules::{Rule, RuleContext};
 
@@ -31,11 +31,34 @@ impl Rule for R004MissingAtomicFalse {
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        // Check if migration has any concurrent operations
-        let has_concurrent = migration
-            .operations
-            .iter()
-            .any(|op| op.op_type.is_concurrent());
+        // Two paths to "this migration needs `atomic = False`":
+        //   1. A Django op flagged as concurrent
+        //      (`AddIndexConcurrently`, `RemoveIndexConcurrently`).
+        //   2. A `RunSQL(...)` whose SQL contains a `CONCURRENTLY`
+        //      keyword on a CREATE/DROP INDEX statement. Postgres
+        //      rejects `CREATE INDEX CONCURRENTLY` inside a
+        //      transaction block at runtime ("CREATE INDEX
+        //      CONCURRENTLY cannot run inside a transaction
+        //      block"), so an atomic migration that wraps such a
+        //      RunSQL silently fails on every deploy — the rule
+        //      should catch it at lint time.
+        let has_concurrent = migration.operations.iter().any(|op| {
+            if op.op_type.is_concurrent() {
+                return true;
+            }
+            if let OperationData::RunSQL(data) = &op.data {
+                let cleaned = strip_sql_noise(&data.sql).to_uppercase();
+                return cleaned.split(';').any(|stmt| {
+                    let s = stmt.trim();
+                    s.contains("CONCURRENTLY")
+                        && (s.contains("CREATE INDEX")
+                            || s.contains("CREATE UNIQUE INDEX")
+                            || s.contains("DROP INDEX")
+                            || s.contains("REINDEX"))
+                });
+            }
+            false
+        });
 
         if has_concurrent && !migration.is_non_atomic {
             // Anchor the diagnostic at the `class Migration(...)` line.
@@ -184,6 +207,77 @@ class Migration(migrations.Migration):
         ),
     ]
 "#;
+
+    const RUNSQL_CONCURRENTLY_NO_ATOMIC_BAD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL(
+            sql='CREATE INDEX CONCURRENTLY idx_name ON t (c);',
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_runsql_create_index_concurrently_without_atomic_false_fires() {
+        // Postgres rejects `CREATE INDEX CONCURRENTLY` inside a
+        // transaction block at runtime. A migration that wraps such
+        // a RunSQL without `atomic = False` is a real bug — the
+        // deploy fails every time. R004's `is_concurrent` check
+        // only looked at Django op types and missed RunSQL entirely.
+        let diagnostics = check_migration(RUNSQL_CONCURRENTLY_NO_ATOMIC_BAD);
+        assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+        assert_eq!(diagnostics[0].rule_id, "R004");
+    }
+
+    const RUNSQL_CONCURRENTLY_WITH_ATOMIC_GOOD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+    atomic = False
+
+    operations = [
+        migrations.RunSQL(
+            sql='CREATE INDEX CONCURRENTLY idx_name ON t (c);',
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_runsql_create_index_concurrently_with_atomic_false_passes() {
+        // Symmetry pin: the new RunSQL branch must still honour
+        // `atomic = False` — otherwise R004 would fire on every
+        // legitimate concurrent RunSQL pattern.
+        let diagnostics = check_migration(RUNSQL_CONCURRENTLY_WITH_ATOMIC_GOOD);
+        assert!(diagnostics.is_empty(), "got: {diagnostics:?}");
+    }
+
+    const RUNSQL_CONCURRENTLY_IN_STRING_LITERAL_GOOD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL(
+            sql="INSERT INTO audit_log (msg) VALUES ('used CONCURRENTLY in prior migration');",
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_runsql_concurrently_in_string_literal_does_not_fire() {
+        // The RunSQL branch must noise-strip BEFORE matching
+        // CONCURRENTLY — a CONCURRENTLY mentioned inside a single-
+        // quoted string literal is just data, not a concurrent
+        // index statement.
+        let diagnostics = check_migration(RUNSQL_CONCURRENTLY_IN_STRING_LITERAL_GOOD);
+        assert!(diagnostics.is_empty(), "got: {diagnostics:?}");
+    }
 
     #[test]
     fn test_inline_ignore_above_class_suppresses_r004() {

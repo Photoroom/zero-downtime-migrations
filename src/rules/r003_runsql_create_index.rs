@@ -33,16 +33,24 @@ impl Rule for R003RunSQLCreateIndex {
 
         for op in migration.operations_of_type(OperationType::RunSQL) {
             if let OperationData::RunSQL(data) = &op.data {
-                // Strip comments and string literals from BOTH sides of
-                // the check. Without it, SQL like `"-- about CREATE INDEX
-                // ..."` false-positives on the CREATE INDEX side, AND
-                // SQL like `"-- We chose not to use CONCURRENTLY\n
-                // CREATE INDEX foo ON t (c);"` false-negatives because
-                // CONCURRENTLY is found in the comment. `contains_create_index`
-                // already noise-strips internally; re-strip here so the
-                // CONCURRENTLY check sees the same cleaned source.
+                // Strip comments and string literals before splitting,
+                // so an `INSERT INTO log VALUES ('CREATE INDEX ...; ...')`
+                // doesn't get diced into spurious statements.
                 let cleaned = strip_sql_noise(&data.sql).to_uppercase();
-                if data.contains_create_index() && !cleaned.contains("CONCURRENTLY") {
+
+                // Walk statement-by-statement instead of a single
+                // whole-string `contains CREATE INDEX && !contains
+                // CONCURRENTLY`. A RunSQL like
+                //   CREATE INDEX a ON t (c); CREATE INDEX CONCURRENTLY b ON t (c);
+                // contains BOTH `CREATE INDEX` and `CONCURRENTLY`, so the
+                // whole-string check would silently exempt the
+                // non-concurrent first statement.
+                let fires = cleaned.split(';').any(|stmt| {
+                    let s = stmt.trim();
+                    (s.contains("CREATE INDEX") || s.contains("CREATE UNIQUE INDEX"))
+                        && !s.contains("CONCURRENTLY")
+                });
+                if fires {
                     diagnostics.push(Diagnostic {
                         rule_id: self.id(),
                         rule_name: self.name(),
@@ -51,7 +59,11 @@ impl Rule for R003RunSQLCreateIndex {
                         path: ctx.path.to_path_buf(),
                         span: op.span,
                         help: Some(
-                            "Use CREATE INDEX CONCURRENTLY to avoid table locks".to_string(),
+                            "Use CREATE INDEX CONCURRENTLY to avoid table locks. Each \
+                             CREATE INDEX statement is checked independently — splitting \
+                             a non-concurrent CREATE INDEX into the same RunSQL as a \
+                             concurrent one does not exempt it."
+                                .to_string(),
                         ),
                     });
                 }
@@ -206,5 +218,56 @@ class Migration(migrations.Migration):
         let diagnostics = check_migration(RUNSQL_CONCURRENTLY_ONLY_IN_COMMENT_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R003");
+    }
+
+    const RUNSQL_MIXED_CONCURRENT_AND_NON_CONCURRENT_BAD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+    atomic = False
+
+    operations = [
+        migrations.RunSQL(
+            sql='CREATE INDEX a_idx ON t (a); CREATE INDEX CONCURRENTLY b_idx ON t (b);',
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_mixed_concurrent_and_non_concurrent_statements_flags_the_non_concurrent_one() {
+        // The whole-string `contains CREATE INDEX && !contains
+        // CONCURRENTLY` check silently passed this case: CONCURRENTLY
+        // appears somewhere in the SQL (on the second statement), so
+        // the first statement's blocking lock escaped detection.
+        // The fix walks statement-by-statement after splitting on
+        // `;` so each CREATE INDEX is evaluated independently.
+        let diagnostics = check_migration(RUNSQL_MIXED_CONCURRENT_AND_NON_CONCURRENT_BAD);
+        assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+        assert_eq!(diagnostics[0].rule_id, "R003");
+    }
+
+    const RUNSQL_BOTH_CONCURRENT_GOOD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+    atomic = False
+
+    operations = [
+        migrations.RunSQL(
+            sql='CREATE INDEX CONCURRENTLY a_idx ON t (a); CREATE INDEX CONCURRENTLY b_idx ON t (b);',
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_both_statements_concurrent_passes() {
+        // Symmetry pin for the per-statement walk: when both
+        // statements are concurrent, neither fires. Without this
+        // pin, a too-aggressive split-and-check refactor could
+        // false-positive on legitimate multi-CONCURRENTLY bundles.
+        let diagnostics = check_migration(RUNSQL_BOTH_CONCURRENT_GOOD);
+        assert!(diagnostics.is_empty(), "got: {diagnostics:?}");
     }
 }
