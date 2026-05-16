@@ -28,6 +28,11 @@ pub struct Migration {
     pub imports: Vec<Import>,
     /// Model names created in this migration (for exemption tracking).
     pub created_models: Vec<String>,
+    /// Span of the `class Migration(...)` definition, when present. Used
+    /// as the anchor for class-level diagnostics (e.g. R004's missing
+    /// `atomic = False`) so a `# zdm: ignore` on or above the class line
+    /// suppresses the diagnostic correctly.
+    pub class_span: Option<Span>,
     /// For each source line that carried a `# zdm: ignore RXXX[, RYYY]`
     /// comment, the set of rule IDs the user asked to suppress at that
     /// line. Lines are 1-indexed.

@@ -108,6 +108,10 @@ impl<'a> MigrationExtractor<'a> {
         let imports = self.extract_imports();
         let is_non_atomic = self.parsed.is_non_atomic();
         let line_ignores = self.extract_line_ignores();
+        let class_span = self
+            .parsed
+            .find_migration_class()
+            .map(|n| Span::from_node(&n));
 
         // Track created models for exemption
         let created_models: Vec<String> = operations
@@ -125,6 +129,7 @@ impl<'a> MigrationExtractor<'a> {
             operations,
             imports,
             created_models,
+            class_span,
             line_ignores,
         })
     }
