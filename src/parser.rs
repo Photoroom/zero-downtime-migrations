@@ -140,7 +140,12 @@ impl ParsedMigration {
         None
     }
 
-    /// Check if the migration has `atomic = False`.
+    /// Check if the migration has `atomic = False` as a class-body
+    /// assignment. Only matches a real assignment whose LHS is the bare
+    /// identifier `atomic` and whose RHS is the Python `False` literal
+    /// (including the parenthesized form `(False)`). Comments mentioning
+    /// "False", strings containing those words, `atomic = True`,
+    /// `not_atomic = False`, and `atomic = some_func(False)` do not match.
     pub fn is_non_atomic(&self) -> bool {
         let Some(class_node) = self.find_migration_class() else {
             return false;
@@ -152,11 +157,26 @@ impl ParsedMigration {
         };
 
         for child in body.children(&mut body.walk()) {
-            if child.kind() == "expression_statement" {
-                let text = child.utf8_text(source).unwrap_or("");
-                if text.contains("atomic") && text.contains("False") {
-                    return true;
-                }
+            if child.kind() != "expression_statement" {
+                continue;
+            }
+            let Some(assignment) = child.named_child(0) else {
+                continue;
+            };
+            if assignment.kind() != "assignment" {
+                continue;
+            }
+            let Some(left) = assignment.child_by_field_name("left") else {
+                continue;
+            };
+            if left.utf8_text(source).ok() != Some("atomic") {
+                continue;
+            }
+            let Some(right) = assignment.child_by_field_name("right") else {
+                continue;
+            };
+            if is_false_literal(right) {
+                return true;
             }
         }
         false
@@ -179,6 +199,23 @@ impl ParsedMigration {
     /// Get the text of a node.
     pub fn node_text(&self, node: Node<'_>) -> &str {
         node.utf8_text(self.source_bytes()).unwrap_or("")
+    }
+}
+
+/// Whether a node is the Python `False` literal, possibly wrapped in any
+/// number of parentheses. tree-sitter-python represents `False` with the
+/// `"false"` node kind and `(expr)` as `parenthesized_expression`.
+fn is_false_literal(node: Node<'_>) -> bool {
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "false" => return true,
+            "parenthesized_expression" => match current.named_child(0) {
+                Some(inner) => current = inner,
+                None => return false,
+            },
+            _ => return false,
+        }
     }
 }
 
@@ -275,6 +312,81 @@ class Migration(migrations.Migration)  # Missing colon
 
         let non_atomic = ParsedMigration::parse(NON_ATOMIC_MIGRATION).unwrap();
         assert!(non_atomic.is_non_atomic());
+    }
+
+    #[test]
+    fn test_is_non_atomic_accepts_parenthesized_false() {
+        let source = r#"
+class Migration:
+    atomic = (False)
+    operations = []
+"#;
+        let parsed = ParsedMigration::parse(source).unwrap();
+        assert!(parsed.is_non_atomic());
+
+        let nested = r#"
+class Migration:
+    atomic = ((False))
+    operations = []
+"#;
+        let parsed = ParsedMigration::parse(nested).unwrap();
+        assert!(parsed.is_non_atomic());
+    }
+
+    #[test]
+    fn test_is_non_atomic_rejects_substring_lookalikes() {
+        // None of these should be detected as non-atomic, even though the old
+        // substring scan ("text contains 'atomic' and 'False'") would have
+        // matched several of them.
+        let cases: &[(&str, &str)] = &[
+            (
+                "atomic = True",
+                r#"
+class Migration:
+    atomic = True
+    operations = []
+"#,
+            ),
+            (
+                "not_atomic = False",
+                r#"
+class Migration:
+    not_atomic = False
+    operations = []
+"#,
+            ),
+            (
+                "atomic = some_func(False)",
+                r#"
+class Migration:
+    atomic = some_func(False)
+    operations = []
+"#,
+            ),
+            (
+                "atomic appears only in a string",
+                r#"
+class Migration:
+    description = "atomic was set to False elsewhere"
+    operations = []
+"#,
+            ),
+            (
+                "atomic appears only in a comment",
+                r#"
+class Migration:
+    # atomic = False would disable transactions
+    operations = []
+"#,
+            ),
+        ];
+        for (label, source) in cases {
+            let parsed = ParsedMigration::parse(*source).unwrap();
+            assert!(
+                !parsed.is_non_atomic(),
+                "case `{label}` should not be flagged as non-atomic"
+            );
+        }
     }
 
     #[test]
