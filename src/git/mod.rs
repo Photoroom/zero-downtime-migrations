@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use git2::{DiffOptions, Repository, StatusOptions};
 
+use crate::discovery::is_migration_file;
 use crate::error::{Error, Result};
 
 /// Status of a file in the git diff.
@@ -271,7 +272,7 @@ impl GitRepo {
         Ok(files
             .into_iter()
             .filter(|f| f.status != FileStatus::Deleted)
-            .filter(|f| is_migration_path(&f.path) == want_migrations)
+            .filter(|f| is_migration_file(&f.path) == want_migrations)
             .map(|f| root.join(&f.path))
             .collect())
     }
@@ -336,28 +337,6 @@ fn collect_changed_files(diff: &git2::Diff<'_>) -> Result<Vec<ChangedFile>> {
     )
     .map_err(|e| Error::git_error_msg(format!("Failed to iterate diff: {}", e)))?;
     Ok(files)
-}
-
-/// Check if a path looks like a Django migration file.
-fn is_migration_path(path: &Path) -> bool {
-    let path_str = path.to_string_lossy();
-
-    // Must be in a migrations directory
-    if !path_str.contains("migrations/") && !path_str.contains("migrations\\") {
-        return false;
-    }
-
-    // Must be a Python file
-    if path.extension().is_none_or(|ext| ext != "py") {
-        return false;
-    }
-
-    // Must not be __init__.py
-    if path.file_name().is_some_and(|name| name == "__init__.py") {
-        return false;
-    }
-
-    true
 }
 
 #[cfg(test)]
@@ -588,26 +567,9 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_is_migration_path() {
-        // Valid migration paths
-        assert!(is_migration_path(Path::new(
-            "app/migrations/0001_initial.py"
-        )));
-        assert!(is_migration_path(Path::new(
-            "myapp/migrations/0002_add_field.py"
-        )));
-        assert!(is_migration_path(Path::new(
-            "some/nested/app/migrations/0001_test.py"
-        )));
-
-        // Invalid paths
-        assert!(!is_migration_path(Path::new("app/migrations/__init__.py")));
-        assert!(!is_migration_path(Path::new("app/models.py")));
-        assert!(!is_migration_path(Path::new("migrations.py")));
-        assert!(!is_migration_path(Path::new("app/migration/0001.py")));
-        assert!(!is_migration_path(Path::new("app/migrations/0001.txt")));
-    }
+    // Migration-path matching now delegates to
+    // `crate::discovery::is_migration_file`; see `test_is_migration_file`
+    // in `src/discovery.rs` for the full case coverage.
 
     #[test]
     fn test_current_branch() {

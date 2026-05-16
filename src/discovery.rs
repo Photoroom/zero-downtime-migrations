@@ -159,6 +159,9 @@ mod tests {
         assert!(is_migration_file(Path::new(
             "/abs/path/app/migrations/0001_initial.py"
         )));
+        assert!(is_migration_file(Path::new(
+            "some/nested/app/migrations/0001_test.py"
+        )));
 
         // Invalid: __init__.py
         assert!(!is_migration_file(Path::new("app/migrations/__init__.py")));
@@ -166,6 +169,11 @@ mod tests {
         // Invalid: not in migrations directory
         assert!(!is_migration_file(Path::new("app/models.py")));
         assert!(!is_migration_file(Path::new("app/0001_initial.py")));
+        // A file literally named `migrations.py` at the repo root is not a
+        // Django migration — the parent must be a `migrations/` directory.
+        assert!(!is_migration_file(Path::new("migrations.py")));
+        // Singular `migration/` directory does not count.
+        assert!(!is_migration_file(Path::new("app/migration/0001.py")));
 
         // Invalid: not a .py file
         assert!(!is_migration_file(Path::new(
