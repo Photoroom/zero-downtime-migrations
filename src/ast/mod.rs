@@ -48,8 +48,15 @@ impl Migration {
 /// An import statement in the migration file.
 #[derive(Debug, Clone)]
 pub struct Import {
-    /// The full import text.
+    /// The full import text (kept for diagnostics and for matchers we
+    /// haven't structurally parsed yet).
     pub text: String,
+    /// For `from X import ...`, the module path `X`. `None` for plain
+    /// `import X` statements (those go through `text` for now).
+    pub module: Option<String>,
+    /// For `from X import a, b, c`, the imported names. Aliases are
+    /// recorded under the original name (`from X import a as b` → `"a"`).
+    pub names: Vec<String>,
     /// The span of the import statement.
     pub span: Span,
 }
@@ -60,8 +67,38 @@ impl Import {
         self.text.contains("AddIndexConcurrently") || self.text.contains("RemoveIndexConcurrently")
     }
 
-    /// Check if this is a direct model import (bad practice).
+    /// Check whether this import looks like it brings a Django *model class*
+    /// into scope (the thing R014 wants to flag). Imports from
+    /// `django.db.models` or `django.contrib.*` are skipped because those
+    /// give you the field/utility classes, not historical model state. A
+    /// `from .models import some_helper` for a snake_case helper is also
+    /// not flagged — only PascalCase names (the convention for model
+    /// classes) trigger. Wildcard imports (`from .models import *`) are
+    /// flagged because we can't see which names land in scope.
     pub fn is_direct_model_import(&self) -> bool {
-        self.text.contains(".models import") && !self.text.contains("django.db.models")
+        let Some(module) = &self.module else {
+            return false;
+        };
+        if !module_path_ends_with_models(module) {
+            return false;
+        }
+        if module.starts_with("django.") {
+            return false;
+        }
+        self.names
+            .iter()
+            .any(|n| n == "*" || starts_with_uppercase(n))
     }
+}
+
+/// Returns true if `module` ends with a `models` segment, e.g.
+/// `myapp.models`, `package.models`, or just `models`. Relative imports
+/// like `.models` and `..models` also count.
+fn module_path_ends_with_models(module: &str) -> bool {
+    let trimmed = module.trim_start_matches('.');
+    trimmed == "models" || trimmed.ends_with(".models")
+}
+
+fn starts_with_uppercase(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
 }

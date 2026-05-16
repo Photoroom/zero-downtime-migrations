@@ -371,11 +371,72 @@ impl<'a> MigrationExtractor<'a> {
         self.parsed
             .get_imports()
             .into_iter()
-            .map(|node| Import {
-                text: self.node_text(node).to_string(),
-                span: Span::from_node(&node),
+            .map(|node| {
+                let (module, names) = self.extract_import_parts(node);
+                Import {
+                    text: self.node_text(node).to_string(),
+                    module,
+                    names,
+                    span: Span::from_node(&node),
+                }
             })
             .collect()
+    }
+
+    /// For an `import_from_statement`, return the module path and the list
+    /// of imported names. For a plain `import_statement` returns `(None,
+    /// names_imported)` so callers can match on the absence of a module.
+    fn extract_import_parts(&self, node: Node) -> (Option<String>, Vec<String>) {
+        if node.kind() != "import_from_statement" {
+            // `import X` / `import X as Y` — module is the dotted path.
+            let mut names = Vec::new();
+            for child in node.named_children(&mut node.walk()) {
+                match child.kind() {
+                    "dotted_name" | "identifier" => {
+                        names.push(self.node_text(child).to_string());
+                    }
+                    "aliased_import" => {
+                        if let Some(orig) = child.child_by_field_name("name") {
+                            names.push(self.node_text(orig).to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return (None, names);
+        }
+
+        let module = node
+            .child_by_field_name("module_name")
+            .map(|m| self.node_text(m).to_string());
+
+        let mut names = Vec::new();
+        // Imported names appear as named children that are not the
+        // module_name field. Tree-sitter-python tags `module_name` as a
+        // field but the children iterator still yields it; filter by id.
+        let module_id = node.child_by_field_name("module_name").map(|m| m.id());
+        for child in node.named_children(&mut node.walk()) {
+            if Some(child.id()) == module_id {
+                continue;
+            }
+            match child.kind() {
+                "dotted_name" | "identifier" => {
+                    names.push(self.node_text(child).to_string());
+                }
+                "aliased_import" => {
+                    if let Some(orig) = child.child_by_field_name("name") {
+                        names.push(self.node_text(orig).to_string());
+                    }
+                }
+                // `from X import *` — record as a wildcard sentinel so
+                // matchers can decide whether to treat it as broad.
+                "wildcard_import" => {
+                    names.push("*".to_string());
+                }
+                _ => {}
+            }
+        }
+        (module, names)
     }
 
     /// Get a keyword argument value as a string.

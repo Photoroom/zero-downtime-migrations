@@ -127,4 +127,109 @@ class Migration(migrations.Migration):
         let diagnostics = check_migration(DJANGO_MODELS_IMPORT_GOOD);
         assert!(diagnostics.is_empty());
     }
+
+    const RELATIVE_HELPER_IMPORT_GOOD: &str = r#"
+from django.db import migrations
+from .models import compute_something
+
+
+class Migration(migrations.Migration):
+    operations = []
+"#;
+
+    #[test]
+    fn test_relative_helper_import_is_not_flagged() {
+        // `from .models import compute_something` imports a snake_case
+        // helper from a sibling models module — not a model class. The
+        // earlier substring-based check wrongly flagged this.
+        let diagnostics = check_migration(RELATIVE_HELPER_IMPORT_GOOD);
+        assert!(diagnostics.is_empty());
+    }
+
+    const RELATIVE_MODEL_IMPORT_BAD: &str = r#"
+from django.db import migrations
+from .models import Product
+
+
+class Migration(migrations.Migration):
+    operations = []
+"#;
+
+    #[test]
+    fn test_relative_model_import_is_flagged() {
+        let diagnostics = check_migration(RELATIVE_MODEL_IMPORT_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R014");
+    }
+
+    const DJANGO_AUTH_USER_IMPORT_GOOD: &str = r#"
+from django.db import migrations
+from django.contrib.auth.models import User
+
+
+class Migration(migrations.Migration):
+    operations = []
+"#;
+
+    #[test]
+    fn test_django_contrib_models_import_not_flagged() {
+        // Imports from django.* are framework-provided model utilities,
+        // not user model state. R014 is about the user's own model
+        // classes whose schema may drift; framework models don't have
+        // that problem.
+        let diagnostics = check_migration(DJANGO_AUTH_USER_IMPORT_GOOD);
+        assert!(diagnostics.is_empty());
+    }
+
+    const MIXED_NAMES_BAD: &str = r#"
+from django.db import migrations
+from .models import compute_something, Product
+
+
+class Migration(migrations.Migration):
+    operations = []
+"#;
+
+    #[test]
+    fn test_mixed_names_in_one_import_is_flagged() {
+        // A single import with at least one PascalCase name is enough.
+        let diagnostics = check_migration(MIXED_NAMES_BAD);
+        assert_eq!(diagnostics.len(), 1);
+    }
+
+    const WILDCARD_IMPORT_BAD: &str = r#"
+from django.db import migrations
+from .models import *
+
+
+class Migration(migrations.Migration):
+    operations = []
+"#;
+
+    #[test]
+    fn test_wildcard_import_is_flagged() {
+        // `from .models import *` brings every name in scope, including
+        // model classes. We can't see the names, so the conservative call
+        // is to flag.
+        let diagnostics = check_migration(WILDCARD_IMPORT_BAD);
+        assert_eq!(diagnostics.len(), 1);
+    }
+
+    const PLAIN_IMPORT_OF_MODELS_GOOD: &str = r#"
+from django.db import migrations
+import myapp.models
+
+
+class Migration(migrations.Migration):
+    operations = []
+"#;
+
+    #[test]
+    fn test_plain_import_of_models_module_not_flagged() {
+        // `import myapp.models` does not by itself bring a model class
+        // into scope — subsequent use of `myapp.models.X` would, but
+        // R014 only looks at imports today.
+        let diagnostics = check_migration(PLAIN_IMPORT_OF_MODELS_GOOD);
+        assert!(diagnostics.is_empty());
+    }
 }
