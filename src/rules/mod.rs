@@ -258,13 +258,21 @@ mod tests {
     #[test]
     fn test_registry_has_all_rules() {
         let registry = RuleRegistry::new();
-        assert!(registry.rules().len() >= 15);
+        let ids: Vec<&str> = registry.rules().iter().map(|r| r.id()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "R001", "R002", "R003", "R004", "R005", "R006", "R007", "R010", "R011", "R012",
+                "R013", "R014", "R015", "R016", "R017",
+            ],
+        );
     }
 
     #[test]
     fn test_changeset_registry_has_all_rules() {
         let registry = ChangesetRuleRegistry::new();
-        assert!(registry.rules().len() >= 2);
+        let ids: Vec<&str> = registry.rules().iter().map(|r| r.id()).collect();
+        assert_eq!(ids, vec!["R008", "R009"]);
     }
 
     #[test]
