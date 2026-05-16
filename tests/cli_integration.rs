@@ -252,8 +252,8 @@ mod diff_mode {
             .output()
             .expect("Failed to update base branch");
 
-        // A staged migration that lives under an excluded path. Without the
-        // exclude filter being applied to staged discovery, R001 would fire.
+        // Staged migration A lives under the excluded path; without
+        // the exclude filter R001 would fire on it.
         let excluded_dir = temp
             .path()
             .join("app")
@@ -268,15 +268,57 @@ mod diff_mode {
         .unwrap();
         git_stage(temp.path(), "app/test_migrations");
 
-        zdm()
+        // The exclude-only assertion was self-confirming: if the diff
+        // machinery silently missed staged files, the test would
+        // still pass with exit 0. Stage a CONTROL migration in a
+        // NON-excluded path with the same bad content — that file
+        // must fire R001, proving the exclude is what suppressed the
+        // first one rather than the discovery layer ignoring
+        // everything.
+        let control_dir = temp.path().join("app").join("migrations");
+        fs::write(
+            control_dir.join("0002_control_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        git_stage(temp.path(), "app/migrations/0002_control_bad.py");
+
+        let output = zdm()
             .current_dir(temp.path())
             .arg("--diff-staged")
             .arg("origin/main")
             .arg("--select")
             .arg("R001")
+            .arg("--output-format")
+            .arg("json")
             .assert()
-            .success()
-            .code(0);
+            .failure()
+            .code(1)
+            .get_output()
+            .stdout
+            .clone();
+        let json: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(output).unwrap()).unwrap();
+        let diags = json
+            .get("diagnostics")
+            .and_then(|v| v.as_array())
+            .expect("JSON must include a `diagnostics` array");
+        // Exactly one diagnostic: the control. The excluded file
+        // contributes nothing.
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected only the control file to fire, got: {diags:#?}",
+        );
+        let path = diags[0]["path"].as_str().unwrap();
+        assert!(
+            path.ends_with("0002_control_bad.py"),
+            "the surviving diagnostic must be the control, got path: {path}",
+        );
+        assert!(
+            !path.contains("test_migrations"),
+            "an excluded-path diagnostic should not surface, got: {path}",
+        );
     }
 
     #[test]
