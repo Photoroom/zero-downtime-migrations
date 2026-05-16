@@ -145,6 +145,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
         all_diagnostics.extend(changeset_diagnostics);
     }
 
+    // Sort diagnostics by (path, line, column) so output reads in source
+    // order rather than rule-iteration order. Rules iterate file-by-file
+    // and rule-by-rule, which would otherwise group all R001s together
+    // before all R002s for the same file, etc. — the opposite of what
+    // most linters do.
+    all_diagnostics.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.span.start_line.cmp(&b.span.start_line))
+            .then(a.span.start_column.cmp(&b.span.start_column))
+            .then(a.rule_id.cmp(b.rule_id))
+    });
+
     // Output results
     output_diagnostics(&all_diagnostics, &cli.output_format);
 
