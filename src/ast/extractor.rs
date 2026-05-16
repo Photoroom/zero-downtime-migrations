@@ -714,11 +714,44 @@ impl<'a> MigrationExtractor<'a> {
         None
     }
 
-    /// Extract the actual string value (removing quotes).
+    /// Extract the actual string content from a tree-sitter `string`
+    /// node, concatenating every `string_content` child.
+    ///
+    /// The previous implementation called `trim_matches(|c| c == '"'
+    /// || c == '\'')` on the raw node text. That mis-handled:
+    ///   - Mixed-quote literals like `"'foo"` (would strip the inner
+    ///     `'` and return `foo` instead of `'foo`).
+    ///   - String prefixes like `r"foo"` (left an `r` glued to the
+    ///     opening quote in the trimmed result).
+    ///   - Triple-quoted strings happen to work because
+    ///     `trim_matches` strips a class of characters greedily, but
+    ///     the correctness was coincidental.
+    ///
+    /// Tree-sitter-python decomposes a `string` node into
+    /// `string_start` (opening delimiter + prefix), one or more
+    /// `string_content` chunks (the literal text), and `string_end`.
+    /// Concatenating just the `string_content` children gives us the
+    /// content verbatim regardless of quoting or prefix. Escape
+    /// sequences inside the content are preserved as written, which
+    /// matches the previous behaviour for any non-pathological
+    /// identifier (column/index/model names don't normally contain
+    /// `\` anyway). Interpolation nodes inside f-strings are skipped
+    /// so we don't fabricate column names from runtime expressions.
     fn extract_string_value(&self, node: Node) -> String {
-        let text = self.node_text(node);
-        // Remove surrounding quotes
-        text.trim_matches(|c| c == '"' || c == '\'').to_string()
+        if node.kind() != "string" {
+            // Fallback for non-string nodes (callers occasionally
+            // pass through identifiers in error paths). Returning
+            // raw text preserves the prior best-effort behaviour
+            // without panicking.
+            return self.node_text(node).to_string();
+        }
+        let mut out = String::new();
+        for child in node.children(&mut node.walk()) {
+            if child.kind() == "string_content" {
+                out.push_str(self.node_text(child));
+            }
+        }
+        out
     }
 
     /// Get the text of a node.
@@ -1773,5 +1806,46 @@ class Migration(migrations.Migration):
             .map(|op| op.op_type)
             .collect();
         assert_eq!(kinds, vec![OperationType::SeparateDatabaseAndState]);
+    }
+
+    const STRING_QUOTING_VARIANTS: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(
+                fields=["name", 'category', r"raw_name", """triple"""],
+                name='product_multi_idx',
+            ),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_string_handles_quoting_variants() {
+        // The previous `trim_matches` implementation mis-handled
+        // prefixed strings (`r"raw_name"` → returned `r` glued to
+        // the value) and could collapse mixed-quote contents. Pin
+        // that every supported form yields the bare content.
+        let parsed = ParsedMigration::parse(STRING_QUOTING_VARIANTS).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(
+            data.columns,
+            vec![
+                "name".to_string(),
+                "category".to_string(),
+                "raw_name".to_string(),
+                "triple".to_string(),
+            ],
+        );
     }
 }
