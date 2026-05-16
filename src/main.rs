@@ -93,18 +93,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
         };
     }
 
-    // Build config from CLI args
+    // Build config from CLI args. `apply_cli_overrides` treats `--ignore`
+    // as additive to the file's ignore list and `--select` as replacing it.
     let mut config = load_config()?;
-
-    if let Some(select) = cli.select {
-        config.select = select.into_iter().collect();
-    }
-    if let Some(ignore) = cli.ignore {
-        config.ignore = ignore.into_iter().collect();
-    }
-    if cli.warnings_as_errors {
-        config.warnings_as_errors = true;
-    }
+    config.apply_cli_overrides(cli.select, cli.ignore, cli.warnings_as_errors);
 
     let diff_mode = match (cli.diff.as_deref(), cli.diff_staged.as_deref()) {
         (Some(base_ref), None) => Some(DiffMode::Head { base_ref }),

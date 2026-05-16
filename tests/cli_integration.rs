@@ -417,6 +417,9 @@ class Migration(migrations.Migration):
 mod rule_selection {
     use super::*;
 
+    // This fixture triggers exactly R001 (non-concurrent AddIndex) and
+    // R016 (non-concurrent RemoveIndex). Tests in this module rely on
+    // those being the only diagnostics emitted.
     const MIGRATION_WITH_MULTIPLE_ISSUES: &str = r#"
 from django.db import migrations, models
 
@@ -489,6 +492,48 @@ class Migration(migrations.Migration):
             .assert()
             .success()
             .code(0);
+    }
+
+    #[test]
+    fn cli_ignore_is_additive_to_config_ignore() {
+        let temp = setup_migrations(&[("0001_multi.py", MIGRATION_WITH_MULTIPLE_ISSUES)]);
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"ignore = ["R016"]"#,
+        )
+        .unwrap();
+
+        // Config ignores R016, CLI adds R001. Both should be suppressed and
+        // the run should exit clean.
+        zdm()
+            .current_dir(temp.path())
+            .arg("--ignore")
+            .arg("R001")
+            .assert()
+            .success()
+            .code(0);
+    }
+
+    #[test]
+    fn cli_select_replaces_config_select() {
+        let temp = setup_migrations(&[("0001_multi.py", MIGRATION_WITH_MULTIPLE_ISSUES)]);
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"select = ["R001"]"#,
+        )
+        .unwrap();
+
+        // Config selects R001 only; CLI overrides with R016 only. R001 must
+        // not be reported; R016 must.
+        zdm()
+            .current_dir(temp.path())
+            .arg("--select")
+            .arg("R016")
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("R001").not())
+            .stdout(predicate::str::contains("R016"));
     }
 }
 
