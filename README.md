@@ -56,6 +56,9 @@ zdm --ignore R008 .
 # Show explanation for a rule
 zdm rule R001
 
+# List every rule the binary recognises
+zdm --list-rules
+
 # Treat warnings as errors
 zdm --warnings-as-errors .
 ```
@@ -202,7 +205,8 @@ pre-commit is validating, rather than the previous `HEAD` commit.
 | **Requires Django installed** | No | Yes | Yes |
 | **Requires project setup** | No | Yes (settings.py) | Yes (full environment) |
 | **Checks for missing migrations** | No | No | Yes |
-| **Checks for unsafe operations** | Yes (16 rules) | Yes (~8 rules) | No |
+| **Checks for unsafe operations** | Yes (16 rules; `zdm --list-rules`) | Yes (~8 rules) | No |
+| **Configurable via `pyproject.toml`** | Yes (walks up to repo root) | Yes | N/A |
 | **Can run without database** | Yes | Yes | No |
 | **Language** | Rust | Python | Python |
 

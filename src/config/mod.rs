@@ -19,6 +19,17 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 
 /// Configuration for zdm.
+///
+/// `exclude` and `allowed_file_patterns` are validated at config
+/// load (`Config::load_from_directory` → `validate_glob_patterns`)
+/// and runtime call sites rely on that invariant — they call
+/// `glob::Pattern::new(p).expect(...)` rather than gracefully
+/// degrading on a re-parse failure. **A library consumer that
+/// mutates these fields directly must call `validate_glob_patterns`
+/// before invoking any code that compiles them, or risk a panic at
+/// the runtime site.** The fields are `pub` for ergonomics
+/// (config-from-Rust callers); enforcing this via setters would be
+/// cleaner but isn't done yet.
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     /// Rules to select (if empty, all rules are selected).
@@ -27,10 +38,14 @@ pub struct Config {
     pub ignore: HashSet<String>,
     /// Treat warnings as errors.
     pub warnings_as_errors: bool,
-    /// File patterns to exclude from linting.
+    /// File patterns to exclude from linting. See struct doc — must
+    /// be re-validated via `validate_glob_patterns` after any
+    /// out-of-band mutation.
     pub exclude: Vec<String>,
-    /// For R008: file patterns allowed to change alongside migrations.
-    /// Files NOT matching these patterns will trigger a warning.
+    /// For R008: file patterns allowed to change alongside
+    /// migrations. Files NOT matching these patterns will trigger a
+    /// warning. See struct doc — must be re-validated via
+    /// `validate_glob_patterns` after any out-of-band mutation.
     pub allowed_file_patterns: Vec<String>,
 }
 
