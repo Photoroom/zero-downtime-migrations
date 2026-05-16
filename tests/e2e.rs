@@ -103,6 +103,107 @@ fn e2e_r016_pass_concurrent_remove_index() {
 }
 
 // =============================================================================
+// Coverage for previously-orphan fixtures.
+//
+// These fixture files lived on disk but had no e2e test referencing them
+// before this PR, so they masqueraded as coverage. The tests below pin
+// each one to a concrete expected outcome so a regression in the rule
+// will surface here. R012 is the only Warning in the set; everything
+// else is Error (exit 1).
+// =============================================================================
+
+#[test]
+fn e2e_r002_fail_unique_constraint() {
+    let fixture = fixtures_dir().join("R002/fail_unique_constraint.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R002"));
+}
+
+#[test]
+fn e2e_r003_fail_run_sql_create_index() {
+    let fixture = fixtures_dir().join("R003/fail_run_sql_create_index.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R003"))
+        .stdout(predicate::str::contains("CONCURRENTLY"));
+}
+
+#[test]
+fn e2e_r006_fail_add_field_fk() {
+    let fixture = fixtures_dir().join("R006/fail_add_field_fk.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R006"));
+}
+
+#[test]
+fn e2e_r011_fail_rename_field() {
+    let fixture = fixtures_dir().join("R011/fail_rename_field.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R011"));
+}
+
+#[test]
+fn e2e_r012_fail_run_python_irreversible() {
+    // R012 is a Warning, so the run still exits 0 unless the user opts
+    // into --warnings-as-errors; assert both the warning surfaces and
+    // the exit code reflects the intended severity policy.
+    let fixture = fixtures_dir().join("R012/fail_run_python_irreversible.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .success()
+        .code(0)
+        .stdout(predicate::str::contains("R012"));
+}
+
+#[test]
+fn e2e_r014_fail_model_import() {
+    // The fixture also lacks a reverse_code on its RunPython, so R012
+    // (Warning) fires alongside R014 (Error). Substring matching on
+    // R014 is enough — we just need the rule under test to surface.
+    let fixture = fixtures_dir().join("R014/fail_model_import.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R014"));
+}
+
+#[test]
+fn e2e_r015_fail_alter_field_not_null() {
+    let fixture = fixtures_dir().join("R015/fail_alter_field_not_null.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R015"));
+}
+
+// =============================================================================
 // Multiple Rules in Same File
 // =============================================================================
 
