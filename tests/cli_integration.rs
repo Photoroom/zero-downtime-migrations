@@ -662,7 +662,11 @@ mod rule_command {
             // `main()`'s error sink).
             .stderr(predicate::function(|s: &str| {
                 s.matches("Unknown rule").count() == 1
-            }));
+            }))
+            // The error now lists the available rule IDs so the user
+            // gets actionable feedback (e.g. "did you mean R001?").
+            .stderr(predicate::str::contains("available rules:"))
+            .stderr(predicate::str::contains("R001"));
     }
 }
 

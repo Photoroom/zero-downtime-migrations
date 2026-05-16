@@ -96,12 +96,19 @@ pub enum Error {
     InvalidGitReference { reference: String },
 
     /// Unknown rule
-    #[error("Unknown rule: {rule_id}")]
+    #[error("Unknown rule: {rule_id}\n  available rules: {}", available.join(", "))]
     #[diagnostic(
         code(zdm::rule::unknown),
         help("Run 'zdm rule <id>' to see documentation for a specific rule")
     )]
-    UnknownRule { rule_id: String },
+    UnknownRule {
+        rule_id: String,
+        /// All rule IDs the binary knows about, sorted, for the
+        /// "available rules: …" line in the error message. Populated
+        /// at the error-construction site (the CLI dispatcher) so the
+        /// error type itself doesn't depend on the rule registries.
+        available: Vec<String>,
+    },
 
     /// Invalid path
     #[error("Invalid path: {path}")]
@@ -198,10 +205,13 @@ impl Error {
         }
     }
 
-    /// Create an unknown rule error.
-    pub fn unknown_rule(rule_id: impl Into<String>) -> Self {
+    /// Create an unknown rule error. `available` should be every rule
+    /// ID the binary recognises (per-file + changeset registries),
+    /// sorted, so the rendered error can suggest valid alternatives.
+    pub fn unknown_rule(rule_id: impl Into<String>, available: Vec<String>) -> Self {
         Self::UnknownRule {
             rule_id: rule_id.into(),
+            available,
         }
     }
 

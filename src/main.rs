@@ -217,8 +217,23 @@ fn run_rule_command(rule_id: &str) -> Result<ExitCode> {
     // No `eprintln!` here: returning the error propagates to `main()`,
     // which renders it through the standard sanitized error path. The
     // previous explicit print produced a duplicate "error: Unknown
-    // rule: X" line.
-    Err(Error::unknown_rule(rule_id))
+    // rule: X" line. The error carries the sorted list of valid rule
+    // IDs so the user gets actionable feedback instead of having to
+    // grep the docs.
+    let mut available: Vec<String> = registry
+        .rules()
+        .iter()
+        .map(|r| r.id().to_string())
+        .chain(
+            changeset_registry
+                .rules()
+                .iter()
+                .map(|r| r.id().to_string()),
+        )
+        .collect();
+    available.sort();
+    available.dedup();
+    Err(Error::unknown_rule(rule_id, available))
 }
 
 fn load_config() -> Result<Config> {
