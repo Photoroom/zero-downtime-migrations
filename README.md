@@ -14,8 +14,10 @@ A standalone Rust CLI tool that statically analyzes Django migration files to ca
 
 ## Installation
 
+> **Breaking change:** the `zero-downtime-migrations` command alias has been removed. Use `zdm`. (`alias zero-downtime-migrations=zdm` in your shell is a one-line workaround if you depended on the old name.)
+
 ```bash
-# Install via pip (PyPI package is django-zdm; binaries are zdm and zero-downtime-migrations)
+# Install via pip (PyPI package is django-zdm; binary is `zdm`)
 pip install django-zdm
 
 # Or use uvx to run without installing
@@ -28,8 +30,7 @@ pipx install django-zdm
 ## Usage
 
 ```bash
-# These are equivalent
-zero-downtime-migrations app/migrations/0042_add_index.py
+# Lint a single migration
 zdm app/migrations/0042_add_index.py
 
 # Lint all migrations in a directory

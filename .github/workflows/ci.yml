@@ -122,4 +122,3 @@ jobs:
           name: zdm-${{ matrix.target }}
           path: |
             target/${{ matrix.target }}/release/zdm${{ matrix.os == 'windows-latest' && '.exe' || '' }}
-            target/${{ matrix.target }}/release/zero-downtime-migrations${{ matrix.os == 'windows-latest' && '.exe' || '' }}
