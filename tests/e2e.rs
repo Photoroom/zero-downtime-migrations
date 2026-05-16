@@ -587,3 +587,71 @@ class Migration(migrations.Migration):
          got stdout:\n{stdout}\nstderr:\n{stderr}",
     );
 }
+
+// =============================================================================
+// E2E coverage for rules that previously had no fixture-based test.
+//
+// R004, R005, R013, R017 each shipped with only in-rule unit tests.
+// A regression in the output sink, operation extractor, or registry
+// assembly could silently break end-to-end emission for these
+// rules without any integration test failing. Add minimal fail
+// fixtures + e2e tests so the binary's plumbing is exercised for
+// every rule that ships diagnostics from a single-file lint.
+//
+// R009 is deliberately skipped here — it's a changeset rule that
+// only fires across multiple files in a diff, so its meaningful
+// e2e coverage lives in tests/cli_integration.rs's diff-mode
+// section rather than a single-file fixture invocation.
+// =============================================================================
+
+#[test]
+fn e2e_r004_fail_concurrent_without_atomic_false() {
+    let fixture = fixtures_dir().join("R004/fail_concurrent_without_atomic_false.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R004"));
+}
+
+#[test]
+fn e2e_r005_fail_remove_field_without_separate() {
+    let fixture = fixtures_dir().join("R005/fail_remove_field_without_separate.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R005"));
+}
+
+#[test]
+fn e2e_r013_fail_irreversible_run_sql() {
+    // R013 is a Warning, so exit code stays 0 unless we promote
+    // it. Pin both the exit code AND the rule ID in stdout so a
+    // silently-suppressed warning doesn't pass the test.
+    let fixture = fixtures_dir().join("R013/fail_irreversible_run_sql.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .success()
+        .code(0)
+        .stdout(predicate::str::contains("R013"))
+        .stdout(predicate::str::contains("warning"));
+}
+
+#[test]
+fn e2e_r017_fail_check_constraint() {
+    let fixture = fixtures_dir().join("R017/fail_check_constraint.py");
+
+    zdm()
+        .arg(&fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R017"));
+}
