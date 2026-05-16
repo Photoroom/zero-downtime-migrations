@@ -42,17 +42,39 @@ fn e2e_r001_fail_non_concurrent_add_index() {
 
 #[test]
 fn e2e_r001_pass_concurrent_add_index() {
-    let fixture = fixtures_dir().join("R001/pass_concurrent_add_index.py");
+    // Pass-only assertions like `.success().code(0)` are
+    // self-confirming: if the entire rule registry silently
+    // stopped emitting diagnostics on this fixture (or any
+    // fixture), the test would still pass. Pair every pass
+    // fixture with a sibling lint of the matching fail fixture
+    // to prove the rule is alive on this branch.
+    let pass_fixture = fixtures_dir().join("R001/pass_concurrent_add_index.py");
+    zdm().arg(&pass_fixture).assert().success().code(0);
 
-    zdm().arg(&fixture).assert().success().code(0);
+    let fail_fixture = fixtures_dir().join("R001/fail_non_concurrent_add_index.py");
+    zdm()
+        .arg(&fail_fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R001"));
 }
 
 #[test]
 fn e2e_r001_pass_add_index_on_new_model() {
-    // CreateModel exemption - adding index on newly created model is safe
-    let fixture = fixtures_dir().join("R001/pass_add_index_on_new_model.py");
+    // CreateModel exemption — adding index on newly created
+    // model is safe. Paired with the same fail-fixture sibling
+    // as above to defend against silent registry regressions.
+    let pass_fixture = fixtures_dir().join("R001/pass_add_index_on_new_model.py");
+    zdm().arg(&pass_fixture).assert().success().code(0);
 
-    zdm().arg(&fixture).assert().success().code(0);
+    let fail_fixture = fixtures_dir().join("R001/fail_non_concurrent_add_index.py");
+    zdm()
+        .arg(&fail_fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R001"));
 }
 
 // =============================================================================
@@ -61,9 +83,19 @@ fn e2e_r001_pass_add_index_on_new_model() {
 
 #[test]
 fn e2e_r010_pass_nullable_field() {
-    let fixture = fixtures_dir().join("R010/pass_nullable_field.py");
+    // Paired with the fail fixture (see e2e_r001 pass tests for
+    // rationale) so a silent registry regression on R010 can't
+    // pass this test by emitting nothing.
+    let pass_fixture = fixtures_dir().join("R010/pass_nullable_field.py");
+    zdm().arg(&pass_fixture).assert().success().code(0);
 
-    zdm().arg(&fixture).assert().success().code(0);
+    let fail_fixture = fixtures_dir().join("R010/fail_add_field_not_null.py");
+    zdm()
+        .arg(&fail_fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R010"));
 }
 
 #[test]
@@ -97,9 +129,19 @@ fn e2e_r016_fail_non_concurrent_remove_index() {
 
 #[test]
 fn e2e_r016_pass_concurrent_remove_index() {
-    let fixture = fixtures_dir().join("R016/pass_concurrent_remove_index.py");
+    // Paired with the fail fixture so a silent registry
+    // regression on R016 can't pass this test by emitting
+    // nothing.
+    let pass_fixture = fixtures_dir().join("R016/pass_concurrent_remove_index.py");
+    zdm().arg(&pass_fixture).assert().success().code(0);
 
-    zdm().arg(&fixture).assert().success().code(0);
+    let fail_fixture = fixtures_dir().join("R016/fail_remove_index_non_concurrent.py");
+    zdm()
+        .arg(&fail_fixture)
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("R016"));
 }
 
 // =============================================================================
@@ -178,17 +220,27 @@ fn e2e_r012_fail_run_python_irreversible() {
 
 #[test]
 fn e2e_r014_fail_model_import() {
-    // The fixture also lacks a reverse_code on its RunPython, so R012
-    // (Warning) fires alongside R014 (Error). Substring matching on
-    // R014 is enough — we just need the rule under test to surface.
+    // The fixture lacks a reverse_code on its RunPython, so R012
+    // (Warning) fires alongside R014 (Error). Pin BOTH rule IDs
+    // so the test catches:
+    //   - R014 silently stops firing (was pinned before)
+    //   - R012 silently stops firing on this fixture (would have
+    //     passed the old `contains("R014")` check while masking
+    //     a real regression in R012's RunPython detection)
+    // Also use `--select R014,R012` to scope the run so a future
+    // false-positive in some other rule (R010 etc.) on this same
+    // fixture doesn't blur the assertion.
     let fixture = fixtures_dir().join("R014/fail_model_import.py");
 
     zdm()
         .arg(&fixture)
+        .arg("--select")
+        .arg("R014,R012")
         .assert()
         .failure()
         .code(1)
-        .stdout(predicate::str::contains("R014"));
+        .stdout(predicate::str::contains("R014"))
+        .stdout(predicate::str::contains("R012"));
 }
 
 #[test]
