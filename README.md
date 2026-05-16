@@ -83,7 +83,7 @@ zdm --warnings-as-errors .
 | R012 | irreversible-run-python | Warning | `RunPython` should have a reverse function |
 | R013 | irreversible-run-sql | Warning | `RunSQL` should have a reverse SQL |
 | R014 | model-imports | Error | Don't import models in `RunPython` |
-| R015 | alter-field-not-null | Error | Changing field to NOT NULL validates all rows |
+| R015 | alter-field-not-null | Warning | `AlterField` whose result is NOT NULL may scan every row |
 | R016 | non-concurrent-remove-index | Error | Use `RemoveIndexConcurrently` instead of `RemoveIndex` |
 | R017 | non-concurrent-add-constraint | Error | Adding a CHECK constraint validates all rows |
 
@@ -111,7 +111,7 @@ class Migration(migrations.Migration):
 
 ### R015 Limitation
 
-R015 (alter-field-not-null) cannot determine whether a field was previously nullable. It flags ALL `AlterField` operations where the resulting field is NOT NULL, which may produce false positives when the field was already NOT NULL. This is a fundamental limitation of static analysis without schema history. Use `# zdm: ignore R015` inline comments for legitimate `AlterField` operations that don't change nullability.
+R015 (alter-field-not-null) cannot tell, from a single `AlterField` operation, whether the column was previously nullable. It flags any `AlterField` whose resulting field is NOT NULL, which catches a genuine nullable→NOT NULL transition (the dangerous case) alongside benign re-stipulations of an already-NOT-NULL column. Because static analysis has no schema history, the rule emits `Warning` rather than `Error` — surfaced for review without breaking CI. Add `# zdm: ignore R015` on operations you have verified are safe.
 
 ### Inline Suppression
 

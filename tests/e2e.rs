@@ -192,14 +192,18 @@ fn e2e_r014_fail_model_import() {
 }
 
 #[test]
-fn e2e_r015_fail_alter_field_not_null() {
+fn e2e_r015_warns_alter_field_not_null() {
+    // R015 surfaces nullable→NOT NULL transitions as a Warning rather
+    // than an Error, because the rule cannot tell a genuine transition
+    // from a benign AlterField on an already-NOT-NULL column. The
+    // diagnostic appears in stdout but does not fail the build.
     let fixture = fixtures_dir().join("R015/fail_alter_field_not_null.py");
 
     zdm()
         .arg(&fixture)
         .assert()
-        .failure()
-        .code(1)
+        .success()
+        .code(0)
         .stdout(predicate::str::contains("R015"));
 }
 

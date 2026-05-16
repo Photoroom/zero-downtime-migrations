@@ -1,21 +1,35 @@
-//! R015: AlterField changing to NOT NULL
+//! R015: AlterField possibly changing to NOT NULL
 //!
-//! Detects AlterField operations that change a field from nullable to NOT NULL.
-//! This operation scans all rows to validate no NULLs exist and can lock the table.
+//! Detects `AlterField` operations whose new field is NOT NULL. The
+//! diagnostic flags both genuine nullable→NOT NULL transitions and
+//! benign re-stipulations of an already-NOT-NULL column (changing
+//! `max_length`, `help_text`, etc., where the new field still happens
+//! to be NOT NULL).
 //!
-//! ## Limitation
+//! ## Why the column scan
 //!
-//! This rule cannot determine whether the field was previously nullable. It flags
-//! ALL AlterField operations where the resulting field is NOT NULL, which may produce
-//! false positives when:
-//! - The field was already NOT NULL (e.g., just changing max_length)
-//! - The AlterField is only changing other properties (e.g., help_text)
+//! `ALTER TABLE ... ALTER COLUMN col SET NOT NULL` normally scans
+//! every row to verify no NULLs exist. The scan runs under an ACCESS
+//! EXCLUSIVE lock that blocks reads and writes for its duration. The
+//! one fast-path: Postgres skips the scan when a *validated*
+//! `CHECK (col IS NOT NULL)` constraint already exists on the column,
+//! because the constraint proves no NULL can be present. The
+//! four-step pattern in the help builds that constraint without
+//! blocking writes, then `SET NOT NULL` becomes a catalog-only
+//! operation.
 //!
-//! This is a fundamental limitation of static analysis without schema history.
-//! To accurately detect nullable→NOT NULL transitions, the tool would need access
-//! to the previous migration or the actual database schema. Consider using
-//! `# zdm: ignore R015` inline comments for legitimate AlterField operations
-//! that don't change nullability.
+//! ## Severity
+//!
+//! `Warning`, not `Error`: the rule cannot tell, from a single
+//! `AlterField` operation, whether the column was previously nullable.
+//! Without schema history, a NOT-NULL→NOT-NULL `AlterField` (very
+//! common — e.g. widening a CharField) is indistinguishable from a
+//! risky nullable→NOT-NULL transition. Treating every such operation
+//! as `Error` blocks correct migrations; emitting a `Warning` flags
+//! the operation for review without breaking CI.
+//!
+//! Use `# zdm: ignore R015` on the operation when you've verified the
+//! column was already NOT NULL.
 
 use crate::ast::{Migration, OperationData, OperationType};
 use crate::diagnostics::{Diagnostic, Severity};
@@ -34,12 +48,14 @@ impl Rule for R015AlterFieldNotNull {
     }
 
     fn description(&self) -> &'static str {
-        "AlterField changing a field to NOT NULL requires scanning all rows to validate \
-         no NULLs exist. Use a CHECK constraint with NOT VALID then VALIDATE separately."
+        "AlterField on a field that ends up NOT NULL may scan every row to validate \
+         the constraint. Verify the column was already NOT NULL, or migrate via \
+         a four-step pattern: NOT VALID CHECK, VALIDATE CONSTRAINT, SET NOT NULL, \
+         DROP CONSTRAINT."
     }
 
     fn severity(&self) -> Severity {
-        Severity::Error
+        Severity::Warning
     }
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
@@ -48,22 +64,28 @@ impl Rule for R015AlterFieldNotNull {
         for op in migration.operations_of_type(OperationType::AlterField) {
             if let OperationData::Field(data) = &op.data {
                 if let Some(ref field) = data.field {
-                    // Check if the field is now NOT NULL
                     if !field.is_nullable {
                         diagnostics.push(Diagnostic {
                             rule_id: self.id(),
                             rule_name: self.name(),
                             message: format!(
-                                "AlterField '{}' makes field NOT NULL",
+                                "AlterField '{}' results in a NOT NULL column \
+                                 (may require a full table scan)",
                                 data.field_name
                             ),
                             severity: self.severity(),
                             path: ctx.path.to_path_buf(),
                             span: op.span,
                             help: Some(
-                                "Use a two-step approach: 1) Add a CHECK constraint with NOT VALID \
-                                 to prevent new NULLs, 2) VALIDATE CONSTRAINT in a separate migration \
-                                 to check existing rows without locking"
+                                "If the column was already NOT NULL (e.g. you're only \
+                                 changing max_length or help_text), this is safe — add \
+                                 `# zdm: ignore R015` to suppress.\n\n\
+                                 If this is a genuine nullable → NOT NULL transition, use \
+                                 the four-step pattern:\n  \
+                                 1. ALTER TABLE ... ADD CONSTRAINT <name> CHECK (col IS NOT NULL) NOT VALID;\n  \
+                                 2. ALTER TABLE ... VALIDATE CONSTRAINT <name>;  -- table-scan without blocking writes\n  \
+                                 3. ALTER TABLE ... ALTER COLUMN col SET NOT NULL;  -- catalog-only, no scan, because the CHECK proves no NULLs\n  \
+                                 4. ALTER TABLE ... DROP CONSTRAINT <name>;  -- optional cleanup; the CHECK is now subsumed by the NOT NULL marker"
                                     .to_string(),
                             ),
                         });
@@ -137,5 +159,16 @@ class Migration(migrations.Migration):
     fn test_alter_nullable_good() {
         let diagnostics = check_migration(ALTER_NULLABLE_GOOD);
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_r015_severity_is_warning() {
+        // R015 cannot tell a genuine nullable → NOT NULL transition
+        // from a benign AlterField on an already-NOT-NULL column.
+        // Treating the diagnostic as Warning surfaces it for review
+        // without breaking CI on the common false-positive form.
+        let diagnostics = check_migration(ALTER_TO_NOT_NULL_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, Severity::Warning);
     }
 }
