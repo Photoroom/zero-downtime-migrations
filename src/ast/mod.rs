@@ -28,6 +28,16 @@ pub struct Migration {
     pub imports: Vec<Import>,
     /// Model names created in this migration (for exemption tracking).
     pub created_models: Vec<String>,
+    /// Operations extracted from
+    /// `SeparateDatabaseAndState(database_operations=[...])` arms in this
+    /// migration. These represent the "database-side" half of a two-step
+    /// deployment — they execute real schema changes without the
+    /// state-side preamble. State-side operations are deliberately not
+    /// surfaced because they're metadata-only and rules that look for
+    /// schema-locking patterns should ignore them. A rule that wants to
+    /// inspect `state_operations` must walk the original
+    /// `OperationData::SeparateDatabaseAndState` payload itself.
+    pub wrapped_database_ops: Vec<Operation>,
     /// Span of the `class Migration(...)` definition, when present. Used
     /// as the anchor for class-level diagnostics (e.g. R004's missing
     /// `atomic = False`) so a `# zdm: ignore` on or above the class line

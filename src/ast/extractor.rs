@@ -104,7 +104,7 @@ impl<'a> MigrationExtractor<'a> {
 
     /// Extract a complete Migration from the parsed file.
     pub fn extract(&self, path: &Path) -> Result<Migration> {
-        let operations = self.extract_operations();
+        let (operations, wrapped_database_ops) = self.extract_operations();
         let imports = self.extract_imports();
         let is_non_atomic = self.parsed.is_non_atomic();
         let line_ignores = self.extract_line_ignores();
@@ -129,6 +129,7 @@ impl<'a> MigrationExtractor<'a> {
             operations,
             imports,
             created_models,
+            wrapped_database_ops,
             class_span,
             line_ignores,
         })
@@ -146,22 +147,66 @@ impl<'a> MigrationExtractor<'a> {
         map
     }
 
-    /// Extract all operations from the migration.
-    fn extract_operations(&self) -> Vec<Operation> {
+    /// Extract the migration's top-level operations and, alongside them,
+    /// any operations wrapped in
+    /// `SeparateDatabaseAndState(database_operations=[...])`. State-side
+    /// wrapped ops are intentionally NOT surfaced: they're metadata-only
+    /// and rules that scan for schema-locking patterns should ignore
+    /// them.
+    fn extract_operations(&self) -> (Vec<Operation>, Vec<Operation>) {
+        let mut top_level: Vec<Operation> = Vec::new();
+        let mut wrapped_database: Vec<Operation> = Vec::new();
+
         let Some(ops_list) = self.parsed.find_operations_list() else {
-            return vec![];
+            return (top_level, wrapped_database);
         };
 
-        let mut operations = Vec::new();
-
         for child in ops_list.children(&mut ops_list.walk()) {
+            if child.kind() != "call" {
+                continue;
+            }
+            let Some(op) = self.extract_operation(child) else {
+                continue;
+            };
+            if op.op_type == OperationType::SeparateDatabaseAndState {
+                if let Some(args) = child.child_by_field_name("arguments") {
+                    let list = self
+                        .get_keyword_arg_value(args, "database_operations")
+                        .or_else(|| self.get_nth_positional_value(args, 0));
+                    if let Some(list) = list {
+                        wrapped_database.extend(self.extract_operations_from_list(list));
+                    }
+                }
+            }
+            top_level.push(op);
+        }
+
+        (top_level, wrapped_database)
+    }
+
+    /// Iterate a `list` syntax node and extract any `call` children as
+    /// operations. Shared by the top-level walk and the
+    /// SeparateDatabaseAndState descent so the same extraction rules
+    /// (e.g. unknown operation types) apply uniformly. Non-`list` value
+    /// nodes (e.g. `database_operations=None`, a comprehension, an
+    /// identifier referring to a module-level list) yield an empty
+    /// vector — we only descend into a literal list. A nested
+    /// `SeparateDatabaseAndState` inside `database_operations` is
+    /// surfaced as a single op; we deliberately do not recurse, since
+    /// the doubly-nested form has no real-world use and recursion would
+    /// hide it from rules that want to flag it.
+    fn extract_operations_from_list(&self, list: Node<'_>) -> Vec<Operation> {
+        let mut operations = Vec::new();
+        if list.kind() != "list" {
+            return operations;
+        }
+        for child in list.children(&mut list.walk()) {
             if child.kind() == "call" {
                 if let Some(op) = self.extract_operation(child) {
                     operations.push(op);
                 }
             }
         }
-
         operations
     }
 
@@ -1196,5 +1241,223 @@ class Migration(migrations.Migration):
         } else {
             panic!("Expected Field data");
         }
+    }
+
+    const SEPARATE_DB_AND_STATE_MIGRATION: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.RunSQL(
+                    sql='ALTER TABLE app_order DROP COLUMN legacy_id;',
+                    reverse_sql='ALTER TABLE app_order ADD COLUMN legacy_id integer;',
+                ),
+                migrations.AddIndex(
+                    model_name='order',
+                    index=models.Index(fields=['status'], name='order_status_idx'),
+                ),
+            ],
+            state_operations=[
+                migrations.RemoveField(model_name='order', name='legacy_id'),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_wrapped_database_ops_are_extracted() {
+        let parsed = ParsedMigration::parse(SEPARATE_DB_AND_STATE_MIGRATION).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        // Top-level operations are unchanged: the SeparateDatabaseAndState
+        // wrapper itself is still surfaced.
+        assert_eq!(migration.operations.len(), 1);
+        assert_eq!(
+            migration.operations[0].op_type,
+            OperationType::SeparateDatabaseAndState
+        );
+
+        // database_operations are extracted into the parallel collection.
+        let kinds: Vec<_> = migration
+            .wrapped_database_ops
+            .iter()
+            .map(|op| op.op_type)
+            .collect();
+        assert_eq!(kinds, vec![OperationType::RunSQL, OperationType::AddIndex]);
+    }
+
+    #[test]
+    fn test_state_operations_are_not_surfaced() {
+        // state_operations are metadata-only — schema-locking rules must
+        // not see them, so we deliberately drop them on the floor.
+        let parsed = ParsedMigration::parse(SEPARATE_DB_AND_STATE_MIGRATION).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        assert!(
+            migration
+                .wrapped_database_ops
+                .iter()
+                .all(|op| op.op_type != OperationType::RemoveField),
+            "RemoveField is in state_operations only and must not appear in wrapped_database_ops"
+        );
+    }
+
+    const SDAS_WITHOUT_DB_OPS: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            state_operations=[
+                migrations.RemoveField(model_name='order', name='legacy_id'),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_sdas_without_database_operations_kwarg_yields_empty() {
+        let parsed = ParsedMigration::parse(SDAS_WITHOUT_DB_OPS).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        assert_eq!(migration.operations.len(), 1);
+        assert!(migration.wrapped_database_ops.is_empty());
+    }
+
+    const SDAS_DB_OPS_POSITIONAL: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            [
+                migrations.RunSQL(sql='ALTER TABLE app_order DROP COLUMN legacy_id;'),
+            ],
+            [
+                migrations.RemoveField(model_name='order', name='legacy_id'),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_sdas_positional_database_operations_are_extracted() {
+        // Django's signature is
+        // `SeparateDatabaseAndState(database_operations=None, state_operations=None)`
+        // and the positional form is valid Python that real migrations
+        // sometimes use.
+        let parsed = ParsedMigration::parse(SDAS_DB_OPS_POSITIONAL).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        assert_eq!(migration.operations.len(), 1);
+        let kinds: Vec<_> = migration
+            .wrapped_database_ops
+            .iter()
+            .map(|op| op.op_type)
+            .collect();
+        assert_eq!(kinds, vec![OperationType::RunSQL]);
+    }
+
+    const SDAS_DB_OPS_NONE: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=None,
+            state_operations=[
+                migrations.RemoveField(model_name='order', name='legacy_id'),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_sdas_database_operations_none_yields_empty() {
+        // `database_operations=None` is valid Django; the kind-check in
+        // `extract_operations_from_list` should reject it without panic.
+        let parsed = ParsedMigration::parse(SDAS_DB_OPS_NONE).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        assert_eq!(migration.operations.len(), 1);
+        assert!(migration.wrapped_database_ops.is_empty());
+    }
+
+    const SDAS_DB_OPS_EMPTY_LIST: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[],
+            state_operations=[],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_sdas_empty_database_operations_yields_empty() {
+        let parsed = ParsedMigration::parse(SDAS_DB_OPS_EMPTY_LIST).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        assert_eq!(migration.operations.len(), 1);
+        assert!(migration.wrapped_database_ops.is_empty());
+    }
+
+    const SDAS_NESTED: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.SeparateDatabaseAndState(
+                    database_operations=[
+                        migrations.RunSQL(sql='SELECT 1;'),
+                    ],
+                ),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_sdas_nested_does_not_recurse() {
+        // Doubly-nested SDaS is exotic enough that we deliberately do
+        // not recurse: the outer call surfaces the inner SDaS as one op
+        // in `wrapped_database_ops`, but the inner call's own
+        // `database_operations` are not hoisted further. A rule that
+        // wants to flag nested SDaS can inspect the surfaced op.
+        let parsed = ParsedMigration::parse(SDAS_NESTED).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        assert_eq!(migration.operations.len(), 1);
+        let kinds: Vec<_> = migration
+            .wrapped_database_ops
+            .iter()
+            .map(|op| op.op_type)
+            .collect();
+        assert_eq!(kinds, vec![OperationType::SeparateDatabaseAndState]);
     }
 }
