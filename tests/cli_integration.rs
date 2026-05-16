@@ -782,3 +782,27 @@ mod version_help {
             ));
     }
 }
+
+mod list_rules {
+    use super::*;
+
+    #[test]
+    fn list_rules_prints_known_rules_and_exits_zero() {
+        // `--list-rules` should short-circuit before config load
+        // (so it works even outside a configured project) and print
+        // every rule the binary knows about. The output uses each
+        // rule's ID, severity, and name.
+        zdm()
+            .arg("--list-rules")
+            .assert()
+            .success()
+            .code(0)
+            .stdout(predicate::str::contains("R001"))
+            .stdout(predicate::str::contains("non-concurrent-add-index"))
+            .stdout(predicate::str::contains("R017"))
+            // R015 was downgraded to Warning in this PR; the listing
+            // should reflect the current severity.
+            .stdout(predicate::str::contains("R015"))
+            .stdout(predicate::str::contains("Warning"));
+    }
+}

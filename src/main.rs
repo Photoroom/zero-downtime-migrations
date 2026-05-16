@@ -53,6 +53,10 @@ struct Cli {
     /// Treat warnings as errors
     #[arg(long)]
     warnings_as_errors: bool,
+
+    /// List every rule the binary recognises and exit
+    #[arg(long)]
+    list_rules: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, Default)]
@@ -98,6 +102,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
         return match command {
             Commands::Rule { rule_id } => run_rule_command(&rule_id),
         };
+    }
+
+    // `--list-rules` short-circuits before anything else: no config
+    // load, no file discovery, just print the catalogue and exit.
+    if cli.list_rules {
+        return list_rules();
     }
 
     // Build config from CLI args. `apply_cli_overrides` treats `--ignore`
@@ -188,6 +198,52 @@ fn run(cli: Cli) -> Result<ExitCode> {
     } else {
         Ok(ExitCode::SUCCESS)
     }
+}
+
+/// Print every rule the binary recognises, sorted by ID, with its
+/// name and severity. One row per rule, columns separated by two
+/// spaces — easy to grep and reasonable to read.
+fn list_rules() -> Result<ExitCode> {
+    let registry = RuleRegistry::new();
+    let changeset_registry = ChangesetRuleRegistry::new();
+
+    let mut rows: Vec<(String, String, String)> = registry
+        .rules()
+        .iter()
+        .map(|r| {
+            (
+                r.id().to_string(),
+                r.name().to_string(),
+                format!("{:?}", r.severity()),
+            )
+        })
+        .chain(changeset_registry.rules().iter().map(|r| {
+            (
+                r.id().to_string(),
+                r.name().to_string(),
+                format!("{:?}", r.severity()),
+            )
+        }))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows.dedup_by(|a, b| a.0 == b.0);
+
+    // Width the ID and severity columns so the name column lines up.
+    let id_width = rows.iter().map(|r| r.0.len()).max().unwrap_or(4);
+    let sev_width = rows.iter().map(|r| r.2.len()).max().unwrap_or(7);
+
+    for (id, name, sev) in &rows {
+        println!(
+            "{:<id_width$}  {:<sev_width$}  {}",
+            id.bold().cyan(),
+            sev,
+            name,
+            id_width = id_width,
+            sev_width = sev_width,
+        );
+    }
+
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_rule_command(rule_id: &str) -> Result<ExitCode> {
