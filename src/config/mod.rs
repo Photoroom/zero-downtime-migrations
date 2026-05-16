@@ -75,25 +75,60 @@ impl Config {
     /// Walk upward from `start` looking for the first directory that
     /// contains either `pyproject.toml` or
     /// `zero-downtime-migrations.toml`. Stop at any directory that
-    /// holds a `.git` entry (the repository root — a config above the
-    /// repo would belong to a parent project and is not ours to read)
-    /// or when the filesystem root is reached. Returns `None` if no
-    /// config file is found within those bounds.
+    /// holds a `.git` entry (the repository root — a config above
+    /// the repo would belong to a parent project and is not ours to
+    /// read).
+    ///
+    /// The walk only escapes `start` when a `.git` ancestor actually
+    /// exists somewhere above. Without that anchor — for example,
+    /// when zdm runs in an unpacked tarball under `/tmp/build/foo`
+    /// or a non-git CI workspace — the walk would otherwise climb
+    /// all the way to `/` and pick up a world-writable
+    /// `/tmp/zero-downtime-migrations.toml`. Restricting upward
+    /// movement to within a confirmed repo closes that escalation
+    /// path.
+    ///
+    /// Returns `None` if no config file is found within those
+    /// bounds.
     fn find_config_dir(start: &Path) -> Option<std::path::PathBuf> {
+        // Preflight: is there a `.git` ancestor at all? If not, only
+        // consider `start` itself.
+        let mut probe = start;
+        let mut have_git_anchor = probe.join(".git").exists();
+        while !have_git_anchor {
+            probe = match probe.parent() {
+                Some(p) => p,
+                None => break,
+            };
+            if probe.join(".git").exists() {
+                have_git_anchor = true;
+            }
+        }
+
+        if start.join("pyproject.toml").exists()
+            || start.join("zero-downtime-migrations.toml").exists()
+        {
+            return Some(start.to_path_buf());
+        }
+        if !have_git_anchor {
+            return None;
+        }
+
+        // Walk up looking for a config file, stopping at the
+        // `.git`-bearing directory. `.git` can be a directory
+        // (regular repo) or a file (worktree / submodule with a
+        // gitdir pointer); accept either form as the stop signal.
         let mut current = start;
         loop {
+            current = current.parent()?;
             if current.join("pyproject.toml").exists()
                 || current.join("zero-downtime-migrations.toml").exists()
             {
                 return Some(current.to_path_buf());
             }
-            // `.git` can be a directory (regular repo) or a file
-            // (worktree / submodule with a gitdir pointer); accept
-            // either form as the stop signal.
             if current.join(".git").exists() {
                 return None;
             }
-            current = current.parent()?;
         }
     }
 
@@ -470,10 +505,12 @@ exclude = ["**/test_migrations/**", "**/fixtures/**"]
     #[test]
     fn test_load_walks_up_to_find_config() {
         // Drop a config in the repo root, then invoke load from a
-        // deeply nested subdirectory. The walk-up should pick up the
-        // root config so developers don't have to cd to the project
-        // root.
+        // deeply nested subdirectory. The walk-up should pick up
+        // the root config so developers don't have to cd to the
+        // project root. The walk only escapes `start` when a
+        // `.git` ancestor exists, so plant a sentinel.
         let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join(".git")).unwrap();
         fs::write(
             temp.path().join("zero-downtime-migrations.toml"),
             r#"ignore = ["R001"]"#,
@@ -540,6 +577,7 @@ exclude = ["**/test_migrations/**", "**/fixtures/**"]
         // wins; multi-level merging would surprise users with
         // `[tool.zdm]` blocks scattered across nested pyprojects.
         let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join(".git")).unwrap();
         // Outer config: ignores R001.
         fs::write(
             temp.path().join("zero-downtime-migrations.toml"),
@@ -566,5 +604,47 @@ exclude = ["**/test_migrations/**", "**/fixtures/**"]
             !config.ignore.contains("R001"),
             "outer config should not bleed through when the inner config exists",
         );
+    }
+
+    #[test]
+    fn test_walk_does_not_escape_when_no_git_ancestor() {
+        // If there is no `.git` ancestor anywhere above `start`, the
+        // walk must NOT climb into parent directories — a config
+        // sitting in a shared temp dir, a CI workspace's parent, or
+        // even `/` could be world-writable and would otherwise be
+        // adopted as a legitimate project config.
+        let temp = TempDir::new().unwrap();
+        // No `.git` anywhere. A config that should NOT be loaded
+        // from a sibling/parent directory:
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"ignore = ["R007"]"#,
+        )
+        .unwrap();
+        let nested = temp.path().join("no_git_repo/sub");
+        fs::create_dir_all(&nested).unwrap();
+
+        let config = Config::load_from_directory(&nested).unwrap();
+        assert!(
+            !config.ignore.contains("R007"),
+            "parent-of-non-repo config should not be loaded",
+        );
+        assert!(config.select.is_empty());
+        assert!(config.ignore.is_empty());
+    }
+
+    #[test]
+    fn test_no_config_no_git_returns_defaults() {
+        // Both no config and no `.git` anywhere: the loop must
+        // terminate by returning `None` from `find_config_dir`
+        // rather than walking all the way to the filesystem root.
+        let temp = TempDir::new().unwrap();
+        let nested = temp.path().join("a/b/c/d");
+        fs::create_dir_all(&nested).unwrap();
+
+        let config = Config::load_from_directory(&nested).unwrap();
+        assert!(config.select.is_empty());
+        assert!(config.ignore.is_empty());
+        assert!(config.exclude.is_empty());
     }
 }

@@ -15,9 +15,16 @@ fn zdm() -> Command {
     cargo_bin_cmd!("zdm")
 }
 
-/// Helper to create a temp directory with migration files
+/// Helper to create a temp directory with migration files.
+///
+/// Plants an empty `.git` directory at the temp root so the config
+/// loader's walk-up doesn't escape into the actual project's
+/// pyproject.toml (which would silently change `[tool.zdm]` settings
+/// under the tests). The walk-up is guarded by a `.git` ancestor
+/// requirement, and the sentinel keeps it scoped to our temp root.
 fn setup_migrations(migrations: &[(&str, &str)]) -> TempDir {
     let temp_dir = TempDir::new().unwrap();
+    fs::create_dir_all(temp_dir.path().join(".git")).unwrap();
     let migrations_dir = temp_dir.path().join("app").join("migrations");
     fs::create_dir_all(&migrations_dir).unwrap();
 
