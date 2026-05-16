@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use git2::{DiffOptions, Repository, StatusOptions};
+use git2::{DiffOptions, Repository};
 
 use crate::discovery::is_migration_file;
 use crate::error::{Error, Result};
@@ -55,11 +55,6 @@ impl GitRepo {
         let repo = Repository::discover(path)
             .map_err(|e| Error::git_error_msg(format!("Failed to find git repository: {}", e)))?;
         Ok(Self { repo })
-    }
-
-    /// Check if a path is inside a git repository.
-    pub fn is_git_repo(path: &Path) -> bool {
-        Repository::discover(path).is_ok()
     }
 
     /// Get the repository root directory.
@@ -210,47 +205,6 @@ impl GitRepo {
             })
     }
 
-    /// Get all uncommitted changes (staged + unstaged).
-    pub fn uncommitted_changes(&self) -> Result<Vec<ChangedFile>> {
-        let mut opts = StatusOptions::new();
-        opts.include_untracked(false)
-            .include_ignored(false)
-            .include_unmodified(false);
-
-        let statuses = self
-            .repo
-            .statuses(Some(&mut opts))
-            .map_err(|e| Error::git_error_msg(format!("Failed to get status: {}", e)))?;
-
-        let mut files = Vec::new();
-        for entry in statuses.iter() {
-            let status = entry.status();
-            let path = entry.path().map(PathBuf::from);
-
-            if let Some(path) = path {
-                let file_status = if status.is_index_new() || status.is_wt_new() {
-                    FileStatus::Added
-                } else if status.is_index_deleted() || status.is_wt_deleted() {
-                    FileStatus::Deleted
-                } else if status.is_index_modified() || status.is_wt_modified() {
-                    FileStatus::Modified
-                } else if status.is_index_renamed() || status.is_wt_renamed() {
-                    FileStatus::Renamed
-                } else {
-                    continue;
-                };
-
-                files.push(ChangedFile {
-                    path,
-                    status: file_status,
-                    old_path: None,
-                });
-            }
-        }
-
-        Ok(files)
-    }
-
     /// Get paths of all changed migration files (absolute paths under
     /// the repo root).
     pub fn changed_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
@@ -290,24 +244,6 @@ impl GitRepo {
             .filter(|f| is_migration_file(&f.path) == want_migrations)
             .map(|f| root.join(&f.path))
             .collect())
-    }
-
-    /// Check if the repository is a shallow clone.
-    pub fn is_shallow(&self) -> bool {
-        self.repo.is_shallow()
-    }
-
-    /// Check if HEAD is detached.
-    pub fn is_head_detached(&self) -> bool {
-        self.repo.head_detached().unwrap_or(false)
-    }
-
-    /// Get the current branch name, if on a branch.
-    pub fn current_branch(&self) -> Option<String> {
-        self.repo
-            .head()
-            .ok()
-            .and_then(|r| r.shorthand().map(String::from))
     }
 }
 
@@ -401,20 +337,6 @@ mod tests {
             .current_dir(temp.path())
             .output()
             .unwrap();
-    }
-
-    #[test]
-    fn test_is_git_repo() {
-        let temp = TempDir::new().unwrap();
-        assert!(!GitRepo::is_git_repo(temp.path()));
-
-        Command::new("git")
-            .args(["init"])
-            .current_dir(temp.path())
-            .output()
-            .unwrap();
-
-        assert!(GitRepo::is_git_repo(temp.path()));
     }
 
     #[test]
@@ -591,45 +513,6 @@ mod tests {
     // in `src/discovery.rs` for the full case coverage.
 
     #[test]
-    fn test_current_branch() {
-        let (temp, repo) = create_test_repo();
-
-        // Create initial commit
-        fs::write(temp.path().join("file.txt"), "content").unwrap();
-        commit(&temp, "Initial");
-
-        // Should be on master or main
-        let branch = repo.current_branch();
-        assert!(branch.is_some());
-        let branch_name = branch.unwrap();
-        assert!(branch_name == "master" || branch_name == "main");
-    }
-
-    #[test]
-    fn test_uncommitted_changes() {
-        let (temp, repo) = create_test_repo();
-
-        // Create initial commit
-        fs::write(temp.path().join("file.txt"), "v1").unwrap();
-        commit(&temp, "Initial");
-
-        // Make uncommitted changes
-        fs::write(temp.path().join("file.txt"), "v2").unwrap();
-        fs::write(temp.path().join("new_file.py"), "new").unwrap();
-
-        // Stage the new file
-        Command::new("git")
-            .args(["add", "new_file.py"])
-            .current_dir(temp.path())
-            .output()
-            .unwrap();
-
-        let changes = repo.uncommitted_changes().unwrap();
-        assert!(!changes.is_empty());
-        // Should see the modified file and/or the new staged file
-    }
-
-    #[test]
     fn test_changed_staged_files_uses_index_not_head() {
         let (temp, repo) = create_test_repo();
 
@@ -751,36 +634,30 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_against_branch() {
+    fn test_diff_against_named_branch() {
+        // Diffing against a named branch (rather than HEAD~N) exercises
+        // the revparse_single → tree_at path for a real branch reference.
         let (temp, repo) = create_test_repo();
+        let root = repo.root().unwrap();
 
-        // Create initial commit on main
-        fs::write(temp.path().join("file.txt"), "initial").unwrap();
+        fs::write(root.join("file.txt"), "initial").unwrap();
         commit(&temp, "Initial");
 
-        // Create feature branch
         Command::new("git")
             .args(["checkout", "-b", "feature"])
-            .current_dir(temp.path())
+            .current_dir(&root)
             .output()
             .unwrap();
-
-        // Add file on feature branch
-        fs::write(temp.path().join("feature.py"), "feature code").unwrap();
+        fs::write(root.join("feature.py"), "feature code").unwrap();
         commit(&temp, "Feature commit");
 
-        // Diff against main/master
-        let branch = repo.current_branch().unwrap();
-        let base = if branch == "feature" {
-            // Need to figure out base branch
-            let result = repo.changed_files("HEAD~1");
-            assert!(result.is_ok());
-            result.unwrap()
-        } else {
-            vec![]
-        };
-
-        assert!(!base.is_empty() || branch != "feature");
+        // master/main exists from the initial commit; diff against it.
+        let base = ["master", "main"]
+            .iter()
+            .find_map(|name| repo.changed_files(name).ok())
+            .expect("expected master or main to exist as the initial branch");
+        assert_eq!(base.len(), 1);
+        assert_eq!(base[0].path, PathBuf::from("feature.py"));
     }
 
     #[test]

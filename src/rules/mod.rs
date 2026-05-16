@@ -72,11 +72,6 @@ pub trait Rule: Send + Sync {
 
     /// Run the rule on a migration file.
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic>;
-
-    /// Whether this rule is enabled by default.
-    fn enabled_by_default(&self) -> bool {
-        true
-    }
 }
 
 /// A changeset rule that analyzes sets of changed files together.

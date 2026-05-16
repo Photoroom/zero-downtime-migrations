@@ -10,17 +10,6 @@ use walkdir::WalkDir;
 
 use crate::error::{Error, Result};
 
-/// Discovers Django migration files in the given paths.
-///
-/// For each path:
-/// - If it's a file, include it directly (if it matches migration pattern)
-/// - If it's a directory, recursively find all `**/migrations/*.py` files
-///
-/// Files are returned sorted for deterministic output.
-pub fn discover_migrations(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    discover_migrations_with_exclude(paths, &[])
-}
-
 /// Discovers Django migration files in the given paths, excluding those matching patterns.
 ///
 /// Exclude patterns use glob syntax (e.g., "**/test_migrations/**", "**/fixtures/**").
@@ -187,7 +176,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = create_test_structure(&temp);
 
-        let migrations = discover_migrations(std::slice::from_ref(&root)).unwrap();
+        let migrations =
+            discover_migrations_with_exclude(std::slice::from_ref(&root), &[]).unwrap();
 
         // Should find 4 migrations (excluding __init__.py files)
         assert_eq!(migrations.len(), 4);
@@ -208,7 +198,8 @@ mod tests {
         let root = create_test_structure(&temp);
 
         let file_path = root.join("app1/migrations/0001_initial.py");
-        let migrations = discover_migrations(std::slice::from_ref(&file_path)).unwrap();
+        let migrations =
+            discover_migrations_with_exclude(std::slice::from_ref(&file_path), &[]).unwrap();
 
         assert_eq!(migrations.len(), 1);
         assert_eq!(migrations[0], file_path);
@@ -221,7 +212,7 @@ mod tests {
 
         let paths = vec![root.join("app1/migrations"), root.join("app2/migrations")];
 
-        let migrations = discover_migrations(&paths).unwrap();
+        let migrations = discover_migrations_with_exclude(&paths, &[]).unwrap();
 
         assert_eq!(migrations.len(), 3); // 2 from app1 + 1 from app2
     }
@@ -233,7 +224,7 @@ mod tests {
 
         // Pass same directory twice
         let paths = vec![root.clone(), root.clone()];
-        let migrations = discover_migrations(&paths).unwrap();
+        let migrations = discover_migrations_with_exclude(&paths, &[]).unwrap();
 
         // Should still only have 4 unique migrations
         assert_eq!(migrations.len(), 4);
@@ -241,7 +232,8 @@ mod tests {
 
     #[test]
     fn test_discover_invalid_path_error() {
-        let result = discover_migrations(&[PathBuf::from("/nonexistent/path/12345")]);
+        let result =
+            discover_migrations_with_exclude(&[PathBuf::from("/nonexistent/path/12345")], &[]);
         assert!(result.is_err());
 
         match result.unwrap_err() {
@@ -255,7 +247,8 @@ mod tests {
     #[test]
     fn test_discover_empty_directory() {
         let temp = TempDir::new().unwrap();
-        let migrations = discover_migrations(&[temp.path().to_path_buf()]).unwrap();
+        let migrations =
+            discover_migrations_with_exclude(&[temp.path().to_path_buf()], &[]).unwrap();
         assert!(migrations.is_empty());
     }
 
