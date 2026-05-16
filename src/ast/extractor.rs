@@ -415,7 +415,6 @@ impl<'a> MigrationExtractor<'a> {
             .map(|node| {
                 let (module, names) = self.extract_import_parts(node);
                 Import {
-                    text: self.node_text(node).to_string(),
                     module,
                     names,
                     span: Span::from_node(&node),

@@ -69,11 +69,9 @@ impl Migration {
 /// An import statement in the migration file.
 #[derive(Debug, Clone)]
 pub struct Import {
-    /// The full import text (kept for diagnostics and for matchers we
-    /// haven't structurally parsed yet).
-    pub text: String,
     /// For `from X import ...`, the module path `X`. `None` for plain
-    /// `import X` statements (those go through `text` for now).
+    /// `import X` statements (the matcher `is_direct_model_import`
+    /// short-circuits on `None`).
     pub module: Option<String>,
     /// For `from X import a, b, c`, the imported names. Aliases are
     /// recorded under the original name (`from X import a as b` → `"a"`).
@@ -83,11 +81,6 @@ pub struct Import {
 }
 
 impl Import {
-    /// Check if this is a concurrent index operation import.
-    pub fn is_concurrent_index_import(&self) -> bool {
-        self.text.contains("AddIndexConcurrently") || self.text.contains("RemoveIndexConcurrently")
-    }
-
     /// Check whether this import looks like it brings a Django *model class*
     /// into scope (the thing R014 wants to flag). Imports from
     /// `django.db.models` or `django.contrib.*` are skipped because those

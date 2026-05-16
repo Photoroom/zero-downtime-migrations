@@ -25,32 +25,3 @@ pub struct Diagnostic {
     /// Optional help text with suggestions for fixing.
     pub help: Option<String>,
 }
-
-impl Diagnostic {
-    /// Create a new diagnostic with no help text. Chain `.with_help(...)`
-    /// to attach a suggestion.
-    pub fn new(
-        rule_id: &'static str,
-        rule_name: &'static str,
-        severity: Severity,
-        message: impl Into<String>,
-        path: impl Into<PathBuf>,
-        span: Span,
-    ) -> Self {
-        Self {
-            rule_id,
-            rule_name,
-            severity,
-            message: message.into(),
-            path: path.into(),
-            span,
-            help: None,
-        }
-    }
-
-    /// Attach help text to this diagnostic.
-    pub fn with_help(mut self, help: impl Into<String>) -> Self {
-        self.help = Some(help.into());
-        self
-    }
-}
