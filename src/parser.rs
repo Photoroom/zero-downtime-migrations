@@ -509,4 +509,92 @@ class Migration:
             other => panic!("expected FileTooLarge, got {other:?}"),
         }
     }
+
+    // Module-boundary edge cases for `find_migration_class`. Each test
+    // pins the chosen behaviour so a refactor of the AST walk can't
+    // silently change which class (if any) the rule engine ends up
+    // analysing. Without these pins, a "look at the second class" or
+    // "recurse into nested classes" change would slip through every
+    // existing rule test (which assumes a well-formed single-Migration
+    // file).
+
+    #[test]
+    fn test_find_migration_class_returns_none_for_empty_source() {
+        let parsed = ParsedMigration::parse("").unwrap();
+        assert!(parsed.find_migration_class().is_none());
+    }
+
+    #[test]
+    fn test_find_migration_class_returns_none_for_comments_only() {
+        let parsed = ParsedMigration::parse("# just a comment\n# and another\n").unwrap();
+        assert!(parsed.find_migration_class().is_none());
+    }
+
+    #[test]
+    fn test_find_migration_class_returns_none_when_no_migration_class() {
+        // Other top-level classes exist but none named `Migration`.
+        let source = r#"
+from django.db import migrations
+
+
+class NotAMigration:
+    operations = []
+
+
+class HelperClass:
+    pass
+"#;
+        let parsed = ParsedMigration::parse(source).unwrap();
+        assert!(parsed.find_migration_class().is_none());
+    }
+
+    #[test]
+    fn test_find_migration_class_returns_first_when_multiple() {
+        // Pathological but legal Python: two top-level `class Migration`
+        // definitions. The second shadows the first at runtime, but
+        // Django itself doesn't allow this — `makemigrations` writes
+        // exactly one. Pin that the parser returns the FIRST so a
+        // refactor that switches to "last" surfaces the change.
+        let source = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+    operations = ['FIRST']
+
+
+class Migration(migrations.Migration):  # noqa: F811
+    operations = ['SECOND']
+"#;
+        let parsed = ParsedMigration::parse(source).unwrap();
+        let class_node = parsed.find_migration_class().expect("class found");
+        let class_text = &source[class_node.byte_range()];
+        assert!(
+            class_text.contains("'FIRST'"),
+            "find_migration_class should return the first definition, got:\n{class_text}",
+        );
+    }
+
+    #[test]
+    fn test_find_migration_class_ignores_nested_migration_class() {
+        // A `class Migration:` nested inside another class is not the
+        // Django Migration — `find_migration_class` only walks
+        // top-level children of the module root.
+        let source = r#"
+class Container:
+    class Migration:
+        operations = []
+"#;
+        let parsed = ParsedMigration::parse(source).unwrap();
+        assert!(parsed.find_migration_class().is_none());
+    }
+
+    #[test]
+    fn test_find_migration_class_skips_shebang() {
+        // A leading shebang line (rare but legal in Python source)
+        // should not prevent the parser from finding the class.
+        let source = "#!/usr/bin/env python\n\nclass Migration:\n    operations = []\n";
+        let parsed = ParsedMigration::parse(source).unwrap();
+        assert!(parsed.find_migration_class().is_some());
+    }
 }

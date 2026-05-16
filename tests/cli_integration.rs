@@ -988,16 +988,28 @@ mod list_rules {
 
     #[test]
     fn list_rules_includes_every_documented_rule() {
-        // Enumerate every rule ID the binary currently ships and
-        // assert each appears in the listing. Without this, a
-        // future contributor could add a rule and silently forget
-        // to wire it into whichever registry `--list-rules` walks
-        // (there are two: regular and changeset), and the broader
-        // spot-check above would still pass.
-        let expected_ids = [
-            "R001", "R002", "R003", "R004", "R005", "R006", "R008", "R009", "R010", "R011", "R012",
-            "R013", "R014", "R015", "R016", "R017",
-        ];
+        // Drive the expected list from the actual registries (which
+        // is what the binary walks) so the test can't desync from
+        // the source of truth. The previous hardcoded array would
+        // have silently passed if a contributor added a rule to the
+        // registry but forgot to add it to the test list — and
+        // would have silently failed if a rule was retired from the
+        // registry but left in the array.
+        use zero_downtime_migrations::rules::{ChangesetRuleRegistry, RuleRegistry};
+
+        let mut expected_ids: Vec<&'static str> = RuleRegistry::new()
+            .rules()
+            .iter()
+            .map(|r| r.id())
+            .chain(ChangesetRuleRegistry::new().rules().iter().map(|r| r.id()))
+            .collect();
+        expected_ids.sort();
+        expected_ids.dedup();
+        assert!(
+            !expected_ids.is_empty(),
+            "registry returned zero rules — listing test is now self-confirming",
+        );
+
         let output = zdm().arg("--list-rules").output().expect("zdm should run");
         assert!(
             output.status.success(),
@@ -1005,11 +1017,32 @@ mod list_rules {
             output.status,
         );
         let stdout = String::from_utf8(output.stdout).expect("--list-rules output is UTF-8");
-        for id in expected_ids {
+        for id in &expected_ids {
             assert!(
                 stdout.contains(id),
                 "--list-rules output is missing rule {id}; got:\n{stdout}",
             );
         }
+
+        // Counter-assertion: the printed rule count should match
+        // the expected total exactly. Catches the "extras" case
+        // where stdout contains all expected IDs PLUS a stale one
+        // (e.g. a retired R007 line still printed alongside live
+        // rules).
+        let printed_count = stdout
+            .lines()
+            .filter(|l| {
+                let trimmed = l.trim_start();
+                trimmed.starts_with('R')
+                    && trimmed.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+            })
+            .count();
+        assert_eq!(
+            printed_count,
+            expected_ids.len(),
+            "--list-rules printed {printed_count} rule lines, expected {} (one per registered rule). \
+             Got:\n{stdout}",
+            expected_ids.len(),
+        );
     }
 }

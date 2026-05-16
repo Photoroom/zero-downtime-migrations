@@ -1936,4 +1936,20 @@ class Migration(migrations.Migration):
             ],
         );
     }
+
+    #[test]
+    fn test_extract_without_migration_class_returns_empty_migration() {
+        // A Python file that has no `class Migration` (or has only a
+        // nested one) must not error — `extract` returns a Migration
+        // with empty operations. The rule engine then has nothing to
+        // flag, which is the correct outcome for a non-migration
+        // file accidentally caught by the discovery walk.
+        let source = "# not a migration\nx = 1\n";
+        let parsed = ParsedMigration::parse(source).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("not_a_migration.py")).unwrap();
+        assert!(migration.operations.is_empty());
+        assert!(migration.created_models.is_empty());
+        assert!(migration.class_span.is_none());
+    }
 }

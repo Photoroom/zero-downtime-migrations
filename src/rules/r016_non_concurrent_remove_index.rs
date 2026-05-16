@@ -32,9 +32,9 @@ impl Rule for R016NonConcurrentRemoveIndex {
     }
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
-        // Walk in source order so the fresh-model exemption only
-        // honours CreateModel ops that ran *before* the RemoveIndex —
-        // an order-blind `is_model_created` lookup would exempt a
+        // Top-level walk in source order so the fresh-model exemption
+        // only honours CreateModel ops that ran *before* the RemoveIndex
+        // — an order-blind `is_model_created` lookup would exempt a
         // RemoveIndex placed above its CreateModel, which is a real
         // false-negative even if Django would later refuse to run it.
         // Same pattern as R002.
@@ -55,30 +55,50 @@ impl Rule for R016NonConcurrentRemoveIndex {
                             continue;
                         }
                     }
-
-                    diagnostics.push(Diagnostic {
-                        rule_id: self.id(),
-                        rule_name: self.name(),
-                        message:
-                            "Use RemoveIndexConcurrently instead of RemoveIndex to avoid table locks"
-                                .to_string(),
-                        severity: self.severity(),
-                        path: ctx.path.to_path_buf(),
-                        span: op.span,
-                        help: Some(
-                            "Replace migrations.RemoveIndex with RemoveIndexConcurrently from \
-                             django.contrib.postgres.operations. The concurrent form takes \
-                             SHARE UPDATE EXCLUSIVE instead of ACCESS EXCLUSIVE and must run \
-                             outside a transaction (`atomic = False`)."
-                                .to_string(),
-                        ),
-                    });
+                    diagnostics.push(self.diagnose(op, ctx));
                 }
                 _ => {}
             }
         }
 
+        // RemoveIndex wrapped inside `SeparateDatabaseAndState(
+        // database_operations=[...])`. Django runs the wrapped op
+        // against the live schema, so the same ACCESS EXCLUSIVE lock
+        // applies — wrapping doesn't make a non-concurrent
+        // RemoveIndex any safer. The CreateModel exemption isn't
+        // applied here: the table the wrapped op targets is, by
+        // definition, already live (otherwise the wrapping wouldn't
+        // be necessary). Matches R001's wrapped-ops policy.
+        for op in migration
+            .wrapped_database_ops
+            .iter()
+            .filter(|op| op.op_type == OperationType::RemoveIndex)
+        {
+            diagnostics.push(self.diagnose(op, ctx));
+        }
+
         diagnostics
+    }
+}
+
+impl R016NonConcurrentRemoveIndex {
+    fn diagnose(&self, op: &crate::ast::Operation, ctx: &RuleContext) -> Diagnostic {
+        Diagnostic {
+            rule_id: self.id(),
+            rule_name: self.name(),
+            message: "Use RemoveIndexConcurrently instead of RemoveIndex to avoid table locks"
+                .to_string(),
+            severity: self.severity(),
+            path: ctx.path.to_path_buf(),
+            span: op.span,
+            help: Some(
+                "Replace migrations.RemoveIndex with RemoveIndexConcurrently from \
+                 django.contrib.postgres.operations. The concurrent form takes \
+                 SHARE UPDATE EXCLUSIVE instead of ACCESS EXCLUSIVE and must run \
+                 outside a transaction (`atomic = False`)."
+                    .to_string(),
+            ),
+        }
     }
 }
 
@@ -227,6 +247,35 @@ class Migration(migrations.Migration):
         // An order-blind `is_model_created` lookup would silently
         // exempt this; the source-order walk correctly flags it.
         let diagnostics = check_migration(REMOVE_INDEX_BEFORE_CREATEMODEL_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R016");
+    }
+
+    const REMOVE_INDEX_INSIDE_SDAS_DATABASE_OPS_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.RemoveIndex(
+                    model_name='product',
+                    name='product_name_idx',
+                ),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_remove_index_inside_sdas_database_ops_is_flagged() {
+        // `SeparateDatabaseAndState(database_operations=[RemoveIndex(...)])`
+        // still runs a non-concurrent DROP INDEX against the live
+        // schema. Mirror of R001's wrapped-ops consumer — wrapping
+        // doesn't defang the lock.
+        let diagnostics = check_migration(REMOVE_INDEX_INSIDE_SDAS_DATABASE_OPS_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R016");
     }
