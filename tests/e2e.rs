@@ -193,11 +193,16 @@ fn e2e_r014_fail_model_import() {
 
 #[test]
 fn e2e_oversized_file_is_rejected_with_parse_error_exit_code() {
-    // The parser caps inputs at 10 MiB to bound memory. A file just
-    // over the cap should be rejected before tree-sitter sees it; the
-    // CLI surfaces the rejection as a parse error and exits 2.
+    // The parser caps inputs at `MAX_FILE_SIZE` to bound memory. A
+    // file just over the cap should be rejected before tree-sitter
+    // sees it; the CLI surfaces the rejection as a parse error and
+    // exits 2. Derive the fixture size from the constant so a
+    // future cap change doesn't silently desync the test (we'd
+    // ship a fixture below the new cap and stop exercising the
+    // rejection path).
     use std::fs::File;
     use std::io::Write;
+    use zero_downtime_migrations::parser::MAX_FILE_SIZE;
 
     let temp = tempfile::TempDir::new().unwrap();
     let migrations_dir = temp.path().join("app").join("migrations");
@@ -206,14 +211,19 @@ fn e2e_oversized_file_is_rejected_with_parse_error_exit_code() {
 
     let huge_path = migrations_dir.join("0001_huge.py");
     let mut file = File::create(&huge_path).unwrap();
-    // Write 10 MiB + 1 byte of a benign repeated pattern; the cap
-    // (`MAX_FILE_SIZE = 10 MiB`) trips on byte length, not on parse
-    // content.
-    let chunk = vec![b'#'; 1024];
-    for _ in 0..(10 * 1024) {
+    // Exactly `MAX_FILE_SIZE + 1` bytes — the smallest input that
+    // trips the cap.
+    let chunk = vec![b'#'; 4096];
+    let target = MAX_FILE_SIZE + 1;
+    let mut written = 0u64;
+    while written + chunk.len() as u64 <= target {
         file.write_all(&chunk).unwrap();
+        written += chunk.len() as u64;
     }
-    file.write_all(b"\n").unwrap();
+    let remainder = (target - written) as usize;
+    if remainder > 0 {
+        file.write_all(&chunk[..remainder]).unwrap();
+    }
     drop(file);
 
     zdm()

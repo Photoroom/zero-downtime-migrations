@@ -336,6 +336,41 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_skips_symlinked_files_inside_excluded_path() {
+        // Round-trip the symlink rejection with an exclude pattern
+        // also in play: even if a future refactor reordered the
+        // file_type check and the exclude check, the symlink should
+        // never be ingested. Without this pin, swapping the two
+        // checks would only break the unguarded variant above.
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        let target_dir = root.join("real");
+        fs::create_dir_all(&target_dir).unwrap();
+        let target_file = target_dir.join("hidden.py");
+        fs::write(&target_file, "# target").unwrap();
+
+        // Symlink lives in a `test_migrations/migrations` dir that
+        // the exclude pattern catches; the symlink-rejection must
+        // hold regardless of exclude interaction.
+        let migrations_dir = root.join("test_migrations/migrations");
+        fs::create_dir_all(&migrations_dir).unwrap();
+        let link_path = migrations_dir.join("0001_symlinked.py");
+        symlink(&target_file, &link_path).unwrap();
+
+        let exclude = vec!["**/test_migrations/**".to_string()];
+        let migrations = discover_migrations_with_exclude(&[root.to_path_buf()], &exclude).unwrap();
+
+        assert!(
+            migrations.is_empty(),
+            "symlink should be rejected even when an exclude pattern also matches, got: {migrations:?}",
+        );
+    }
+
     #[test]
     fn test_discover_with_specific_file_exclude() {
         let temp = TempDir::new().unwrap();

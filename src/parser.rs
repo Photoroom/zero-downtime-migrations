@@ -449,12 +449,14 @@ class Migration:
         // of valid code, then the `class Migration(... )` line that
         // is missing its colon (line 4 of the literal string, which
         // means the error node starts somewhere on or after line 4).
-        // We don't pin the exact line because tree-sitter recovery
-        // can choose between several reasonable error points; assert
-        // the line is at least non-zero and within the fixture.
+        // Tree-sitter's error recovery can choose slightly different
+        // anchors (one line earlier when the missing token follows a
+        // continuation), so we accept lines 3 onward but reject a
+        // defaulted `line: 1`/`line: 2` — those would indicate the
+        // location wasn't extracted from the error node at all.
         assert!(
-            (1..=INVALID_PYTHON.lines().count() + 1).contains(&line),
-            "error line {line} should fall within the fixture",
+            (3..=INVALID_PYTHON.lines().count() + 1).contains(&line),
+            "error line {line} should fall on or after the broken class header",
         );
     }
 

@@ -447,6 +447,9 @@ class Migration(migrations.Migration):
         let diag = diagnostics[0]
             .as_object()
             .expect("each diagnostic must be a JSON object");
+        // The full documented per-diagnostic shape: a rename or
+        // accidental drop of any of these would otherwise slip
+        // through the substring grep that preceded this commit.
         for field in [
             "rule_id",
             "rule_name",
@@ -454,6 +457,8 @@ class Migration(migrations.Migration):
             "path",
             "severity",
             "line",
+            "column",
+            "help",
         ] {
             assert!(
                 diag.contains_key(field),
@@ -477,6 +482,10 @@ class Migration(migrations.Migration):
             .expect("top-level JSON must include a `summary` object");
         assert_eq!(summary["total"].as_u64(), Some(diagnostics.len() as u64));
         assert!(summary["errors"].as_u64().unwrap() >= 1);
+        assert!(
+            summary.contains_key("warnings"),
+            "summary must carry a `warnings` count even when zero"
+        );
     }
 
     #[test]
