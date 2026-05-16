@@ -108,10 +108,25 @@ impl GitRepo {
         collect_changed_files(&diff)
     }
 
-    /// Resolve a reference to the tree at that commit.
+    /// Resolve a reference to the tree at that commit. If the ref does
+    /// not exist (the common `--diff origin/main` case after a shallow
+    /// clone or fork checkout), returns `Error::InvalidGitReference` so
+    /// the CLI can surface a targeted message; other libgit2 failures
+    /// fall through as generic `GitError`s.
     fn tree_at(&self, base_ref: &str) -> Result<git2::Tree<'_>> {
         let base_obj = self.repo.revparse_single(base_ref).map_err(|e| {
-            Error::git_error_msg(format!("Failed to resolve reference '{}': {}", base_ref, e))
+            // libgit2's NotFound also fires for things like `HEAD~999`
+            // (commit out of range) or revspecs whose intermediate
+            // objects are missing. Surfacing all of those as "invalid
+            // git reference" is still the right user-facing framing —
+            // the user supplied something that didn't resolve.
+            if e.code() == git2::ErrorCode::NotFound {
+                Error::InvalidGitReference {
+                    reference: base_ref.to_string(),
+                }
+            } else {
+                Error::git_error_msg(format!("Failed to resolve reference '{}': {}", base_ref, e))
+            }
         })?;
         let base_commit = base_obj.peel_to_commit().map_err(|e| {
             Error::git_error_msg(format!(
@@ -556,15 +571,19 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_ref() {
+    fn test_invalid_ref_returns_targeted_error() {
         let (temp, repo) = create_test_repo();
 
-        // Create initial commit
         fs::write(temp.path().join("file.txt"), "content").unwrap();
         commit(&temp, "Initial");
 
         let result = repo.changed_files("nonexistent_branch");
-        assert!(result.is_err());
+        match result {
+            Err(Error::InvalidGitReference { reference }) => {
+                assert_eq!(reference, "nonexistent_branch");
+            }
+            other => panic!("expected InvalidGitReference, got {other:?}"),
+        }
     }
 
     // Migration-path matching now delegates to

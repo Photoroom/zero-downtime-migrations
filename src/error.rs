@@ -81,13 +81,17 @@ pub enum Error {
         source: Option<git2::Error>,
     },
 
-    /// Invalid git reference. Currently has no producer; reserved for the
-    /// upcoming refinement that distinguishes "ref does not exist" from
-    /// generic git failures in `GitRepo::tree_at`.
+    /// The supplied `--diff` reference does not exist (libgit2's NotFound).
+    /// Distinguished from generic git failures so the CLI can suggest a
+    /// likely fix (e.g. fetching `origin/main` after a shallow clone).
     #[error("Invalid git reference: {reference}")]
     #[diagnostic(
         code(zdm::git::invalid_ref),
-        help("Specify a valid branch, tag, or commit SHA")
+        help(
+            "Specify a valid branch, tag, or commit SHA. \
+             For `origin/*` refs, you may need `git fetch origin` first — \
+             shallow clones and fresh checkouts omit remote-tracking refs."
+        )
     )]
     InvalidGitReference { reference: String },
 
