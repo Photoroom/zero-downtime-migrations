@@ -57,13 +57,22 @@ fn discover_in_directory(
     migrations: &mut Vec<PathBuf>,
     exclude_patterns: &[Pattern],
 ) -> Result<()> {
-    // Don't follow symlinks to avoid symlink attacks and infinite loops
+    // `follow_links(false)` stops WalkDir from traversing symlinks
+    // during the walk, but each yielded entry's `path` could itself
+    // be a symlink. `path.is_file()` then follows the link, so a
+    // hostile `0001.py -> /etc/passwd` symlink dropped inside a
+    // migrations directory would otherwise get read. `entry.file_type()`
+    // comes from a `symlink_metadata` call and reports the symlink as
+    // a symlink, not its target — so a real file check rejects it.
     for entry in WalkDir::new(dir).follow_links(false) {
         let entry = entry.map_err(|e| Error::directory_walk(dir, e))?;
 
         let path = entry.path();
 
-        if path.is_file() && is_migration_file(path) && !is_excluded(path, exclude_patterns) {
+        if entry.file_type().is_file()
+            && is_migration_file(path)
+            && !is_excluded(path, exclude_patterns)
+        {
             migrations.push(path.to_path_buf());
         }
     }
@@ -269,6 +278,42 @@ mod tests {
         for m in &migrations {
             assert!(!m.to_string_lossy().contains("app1"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_skips_symlinked_files() {
+        // A symlink dropped inside a migrations directory must not be
+        // followed during discovery, even when it ends in `.py` — a
+        // hostile `0001.py -> /etc/passwd` would otherwise have its
+        // target ingested. The protection comes from
+        // `entry.file_type().is_file()` (via `symlink_metadata`)
+        // returning false for symlinks, rather than `path.is_file()`
+        // which transparently follows them.
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create a real migration file as the symlink target.
+        let target_dir = root.join("real");
+        fs::create_dir_all(&target_dir).unwrap();
+        let target_file = target_dir.join("hidden.py");
+        fs::write(&target_file, "# target").unwrap();
+
+        // Create a migrations dir containing only a symlink pointing
+        // at the file above.
+        let migrations_dir = root.join("app/migrations");
+        fs::create_dir_all(&migrations_dir).unwrap();
+        let link_path = migrations_dir.join("0001_symlinked.py");
+        symlink(&target_file, &link_path).unwrap();
+
+        let migrations = discover_migrations_with_exclude(&[root.to_path_buf()], &[]).unwrap();
+
+        assert!(
+            migrations.is_empty(),
+            "symlinked migration entry should have been skipped, got: {migrations:?}",
+        );
     }
 
     #[test]
