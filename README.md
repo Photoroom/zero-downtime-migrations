@@ -75,17 +75,17 @@ zdm --warnings-as-errors .
 | R004 | missing-atomic-false | Error | Non-atomic migrations require `atomic = False` |
 | R005 | remove-field-without-separate | Error | Use `SeparateDatabaseAndState` to remove fields safely |
 | R006 | add-field-foreign-key | Warning | Adding FK creates index and validates constraint |
-| R007 | fk-without-concurrent-index | Warning | Foreign keys should have a concurrent index |
-| R008 | disallowed-file-changes | Warning | Don't change app code alongside migrations |
-| R009 | separate-db-state-same-pr | Warning | Don't deploy both steps of `SeparateDatabaseAndState` together |
+| R007 | fk-without-concurrent-index | Error | Foreign keys should have a concurrent index |
+| R008 | disallowed-file-changes | Error | Don't change app code alongside migrations |
+| R009 | separate-db-state-same-pr | Error | Don't deploy both steps of `SeparateDatabaseAndState` together |
 | R010 | add-field-not-null | Error | Adding NOT NULL field without default rewrites table |
-| R011 | rename-field | Warning | Renaming fields can break running code |
+| R011 | rename-field | Error | Renaming fields can break running code |
 | R012 | irreversible-run-python | Warning | `RunPython` should have a reverse function |
 | R013 | irreversible-run-sql | Warning | `RunSQL` should have a reverse SQL |
 | R014 | model-imports | Error | Don't import models in `RunPython` |
 | R015 | alter-field-not-null | Error | Changing field to NOT NULL validates all rows |
 | R016 | non-concurrent-remove-index | Error | Use `RemoveIndexConcurrently` instead of `RemoveIndex` |
-| R017 | non-concurrent-add-constraint | Warning | Adding CHECK/FK constraints validates all rows |
+| R017 | non-concurrent-add-constraint | Error | Adding CHECK/FK constraints validates all rows |
 
 ### CreateModel Exemption
 
