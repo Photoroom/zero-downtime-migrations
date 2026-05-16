@@ -205,6 +205,11 @@ fn e2e_oversized_file_is_rejected_with_parse_error_exit_code() {
     use zero_downtime_migrations::parser::MAX_FILE_SIZE;
 
     let temp = tempfile::TempDir::new().unwrap();
+    // Plant `.git` so the config walk-up stays scoped to the temp
+    // dir. The current test only exercises parser-level rejection,
+    // but the boundary pin keeps it robust to future code paths
+    // that load config during single-file invocations.
+    std::fs::create_dir_all(temp.path().join(".git")).unwrap();
     let migrations_dir = temp.path().join("app").join("migrations");
     std::fs::create_dir_all(&migrations_dir).unwrap();
     std::fs::write(migrations_dir.join("__init__.py"), "").unwrap();
@@ -422,10 +427,16 @@ class Migration(migrations.Migration):
 "#;
     let hostile_path = migrations_dir.join("0001_hostile\n  --> /etc/passwd:1\nfake.py");
     let write_result = fs::write(&hostile_path, trigger);
-    if write_result.is_err() {
-        // Some filesystems (notably ZFS with utf8only=on) reject
-        // control characters in filenames. The test is meaningful
-        // only when the OS lets us create the hostile filename.
+    if let Err(e) = write_result {
+        // Some filesystems (notably ZFS with utf8only=on, and
+        // a handful of sandboxed CI runners) reject control
+        // characters in filenames. The test is meaningful only
+        // when the OS lets us create the hostile filename — emit
+        // a marker so CI logs distinguish "skipped" from "passed".
+        // Without this, a regression that breaks the sanitizer
+        // would go unnoticed if every CI runner happened to land
+        // on a hostile-rejecting filesystem.
+        eprintln!("e2e_hostile_filename: filesystem rejected hostile filename ({e}), skipping",);
         return;
     }
 

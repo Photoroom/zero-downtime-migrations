@@ -1892,7 +1892,7 @@ class Migration(migrations.Migration):
         migrations.AddIndex(
             model_name='product',
             index=models.Index(
-                fields=[f"prefix_{var}_suffix", "split" "joined"],
+                fields=[f"prefix_{var}_suffix", "split" "joined", f"static_no_interp"],
                 name='odd_idx',
             ),
         ),
@@ -1928,6 +1928,11 @@ class Migration(migrations.Migration):
                 "".to_string(),
                 // adjacent literals → joined
                 "splitjoined".to_string(),
+                // f-string with NO interpolation → bare content
+                // (equivalent to the non-f-string spelling). Pinning
+                // this guards against an over-broad "any f-string is
+                // empty" rewrite of the extractor.
+                "static_no_interp".to_string(),
             ],
         );
     }

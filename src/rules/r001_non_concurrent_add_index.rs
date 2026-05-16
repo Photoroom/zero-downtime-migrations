@@ -251,4 +251,39 @@ class Migration(migrations.Migration):
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R001");
     }
+
+    const CREATEMODEL_BEFORE_ADDINDEX_GOOD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.CreateModel(
+            name='Product',
+            fields=[
+                ('id', models.AutoField(primary_key=True)),
+                ('name', models.CharField(max_length=255)),
+            ],
+        ),
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(fields=['name'], name='product_name_idx'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_createmodel_before_addindex_is_exempted() {
+        // The "exempt-something" pair for the order-aware fix
+        // above. An `exempt nothing` regression in `created_so_far`
+        // would otherwise only trip `test_add_index_bad` (which has
+        // no CreateModel at all); this pair makes the exemption
+        // path explicit and symmetric with the no-exempt pair.
+        let diagnostics = check_migration(CREATEMODEL_BEFORE_ADDINDEX_GOOD);
+        assert!(
+            diagnostics.is_empty(),
+            "AddIndex on a model created earlier in the same migration should not fire R001, got: {diagnostics:?}",
+        );
+    }
 }
