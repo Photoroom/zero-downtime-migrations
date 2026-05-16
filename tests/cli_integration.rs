@@ -127,9 +127,21 @@ class Migration(migrations.Migration):
 
     #[test]
     fn exit_0_when_only_warnings() {
+        // Exit-0 alone is self-confirming: if every rule silently
+        // stopped emitting diagnostics (so `WARNING_ONLY_MIGRATION`
+        // produced nothing), the test would still pass and we'd
+        // never notice. Pin two facts: the binary exits 0, AND R012
+        // (the irreversible-RunPython warning targeted by the
+        // fixture) actually surfaces in stdout.
         let temp = setup_migrations(&[("0001_warning.py", WARNING_ONLY_MIGRATION)]);
 
-        zdm().arg(temp.path()).assert().success().code(0);
+        zdm()
+            .arg(temp.path())
+            .assert()
+            .success()
+            .code(0)
+            .stdout(predicate::str::contains("R012"))
+            .stdout(predicate::str::contains("warning"));
     }
 
     #[test]
