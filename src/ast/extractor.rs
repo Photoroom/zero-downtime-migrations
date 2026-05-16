@@ -237,7 +237,7 @@ impl<'a> MigrationExtractor<'a> {
             | OperationType::AddIndexConcurrently
             | OperationType::RemoveIndex
             | OperationType::RemoveIndexConcurrently => {
-                OperationData::Index(self.extract_index_operation(args))
+                OperationData::Index(self.extract_index_operation(op_type, args))
             }
             OperationType::CreateModel => {
                 OperationData::Model(self.extract_create_model_operation(args))
@@ -263,14 +263,78 @@ impl<'a> MigrationExtractor<'a> {
     }
 
     /// Extract index operation data.
-    fn extract_index_operation(&self, args: Node) -> IndexOperation {
+    ///
+    /// Add forms (`AddIndex`/`AddIndexConcurrently`) carry their index
+    /// definition nested in an `index=models.Index(...)` call, so we
+    /// drill into that to recover the index name and column list.
+    /// Remove forms (`RemoveIndex`/`RemoveIndexConcurrently`) just
+    /// reference the index by its top-level `name=` kwarg and carry no
+    /// column info.
+    fn extract_index_operation(&self, op_type: OperationType, args: Node<'a>) -> IndexOperation {
         let model_name = self.get_keyword_arg_string(args, "model_name");
-        // Index name would be nested inside the index argument
+
+        let (index_name, columns) = match op_type {
+            OperationType::AddIndex | OperationType::AddIndexConcurrently => {
+                self.extract_inner_index_call(args)
+            }
+            OperationType::RemoveIndex | OperationType::RemoveIndexConcurrently => {
+                (self.get_keyword_arg_string(args, "name"), Vec::new())
+            }
+            _ => (None, Vec::new()),
+        };
 
         IndexOperation {
             model_name: model_name.unwrap_or_default(),
-            index_name: None,
+            index_name,
+            columns,
         }
+    }
+
+    /// Drill into the `index=models.Index(...)` argument of an Add
+    /// form and pull out the inner call's `name=` and `fields=[...]`.
+    /// Returns `(None, Vec::new())` if the argument is missing, isn't a
+    /// call node, or has no recognisable inner kwargs. The kwarg form
+    /// is preferred but the positional form (`AddIndex('model', index)`
+    /// — Django's signature is `(model_name, index)`) is also accepted.
+    /// Non-literal `fields` values (an identifier, a comprehension)
+    /// yield an empty column vec — we deliberately don't try to
+    /// resolve them.
+    fn extract_inner_index_call(&self, args: Node<'a>) -> (Option<String>, Vec<String>) {
+        let index_value = self
+            .get_keyword_arg_value(args, "index")
+            .or_else(|| self.get_nth_positional_value(args, 1));
+        let Some(index_value) = index_value else {
+            return (None, Vec::new());
+        };
+        if index_value.kind() != "call" {
+            return (None, Vec::new());
+        }
+        let Some(inner_args) = index_value.child_by_field_name("arguments") else {
+            return (None, Vec::new());
+        };
+        let inner_name = self.get_keyword_arg_string(inner_args, "name");
+        let columns = self
+            .get_keyword_arg_value(inner_args, "fields")
+            .map(|node| self.extract_string_list(node))
+            .unwrap_or_default();
+        (inner_name, columns)
+    }
+
+    /// Extract the string elements of a Python `list` literal. Returns
+    /// an empty vec for any non-`list` node and silently skips
+    /// non-string children (e.g. an `F('expr')` mixed into a fields
+    /// list) so we don't fabricate column names.
+    fn extract_string_list(&self, node: Node<'_>) -> Vec<String> {
+        let mut out = Vec::new();
+        if node.kind() != "list" {
+            return out;
+        }
+        for child in node.named_children(&mut node.walk()) {
+            if child.kind() == "string" {
+                out.push(self.extract_string_value(child));
+            }
+        }
+        out
     }
 
     /// Extract CreateModel operation data.
@@ -764,6 +828,9 @@ class Migration(migrations.Migration):
 
         if let OperationData::Index(data) = &add_index.data {
             assert_eq!(data.model_name, "product");
+            // The fixture has `index=models.Index(fields=['name'], name='product_name_idx')`.
+            assert_eq!(data.index_name.as_deref(), Some("product_name_idx"));
+            assert_eq!(data.columns, vec!["name".to_string()]);
         } else {
             panic!("Expected Index data");
         }
@@ -1440,6 +1507,253 @@ class Migration(migrations.Migration):
         ),
     ]
 "#;
+
+    const ADD_INDEX_MULTI_COLUMN: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='order',
+            index=models.Index(fields=['customer', 'status'], name='order_customer_status_idx'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_index_multi_column() {
+        let parsed = ParsedMigration::parse(ADD_INDEX_MULTI_COLUMN).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(data.model_name, "order");
+        assert_eq!(
+            data.index_name.as_deref(),
+            Some("order_customer_status_idx")
+        );
+        assert_eq!(
+            data.columns,
+            vec!["customer".to_string(), "status".to_string()]
+        );
+    }
+
+    const ADD_INDEX_CONCURRENTLY: &str = r#"
+from django.db import models
+from django.contrib.postgres.operations import AddIndexConcurrently
+
+
+class Migration(migrations.Migration):
+    atomic = False
+
+    operations = [
+        AddIndexConcurrently(
+            model_name='product',
+            index=models.Index(fields=['sku'], name='product_sku_idx'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_add_index_concurrently_captures_columns() {
+        let parsed = ParsedMigration::parse(ADD_INDEX_CONCURRENTLY).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(data.columns, vec!["sku".to_string()]);
+        assert_eq!(data.index_name.as_deref(), Some("product_sku_idx"));
+    }
+
+    const REMOVE_INDEX_BY_NAME: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RemoveIndex(model_name='product', name='product_legacy_idx'),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_remove_index_captures_name_no_columns() {
+        let parsed = ParsedMigration::parse(REMOVE_INDEX_BY_NAME).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(data.model_name, "product");
+        assert_eq!(data.index_name.as_deref(), Some("product_legacy_idx"));
+        // RemoveIndex carries no column info.
+        assert!(data.columns.is_empty());
+    }
+
+    const ADD_INDEX_POSITIONAL: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            'product',
+            models.Index(fields=['name'], name='product_name_idx'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_index_positional_args() {
+        // Django's signature is `AddIndex(model_name, index)` so the
+        // positional form is valid Python and a shape developers
+        // actually write.
+        let parsed = ParsedMigration::parse(ADD_INDEX_POSITIONAL).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        // model_name kwarg parsing remains kwarg-only, so we don't
+        // assert it here — the column extraction is what this commit
+        // is about.
+        assert_eq!(data.index_name.as_deref(), Some("product_name_idx"));
+        assert_eq!(data.columns, vec!["name".to_string()]);
+    }
+
+    const ADD_INDEX_BARE_NAME: &str = r#"
+from django.db import migrations
+from django.db.models import Index
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=Index(fields=['name'], name='product_name_idx'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_index_bare_name_call() {
+        // `index=Index(...)` (no `models.` prefix) still parses as a
+        // `call` node, so the descent should work the same.
+        let parsed = ParsedMigration::parse(ADD_INDEX_BARE_NAME).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(data.columns, vec!["name".to_string()]);
+        assert_eq!(data.index_name.as_deref(), Some("product_name_idx"));
+    }
+
+    const ADD_INDEX_VALUE_NOT_A_CALL: &str = r#"
+from django.db import migrations
+
+
+PREBUILT = None
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=PREBUILT,
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_index_value_not_a_call_yields_empty() {
+        // `index=` value is an identifier, not a call. Extraction
+        // should degrade gracefully (no column info, no panic).
+        let parsed = ParsedMigration::parse(ADD_INDEX_VALUE_NOT_A_CALL).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(data.index_name, None);
+        assert!(data.columns.is_empty());
+    }
+
+    const ADD_INDEX_FIELDS_KWARG_MISSING: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(name='product_legacy_idx'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_index_missing_fields_kwarg_yields_empty_columns() {
+        // No `fields=` kwarg at all — extraction should still surface
+        // the index name and return empty columns.
+        let parsed = ParsedMigration::parse(ADD_INDEX_FIELDS_KWARG_MISSING).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(data.index_name.as_deref(), Some("product_legacy_idx"));
+        assert!(data.columns.is_empty());
+    }
+
+    const ADD_INDEX_NON_LITERAL_FIELDS: &str = r#"
+from django.db import migrations, models
+
+
+FIELDS = ['name']
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(fields=FIELDS, name='product_name_idx'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_index_non_literal_fields_yields_empty_columns() {
+        // `fields=FIELDS` (an identifier) is not a literal list. We
+        // deliberately don't resolve it; the extractor returns an
+        // empty column vec so downstream rules know they can't make
+        // column-aware decisions.
+        let parsed = ParsedMigration::parse(ADD_INDEX_NON_LITERAL_FIELDS).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(data.index_name.as_deref(), Some("product_name_idx"));
+        assert!(data.columns.is_empty());
+    }
 
     #[test]
     fn test_sdas_nested_does_not_recurse() {

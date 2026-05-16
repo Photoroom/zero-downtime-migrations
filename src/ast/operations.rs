@@ -130,8 +130,26 @@ pub enum OperationData {
 pub struct IndexOperation {
     /// The model name (lowercase).
     pub model_name: String,
-    /// The index name, if specified.
+    /// The index name, if specified. Populated for both Add and Remove
+    /// forms: for `AddIndex`/`AddIndexConcurrently` it's the `name`
+    /// kwarg inside `models.Index(...)`, for `RemoveIndex` it's the
+    /// top-level `name=` kwarg.
     pub index_name: Option<String>,
+    /// Index column names, as written. Only populated for Add forms,
+    /// where the inner `models.Index(fields=[...])` lists them. Empty
+    /// for Remove forms (the rule has no column info — only the index
+    /// name) and for indexes whose `fields=...` value isn't a literal
+    /// list (e.g. an identifier referencing a module-level constant).
+    /// Order matches the source order, which is the index's column
+    /// order in Postgres.
+    ///
+    /// Casing: preserved verbatim from the source. Django writes
+    /// column names lowercase by default, so callers should compare
+    /// case-insensitively for the common path. Case-sensitive matching
+    /// is only correct when the caller knows the column came from a
+    /// `db_column='MixedCase'` (a quoted Postgres identifier) — that
+    /// information isn't carried in this struct.
+    pub columns: Vec<String>,
 }
 
 /// Data for model operations (CreateModel, DeleteModel, etc.).
