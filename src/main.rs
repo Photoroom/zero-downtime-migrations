@@ -15,7 +15,7 @@ use zero_downtime_migrations::diagnostics::{Diagnostic, Severity};
 use zero_downtime_migrations::discovery;
 use zero_downtime_migrations::error::{Error, Result};
 use zero_downtime_migrations::git::GitRepo;
-use zero_downtime_migrations::parser::ParsedMigration;
+use zero_downtime_migrations::parser::{self, ParsedMigration};
 use zero_downtime_migrations::rules::{ChangesetRuleRegistry, RuleRegistry};
 
 /// Zero-Downtime Migrations - A PostgreSQL migration safety linter for Django
@@ -303,25 +303,29 @@ fn parse_and_check_file(
     config: &Config,
     diff_mode: Option<DiffMode<'_>>,
 ) -> Result<(Migration, Vec<Diagnostic>)> {
-    // Read and parse the file
-    let source = match diff_mode {
+    // Both paths enforce a size cap (parser::MAX_FILE_SIZE) to bound memory
+    // and parse time on untrusted input. The regular path uses parse_file,
+    // which also reports syntax errors with line/column. The staged path
+    // emits a less precise error on syntax failure; aligning the two would
+    // mean exposing parse_file's internals as a source-string variant —
+    // tracked as a follow-up.
+    let parsed = match diff_mode {
         Some(DiffMode::Staged { .. }) => {
             let repo = GitRepo::open(Path::new("."))?;
-            repo.read_staged_file(path)?
+            let source = repo.read_staged_file(path)?;
+            parser::check_size(path, source.len() as u64)?;
+            let parsed = ParsedMigration::parse(&source)
+                .map_err(|e| Error::parse(path.to_path_buf(), e.to_string()))?;
+            if parsed.has_errors() {
+                return Err(Error::parse(
+                    path.to_path_buf(),
+                    "syntax error in migration file".to_string(),
+                ));
+            }
+            parsed
         }
-        _ => std::fs::read_to_string(path).map_err(|e| Error::io(e, path.to_path_buf()))?,
+        _ => ParsedMigration::parse_file(path)?,
     };
-
-    let parsed = ParsedMigration::parse(&source)
-        .map_err(|e| Error::parse(path.to_path_buf(), e.to_string()))?;
-
-    // Check for parse errors in the syntax tree
-    if parsed.has_errors() {
-        return Err(Error::parse(
-            path.to_path_buf(),
-            "syntax error in migration file".to_string(),
-        ));
-    }
 
     let extractor = MigrationExtractor::new(&parsed);
     let migration = extractor

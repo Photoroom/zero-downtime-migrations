@@ -12,8 +12,18 @@ use tree_sitter::{Language, Node, Parser, Tree};
 use crate::error::{Error, Result};
 
 /// Maximum file size for migration files (10 MB).
-/// This prevents DoS attacks from extremely large files.
-const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+/// This bounds memory use and parse time when processing untrusted input.
+pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Returns `Err(Error::FileTooLarge)` if the given byte count exceeds
+/// `MAX_FILE_SIZE`. Callers that already hold a source string should pass
+/// `source.len() as u64`; callers reading from disk can stat the file first.
+pub fn check_size(path: &Path, size: u64) -> Result<()> {
+    if size > MAX_FILE_SIZE {
+        return Err(Error::file_too_large(path, size, MAX_FILE_SIZE));
+    }
+    Ok(())
+}
 
 /// Global Python language instance.
 static PYTHON_LANGUAGE: Lazy<Language> = Lazy::new(|| tree_sitter_python::LANGUAGE.into());
@@ -45,11 +55,9 @@ impl ParsedMigration {
 
     /// Parse a migration file from a path.
     pub fn parse_file(path: &Path) -> Result<Self> {
-        // Check file size before reading to prevent DoS
+        // Cap on-disk size before reading to bound memory.
         let metadata = std::fs::metadata(path).map_err(|e| Error::file_read(path, e))?;
-        if metadata.len() > MAX_FILE_SIZE {
-            return Err(Error::file_too_large(path, metadata.len(), MAX_FILE_SIZE));
-        }
+        check_size(path, metadata.len())?;
 
         let source = std::fs::read_to_string(path).map_err(|e| Error::file_read(path, e))?;
 
@@ -305,5 +313,28 @@ class Migration(migrations.Migration)  # Missing colon
             }
         }
         assert_eq!(call_count, 1);
+    }
+
+    #[test]
+    fn test_check_size_accepts_under_limit() {
+        assert!(check_size(Path::new("test.py"), 0).is_ok());
+        assert!(check_size(Path::new("test.py"), MAX_FILE_SIZE).is_ok());
+    }
+
+    #[test]
+    fn test_check_size_rejects_over_limit() {
+        let err = check_size(Path::new("huge.py"), MAX_FILE_SIZE + 1).unwrap_err();
+        match err {
+            Error::FileTooLarge {
+                path,
+                size,
+                max_size,
+            } => {
+                assert_eq!(path, Path::new("huge.py"));
+                assert_eq!(size, MAX_FILE_SIZE + 1);
+                assert_eq!(max_size, MAX_FILE_SIZE);
+            }
+            other => panic!("expected FileTooLarge, got {other:?}"),
+        }
     }
 }
