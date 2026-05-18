@@ -595,12 +595,20 @@ class Migration(migrations.Migration):
             diag_line.contains("E: [R001 non-concurrent-add-index]"),
             "compact line should carry SEV: [RULE rulename], got: {diag_line}",
         );
-        // The first colon-separated field is the path; the second is
-        // a line number, not text.
-        let colon_idx = diag_line
-            .find(':')
-            .expect("compact line must include a colon");
-        let after_path = &diag_line[colon_idx + 1..];
+        // The compact line shape is
+        //   <path>:<line>:<col>: <SEV>: [<RULE> <name>] <msg>
+        // and we want to assert <line> is a number. On Windows the
+        // path itself contains a colon (drive letter, e.g.
+        // `C:\Users\...`), so a naive `diag_line.find(':')` lands
+        // on the drive-letter colon and the next field is the
+        // rest of the path. Find the path/line boundary by
+        // searching for `.py:` instead — every migration fixture
+        // is a `.py` file, so that anchor is unambiguous.
+        let py_marker = ".py:";
+        let py_idx = diag_line
+            .find(py_marker)
+            .expect("compact line must contain a .py path followed by :");
+        let after_path = &diag_line[py_idx + py_marker.len()..];
         let next_colon = after_path
             .find(':')
             .expect("compact line must have a `:line:` after the path");
