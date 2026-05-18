@@ -3,9 +3,9 @@
 //! Detects AddField operations that add a NOT NULL field without a default value.
 //! This requires an immediate rewrite of all rows to set the value, which locks the table.
 
-use crate::ast::{Migration, ModelOperation, OperationData, OperationType};
+use crate::ast::{Migration, OperationData, OperationType};
 use crate::diagnostics::{Diagnostic, Severity};
-use crate::rules::{Rule, RuleContext};
+use crate::rules::{walk_with_created_models, Rule, RuleContext};
 
 /// Rule that detects AddField with NOT NULL and no default.
 pub struct R010AddFieldNotNull;
@@ -29,32 +29,20 @@ impl Rule for R010AddFieldNotNull {
     }
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
-        // Walk operations in source order so the CreateModel
-        // exemption only honours models created *before* the
-        // AddField — the same order-blindness fixed in R001, R002,
-        // R006, R016, and R017 earlier in this PR.
         let mut diagnostics = Vec::new();
-        let mut created_so_far: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        for op in &migration.operations {
-            if op.op_type == OperationType::CreateModel {
-                if let OperationData::Model(ModelOperation { name, .. }) = &op.data {
-                    created_so_far.insert(name.to_lowercase());
-                }
-                continue;
-            }
+        walk_with_created_models(migration, |op, created_so_far| {
             if op.op_type != OperationType::AddField {
-                continue;
+                return;
             }
             let OperationData::Field(data) = &op.data else {
-                continue;
+                return;
             };
             if created_so_far.contains(&data.model_name.to_lowercase()) {
-                continue;
+                return;
             }
-            let Some(field) = &data.field else { continue };
+            let Some(field) = &data.field else { return };
             if field.is_nullable || field.has_default {
-                continue;
+                return;
             }
 
             diagnostics.push(Diagnostic {
@@ -73,7 +61,7 @@ impl Rule for R010AddFieldNotNull {
                         .to_string(),
                 ),
             });
-        }
+        });
 
         diagnostics
     }
@@ -217,6 +205,32 @@ class Migration(migrations.Migration):
         // even claimed R010 honoured the CreateModel exemption but
         // the implementation was order-blind.
         let diagnostics = check_migration(ADDFIELD_BEFORE_CREATEMODEL_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R010");
+    }
+
+    const WRAPPED_NOT_NULL_NO_DEFAULT_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.AddField(
+                    model_name='product',
+                    name='sku',
+                    field=models.CharField(max_length=50),
+                ),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_wrapped_database_addfield_notnull_is_flagged() {
+        let diagnostics = check_migration(WRAPPED_NOT_NULL_NO_DEFAULT_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R010");
     }

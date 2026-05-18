@@ -42,9 +42,10 @@ pub use r015_alter_field_not_null::R015AlterFieldNotNull;
 pub use r016_non_concurrent_remove_index::R016NonConcurrentRemoveIndex;
 pub use r017_non_concurrent_add_constraint::R017NonConcurrentAddConstraint;
 
+use std::collections::HashSet;
 use std::path::Path;
 
-use crate::ast::Migration;
+use crate::ast::{Migration, ModelOperation, Operation, OperationData, OperationType};
 use crate::config::Config;
 use crate::diagnostics::{Diagnostic, Severity};
 
@@ -55,6 +56,36 @@ pub struct RuleContext<'a> {
     pub config: &'a Config,
     /// The file path being linted.
     pub path: &'a Path,
+}
+
+/// Walk a migration's database-effective operations in source
+/// order, threading a `created` set through each callback. A
+/// top-level `CreateModel` op inserts its name into the set
+/// *before* `handle` is called, so the current op sees its own
+/// model in `created` only if the op is itself a `CreateModel`.
+///
+/// Operations wrapped in `SeparateDatabaseAndState(database_operations=[...])`
+/// are walked after the top-level list with an empty created set:
+/// the wrapper implies the database op targets the live schema, so
+/// a top-level state-only `CreateModel` must not exempt it.
+pub(crate) fn walk_with_created_models(
+    migration: &Migration,
+    mut handle: impl FnMut(&Operation, &HashSet<String>),
+) {
+    let mut created_so_far: HashSet<String> = HashSet::new();
+    for op in &migration.operations {
+        if op.op_type == OperationType::CreateModel {
+            if let OperationData::Model(ModelOperation { name, .. }) = &op.data {
+                created_so_far.insert(name.to_lowercase());
+            }
+        }
+        handle(op, &created_so_far);
+    }
+
+    let wrapped_created = HashSet::new();
+    for op in &migration.wrapped_database_ops {
+        handle(op, &wrapped_created);
+    }
 }
 
 /// A per-file rule that analyzes individual migration files.
@@ -468,5 +499,97 @@ class Migration(migrations.Migration):
         // R008 still fires because the directive targets a different rule.
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R008");
+    }
+
+    // -------------------------------------------------------------------
+    // walk_with_created_models
+    //
+    // The helper consolidates a pattern that used to be hand-rolled in
+    // R001/R002/R006/R010/R016/R017. Tests pin the invariants the
+    // callers rely on so a future refactor of the helper can't
+    // silently change exemption behaviour for all six rules at once.
+    // -------------------------------------------------------------------
+
+    use crate::ast::extractor::MigrationExtractor;
+    use crate::parser::ParsedMigration;
+    use std::path::Path;
+
+    fn extract(source: &str) -> Migration {
+        let parsed = ParsedMigration::parse(source).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        extractor.extract(Path::new("test.py")).unwrap()
+    }
+
+    #[test]
+    fn walk_with_created_models_strictly_before() {
+        // A CreateModel reaches `created_so_far` for the callbacks
+        // of every op that follows it, but not the op before it.
+        // This is the invariant that makes the order-aware
+        // exemption work — an order-blind set would silently let a
+        // CreateModel below a flagged op exempt that op.
+        let source = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(fields=['name'], name='product_name_idx'),
+        ),
+        migrations.CreateModel(
+            name='Product',
+            fields=[('id', models.BigAutoField(primary_key=True))],
+        ),
+    ]
+"#;
+        let migration = extract(source);
+        let mut seen: Vec<(OperationType, bool)> = Vec::new();
+        walk_with_created_models(&migration, |op, created| {
+            seen.push((op.op_type, created.contains("product")));
+        });
+        assert_eq!(
+            seen,
+            vec![
+                (OperationType::AddIndex, false),
+                (OperationType::CreateModel, true),
+            ],
+            "AddIndex above its CreateModel must NOT see the model in created_so_far",
+        );
+    }
+
+    #[test]
+    fn walk_with_created_models_case_insensitive() {
+        // Django is case-insensitive on `model_name=` lookups, so
+        // the helper stores names lowercased. Every caller
+        // lowercases on the way in too. Pin the contract so a
+        // helper-internal change can't silently break callers.
+        let source = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.CreateModel(
+            name='Product',
+            fields=[('id', models.BigAutoField(primary_key=True))],
+        ),
+    ]
+"#;
+        let migration = extract(source);
+        let mut saw_lowercase = false;
+        let mut saw_titlecase = false;
+        walk_with_created_models(&migration, |_, created| {
+            if created.contains("product") {
+                saw_lowercase = true;
+            }
+            if created.contains("Product") {
+                saw_titlecase = true;
+            }
+        });
+        assert!(saw_lowercase, "names stored lowercased");
+        assert!(!saw_titlecase, "case-folded — titlecase lookup should miss");
     }
 }

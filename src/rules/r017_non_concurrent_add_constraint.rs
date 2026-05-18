@@ -16,9 +16,9 @@
 //! from the source) is silently skipped to avoid false positives on
 //! unrecognised classes.
 
-use crate::ast::{ConstraintType, Migration, ModelOperation, OperationData, OperationType};
+use crate::ast::{ConstraintType, Migration, OperationData, OperationType};
 use crate::diagnostics::{Diagnostic, Severity};
-use crate::rules::{Rule, RuleContext};
+use crate::rules::{walk_with_created_models, Rule, RuleContext};
 
 /// Rule that detects constraints that may cause table locks.
 pub struct R017NonConcurrentAddConstraint;
@@ -44,31 +44,16 @@ impl Rule for R017NonConcurrentAddConstraint {
     }
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
-        // Walk in source order so the fresh-model exemption only
-        // honours CreateModel ops that ran *before* the AddConstraint.
-        // The previous order-blind `is_model_created` lookup would
-        // silently exempt an AddConstraint placed above its
-        // CreateModel — the same false negative R002 and R016 fixed
-        // earlier in this PR.
         let mut diagnostics = Vec::new();
-        let mut created_so_far: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
-        for op in &migration.operations {
-            if op.op_type == OperationType::CreateModel {
-                if let OperationData::Model(ModelOperation { name, .. }) = &op.data {
-                    created_so_far.insert(name.to_lowercase());
-                }
-                continue;
-            }
+        walk_with_created_models(migration, |op, created_so_far| {
             if op.op_type != OperationType::AddConstraint {
-                continue;
+                return;
             }
             let OperationData::Constraint(data) = &op.data else {
-                continue;
+                return;
             };
             if created_so_far.contains(&data.model_name.to_lowercase()) {
-                continue;
+                return;
             }
 
             // FKs go through AddField (covered by R006); UniqueConstraint
@@ -101,7 +86,7 @@ impl Rule for R017NonConcurrentAddConstraint {
                      indefinitely."
                         .to_string(),
                 ),
-                _ => continue,
+                _ => return,
             };
 
             diagnostics.push(Diagnostic {
@@ -113,7 +98,7 @@ impl Rule for R017NonConcurrentAddConstraint {
                 span: op.span,
                 help: Some(help),
             });
-        }
+        });
 
         diagnostics
     }
@@ -288,6 +273,34 @@ class Migration(migrations.Migration):
         // order-blind and silently exempted this — the same false
         // negative R002 and R016 fixed earlier in this PR.
         let diagnostics = check_migration(ADDCONSTRAINT_BEFORE_CREATEMODEL_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R017");
+    }
+
+    const WRAPPED_CHECK_CONSTRAINT_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.AddConstraint(
+                    model_name='product',
+                    constraint=models.CheckConstraint(
+                        check=models.Q(price__gte=0),
+                        name='positive_price',
+                    ),
+                ),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_wrapped_database_check_constraint_is_flagged() {
+        let diagnostics = check_migration(WRAPPED_CHECK_CONSTRAINT_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R017");
     }

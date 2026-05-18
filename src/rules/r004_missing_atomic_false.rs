@@ -3,7 +3,7 @@
 //! Concurrent index operations (AddIndexConcurrently, RemoveIndexConcurrently)
 //! cannot run inside a transaction. The migration must have `atomic = False`.
 
-use crate::ast::{strip_sql_noise, Migration, OperationData};
+use crate::ast::{strip_sql_noise, Migration, Operation, OperationData};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::rules::{Rule, RuleContext};
 
@@ -42,23 +42,11 @@ impl Rule for R004MissingAtomicFalse {
         //      block"), so an atomic migration that wraps such a
         //      RunSQL silently fails on every deploy — the rule
         //      should catch it at lint time.
-        let has_concurrent = migration.operations.iter().any(|op| {
-            if op.op_type.is_concurrent() {
-                return true;
-            }
-            if let OperationData::RunSQL(data) = &op.data {
-                let cleaned = strip_sql_noise(&data.sql).to_uppercase();
-                return cleaned.split(';').any(|stmt| {
-                    let s = stmt.trim();
-                    s.contains("CONCURRENTLY")
-                        && (s.contains("CREATE INDEX")
-                            || s.contains("CREATE UNIQUE INDEX")
-                            || s.contains("DROP INDEX")
-                            || s.contains("REINDEX"))
-                });
-            }
-            false
-        });
+        let has_concurrent = migration
+            .operations
+            .iter()
+            .chain(&migration.wrapped_database_ops)
+            .any(operation_requires_non_atomic);
 
         if has_concurrent && !migration.is_non_atomic {
             // Anchor the diagnostic at the `class Migration(...)` line.
@@ -83,6 +71,24 @@ impl Rule for R004MissingAtomicFalse {
 
         diagnostics
     }
+}
+
+fn operation_requires_non_atomic(op: &Operation) -> bool {
+    if op.op_type.is_concurrent() {
+        return true;
+    }
+    if let OperationData::RunSQL(data) = &op.data {
+        let cleaned = strip_sql_noise(&data.sql).to_uppercase();
+        return cleaned.split(';').any(|stmt| {
+            let s = stmt.trim();
+            s.contains("CONCURRENTLY")
+                && (s.contains("CREATE INDEX")
+                    || s.contains("CREATE UNIQUE INDEX")
+                    || s.contains("DROP INDEX")
+                    || s.contains("REINDEX"))
+        });
+    }
+    false
 }
 
 #[cfg(test)]
@@ -254,6 +260,54 @@ class Migration(migrations.Migration):
         // legitimate concurrent RunSQL pattern.
         let diagnostics = check_migration(RUNSQL_CONCURRENTLY_WITH_ATOMIC_GOOD);
         assert!(diagnostics.is_empty(), "got: {diagnostics:?}");
+    }
+
+    const WRAPPED_CONCURRENT_NO_ATOMIC_BAD: &str = r#"
+from django.db import migrations, models
+from django.contrib.postgres.operations import AddIndexConcurrently
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                AddIndexConcurrently(
+                    model_name='product',
+                    index=models.Index(fields=['name'], name='product_name_idx'),
+                ),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_wrapped_addindexconcurrently_without_atomic_false_is_flagged() {
+        let diagnostics = check_migration(WRAPPED_CONCURRENT_NO_ATOMIC_BAD);
+        assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+        assert_eq!(diagnostics[0].rule_id, "R004");
+    }
+
+    const WRAPPED_RUNSQL_CONCURRENTLY_NO_ATOMIC_BAD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.RunSQL(sql='CREATE INDEX CONCURRENTLY idx_name ON t (c);'),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_wrapped_runsql_concurrently_without_atomic_false_is_flagged() {
+        let diagnostics = check_migration(WRAPPED_RUNSQL_CONCURRENTLY_NO_ATOMIC_BAD);
+        assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+        assert_eq!(diagnostics[0].rule_id, "R004");
     }
 
     const RUNSQL_CONCURRENTLY_IN_STRING_LITERAL_GOOD: &str = r#"

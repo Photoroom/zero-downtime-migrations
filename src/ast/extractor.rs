@@ -113,22 +113,11 @@ impl<'a> MigrationExtractor<'a> {
             .find_migration_class()
             .map(|n| Span::from_node(&n));
 
-        // Track created models for exemption
-        let created_models: Vec<String> = operations
-            .iter()
-            .filter(|op| op.op_type == OperationType::CreateModel)
-            .filter_map(|op| match &op.data {
-                OperationData::Model(m) => Some(m.name.clone()),
-                _ => None,
-            })
-            .collect();
-
         Ok(Migration {
             path: path.to_path_buf(),
             is_non_atomic,
             operations,
             imports,
-            created_models,
             wrapped_database_ops,
             class_span,
             line_ignores,
@@ -871,20 +860,6 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    #[allow(deprecated)] // exercises `is_model_created` itself
-    fn test_extract_created_models() {
-        let parsed = ParsedMigration::parse(MULTI_OPERATION_MIGRATION).unwrap();
-        let extractor = MigrationExtractor::new(&parsed);
-        let migration = extractor.extract(Path::new("test.py")).unwrap();
-
-        assert_eq!(migration.created_models.len(), 1);
-        assert_eq!(migration.created_models[0], "Product");
-        assert!(migration.is_model_created("product")); // Case-insensitive
-        assert!(migration.is_model_created("Product"));
-        assert!(!migration.is_model_created("Order"));
-    }
-
-    #[test]
     fn test_extract_index_operation() {
         let parsed = ParsedMigration::parse(MULTI_OPERATION_MIGRATION).unwrap();
         let extractor = MigrationExtractor::new(&parsed);
@@ -1174,111 +1149,6 @@ class Migration(migrations.Migration):
         } else {
             panic!("Expected RunPython data");
         }
-    }
-
-    const MULTIPLE_CREATE_MODEL: &str = r#"
-from django.db import migrations, models
-
-
-class Migration(migrations.Migration):
-
-    operations = [
-        migrations.CreateModel(
-            name='User',
-            fields=[],
-        ),
-        migrations.CreateModel(
-            name='Profile',
-            fields=[],
-        ),
-        migrations.AddField(
-            model_name='profile',
-            name='user',
-            field=models.ForeignKey(on_delete=models.CASCADE, to='app.user'),
-        ),
-    ]
-"#;
-
-    #[test]
-    #[allow(deprecated)] // exercises `is_model_created` itself
-    fn test_multiple_create_model_exemption() {
-        let parsed = ParsedMigration::parse(MULTIPLE_CREATE_MODEL).unwrap();
-        let extractor = MigrationExtractor::new(&parsed);
-        let migration = extractor.extract(Path::new("test.py")).unwrap();
-
-        assert_eq!(migration.created_models.len(), 2);
-        assert!(migration.is_model_created("User"));
-        assert!(migration.is_model_created("Profile"));
-        assert!(migration.is_model_created("user")); // Case insensitive
-        assert!(migration.is_model_created("PROFILE")); // Case insensitive
-    }
-
-    const ADDFIELD_EXISTING_MODEL: &str = r#"
-from django.db import migrations, models
-
-
-class Migration(migrations.Migration):
-
-    operations = [
-        migrations.AddField(
-            model_name='existingmodel',
-            name='new_field',
-            field=models.CharField(max_length=255),
-        ),
-    ]
-"#;
-
-    #[test]
-    #[allow(deprecated)] // exercises `is_model_created` itself
-    fn test_addfield_on_existing_model_not_exempt() {
-        let parsed = ParsedMigration::parse(ADDFIELD_EXISTING_MODEL).unwrap();
-        let extractor = MigrationExtractor::new(&parsed);
-        let migration = extractor.extract(Path::new("test.py")).unwrap();
-
-        assert!(migration.created_models.is_empty());
-        assert!(!migration.is_model_created("existingmodel"));
-    }
-
-    const MIXED_OPERATIONS: &str = r#"
-from django.db import migrations, models
-
-
-class Migration(migrations.Migration):
-
-    operations = [
-        migrations.CreateModel(
-            name='NewModel',
-            fields=[
-                ('id', models.BigAutoField(primary_key=True)),
-            ],
-        ),
-        migrations.AddField(
-            model_name='newmodel',
-            name='status',
-            field=models.CharField(max_length=50),
-        ),
-        migrations.AddField(
-            model_name='oldmodel',
-            name='reference',
-            field=models.ForeignKey(on_delete=models.CASCADE, to='app.newmodel'),
-        ),
-    ]
-"#;
-
-    #[test]
-    #[allow(deprecated)] // exercises `is_model_created` itself
-    fn test_exemption_applies_selectively() {
-        let parsed = ParsedMigration::parse(MIXED_OPERATIONS).unwrap();
-        let extractor = MigrationExtractor::new(&parsed);
-        let migration = extractor.extract(Path::new("test.py")).unwrap();
-
-        // NewModel was created in this migration
-        assert!(migration.is_model_created("NewModel"));
-        assert!(migration.is_model_created("newmodel"));
-
-        // OldModel was not created in this migration
-        assert!(!migration.is_model_created("OldModel"));
-        assert!(!migration.is_model_created("oldmodel"));
     }
 
     #[test]
@@ -1953,7 +1823,6 @@ class Migration(migrations.Migration):
         let extractor = MigrationExtractor::new(&parsed);
         let migration = extractor.extract(Path::new("not_a_migration.py")).unwrap();
         assert!(migration.operations.is_empty());
-        assert!(migration.created_models.is_empty());
         assert!(migration.class_span.is_none());
     }
 }

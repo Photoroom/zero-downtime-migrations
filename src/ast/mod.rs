@@ -30,20 +30,6 @@ pub struct Migration {
     pub operations: Vec<Operation>,
     /// Import statements that may be relevant for linting.
     pub imports: Vec<Import>,
-    /// Model names created in this migration (for exemption tracking).
-    ///
-    /// **Order-blind** — the field is a flat list with no record of
-    /// where each `CreateModel` appeared relative to the operation
-    /// being evaluated. Out-of-tree consumers building custom rules
-    /// must not consult it for exemption decisions (it ships the
-    /// exact false negative that `is_model_created` was deprecated
-    /// for). Use the order-aware pattern from R001/R002/R006/
-    /// R010/R016/R017 instead: walk `operations` in source order
-    /// and track a local `created_so_far: HashSet<String>`.
-    ///
-    /// Demoted to `pub(crate)` so it can't be misused from outside
-    /// the crate while we figure out a safer accessor.
-    pub(crate) created_models: Vec<String>,
     /// Operations extracted from
     /// `SeparateDatabaseAndState(database_operations=[...])` arms in this
     /// migration. These represent the "database-side" half of a two-step
@@ -52,13 +38,9 @@ pub struct Migration {
     /// patterns can inspect this field alongside `operations` to avoid
     /// silently ignoring locks hidden inside an SDaS wrapper.
     ///
-    /// R001 is currently the only consumer. R006, R016, and R017 could
-    /// in principle opt in the same way, but the wrapping pattern is
-    /// uncommon for those ops (Django's dev guide recommends SDaS
-    /// primarily for renames, add-with-default, and drop-with-rollback,
-    /// not for FK/index/constraint locks). We deliberately leave them
-    /// to the top-level walk and revisit if a user reports a missed
-    /// case.
+    /// The rule traversal treats these as database-effective operations
+    /// without inheriting top-level `CreateModel` exemptions, because
+    /// the wrapper implies the operation targets a live schema.
     ///
     /// State-side operations are deliberately not surfaced because
     /// they're metadata-only — Django updates its migration state
@@ -83,34 +65,6 @@ impl Migration {
         self.operations
             .iter()
             .filter(move |op| op.op_type == op_type)
-    }
-
-    /// Check if a model was created in this migration.
-    ///
-    /// **Deprecated and order-blind.** Returns true if `model_name`
-    /// appears anywhere in `created_models`, regardless of whether
-    /// the `CreateModel` ran before or after the operation the
-    /// caller is checking. Every in-tree rule used to call this and
-    /// every one of them shipped the same false negative: a
-    /// `CreateModel` placed *below* a flagged op silently exempted
-    /// the op. R001, R002, R006, R010, R016, R017 all migrated to an
-    /// order-aware `created_so_far: HashSet<String>` walk during
-    /// this PR.
-    ///
-    /// Kept `pub` for out-of-tree consumers building custom rules
-    /// against the library API, but new rules should use the
-    /// order-aware pattern instead. A future major version may
-    /// remove this helper entirely.
-    #[deprecated(
-        note = "order-blind — exempts ops whose CreateModel runs LATER in the same migration. \
-                Use an order-aware walk: track created model names as you iterate \
-                `migration.operations`, and exempt only if the name was inserted \
-                *before* the flagged op (see R001/R002/R006/R010/R016/R017 for the pattern)."
-    )]
-    pub fn is_model_created(&self, model_name: &str) -> bool {
-        self.created_models
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(model_name))
     }
 
     /// Whether the given rule ID is suppressed for a diagnostic whose

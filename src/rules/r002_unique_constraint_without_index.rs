@@ -8,7 +8,7 @@
 
 use crate::ast::{ConstraintType, Migration, OperationData, OperationType};
 use crate::diagnostics::{Diagnostic, Severity};
-use crate::rules::{Rule, RuleContext};
+use crate::rules::{walk_with_created_models, Rule, RuleContext};
 
 /// Rule that detects `AddConstraint(UniqueConstraint)` on existing tables,
 /// where Django builds the index non-concurrently under a table lock.
@@ -36,36 +36,22 @@ impl Rule for R002UniqueConstraintWithoutIndex {
     }
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
-        // Walk operations in order so the CreateModel exemption only
-        // honors models that were actually created *before* the
-        // AddConstraint in this migration. The previous implementation
-        // used `migration.is_model_created`, which is order-blind: a
-        // CreateModel placed *after* the AddConstraint silently
-        // exempted, even though Django would execute the AddConstraint
-        // first and lock the (then non-empty? still missing?) target.
         let mut diagnostics = Vec::new();
-        let mut created_so_far: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        walk_with_created_models(migration, |op, created_so_far| {
+            if op.op_type != OperationType::AddConstraint {
+                return;
+            }
+            let OperationData::Constraint(data) = &op.data else {
+                return;
+            };
+            if data.constraint_type != ConstraintType::Unique {
+                return;
+            }
+            if created_so_far.contains(&data.model_name.to_lowercase()) {
+                return;
+            }
 
-        for op in &migration.operations {
-            match op.op_type {
-                OperationType::CreateModel => {
-                    if let OperationData::Model(m) = &op.data {
-                        created_so_far.insert(m.name.to_lowercase());
-                    }
-                }
-                OperationType::AddConstraint => {
-                    let OperationData::Constraint(data) = &op.data else {
-                        continue;
-                    };
-                    if data.constraint_type != ConstraintType::Unique {
-                        continue;
-                    }
-                    if created_so_far.contains(&data.model_name.to_lowercase()) {
-                        continue;
-                    }
-
-                    diagnostics.push(Diagnostic {
+            diagnostics.push(Diagnostic {
                         rule_id: self.id(),
                         rule_name: self.name(),
                         message: "AddConstraint with UniqueConstraint locks the table while it builds the index"
@@ -101,11 +87,8 @@ impl Rule for R002UniqueConstraintWithoutIndex {
                              doesn't open one."
                                 .to_string(),
                         ),
-                    });
-                }
-                _ => {}
-            }
-        }
+            });
+        });
 
         diagnostics
     }
@@ -255,5 +238,30 @@ class Migration(migrations.Migration):
             help.contains("state_operations") && help.contains("database_operations"),
             "help should show both halves of the SDaS wrap, got:\n{help}",
         );
+    }
+
+    const UNIQUE_CONSTRAINT_IN_WRAPPED_DATABASE_OPS_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.AddConstraint(
+                    model_name='product',
+                    constraint=models.UniqueConstraint(fields=['sku'], name='unique_sku'),
+                ),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_wrapped_database_unique_constraint_is_flagged() {
+        let diagnostics = check_migration(UNIQUE_CONSTRAINT_IN_WRAPPED_DATABASE_OPS_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R002");
     }
 }

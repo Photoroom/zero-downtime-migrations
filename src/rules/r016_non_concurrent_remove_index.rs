@@ -6,9 +6,9 @@
 //! which blocks reads and writes — fine on an empty table but a
 //! real outage on a live one.
 
-use crate::ast::{Migration, ModelOperation, OperationData, OperationType};
+use crate::ast::{Migration, OperationData, OperationType};
 use crate::diagnostics::{Diagnostic, Severity};
-use crate::rules::{Rule, RuleContext};
+use crate::rules::{walk_with_created_models, Rule, RuleContext};
 
 /// Rule that detects non-concurrent RemoveIndex operations.
 pub struct R016NonConcurrentRemoveIndex;
@@ -32,51 +32,34 @@ impl Rule for R016NonConcurrentRemoveIndex {
     }
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
-        // Top-level walk in source order so the fresh-model exemption
-        // only honours CreateModel ops that ran *before* the RemoveIndex
-        // — an order-blind `is_model_created` lookup would exempt a
-        // RemoveIndex placed above its CreateModel, which is a real
-        // false-negative even if Django would later refuse to run it.
-        // Same pattern as R002.
         let mut diagnostics = Vec::new();
-        let mut created_so_far: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
-        for op in &migration.operations {
-            match op.op_type {
-                OperationType::CreateModel => {
-                    if let OperationData::Model(ModelOperation { name, .. }) = &op.data {
-                        created_so_far.insert(name.to_lowercase());
-                    }
-                }
-                OperationType::RemoveIndex => {
-                    if let OperationData::Index(idx) = &op.data {
-                        if created_so_far.contains(&idx.model_name.to_lowercase()) {
-                            continue;
-                        }
-                    }
-
-                    diagnostics.push(Diagnostic {
-                        rule_id: self.id(),
-                        rule_name: self.name(),
-                        message:
-                            "Use RemoveIndexConcurrently instead of RemoveIndex to avoid table locks"
-                                .to_string(),
-                        severity: self.severity(),
-                        path: ctx.path.to_path_buf(),
-                        span: op.span,
-                        help: Some(
-                            "Replace migrations.RemoveIndex with RemoveIndexConcurrently from \
-                             django.contrib.postgres.operations. The concurrent form takes \
-                             SHARE UPDATE EXCLUSIVE instead of ACCESS EXCLUSIVE and must run \
-                             outside a transaction (`atomic = False`)."
-                                .to_string(),
-                        ),
-                    });
-                }
-                _ => {}
+        walk_with_created_models(migration, |op, created_so_far| {
+            if op.op_type != OperationType::RemoveIndex {
+                return;
             }
-        }
+            if let OperationData::Index(idx) = &op.data {
+                if created_so_far.contains(&idx.model_name.to_lowercase()) {
+                    return;
+                }
+            }
+
+            diagnostics.push(Diagnostic {
+                rule_id: self.id(),
+                rule_name: self.name(),
+                message: "Use RemoveIndexConcurrently instead of RemoveIndex to avoid table locks"
+                    .to_string(),
+                severity: self.severity(),
+                path: ctx.path.to_path_buf(),
+                span: op.span,
+                help: Some(
+                    "Replace migrations.RemoveIndex with RemoveIndexConcurrently from \
+                     django.contrib.postgres.operations. The concurrent form takes \
+                     SHARE UPDATE EXCLUSIVE instead of ACCESS EXCLUSIVE and must run \
+                     outside a transaction (`atomic = False`)."
+                        .to_string(),
+                ),
+            });
+        });
 
         diagnostics
     }
@@ -227,6 +210,31 @@ class Migration(migrations.Migration):
         // An order-blind `is_model_created` lookup would silently
         // exempt this; the source-order walk correctly flags it.
         let diagnostics = check_migration(REMOVE_INDEX_BEFORE_CREATEMODEL_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R016");
+    }
+
+    const WRAPPED_REMOVE_INDEX_BAD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.RemoveIndex(
+                    model_name='product',
+                    name='product_name_idx',
+                ),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_wrapped_database_remove_index_is_flagged() {
+        let diagnostics = check_migration(WRAPPED_REMOVE_INDEX_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R016");
     }
