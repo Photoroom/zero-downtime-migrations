@@ -145,15 +145,7 @@ class Migration(migrations.Migration):
 "#;
 
     fn check_migration(source: &str) -> Vec<Diagnostic> {
-        let parsed = ParsedMigration::parse(source).unwrap();
-        let extractor = MigrationExtractor::new(&parsed);
-        let migration = extractor.extract(Path::new("test.py")).unwrap();
-        let config = Config::default();
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("test.py"),
-        };
-        R004MissingAtomicFalse.check(&migration, &ctx)
+        crate::rules::test_support::check_rule(&R004MissingAtomicFalse, source)
     }
 
     #[test]

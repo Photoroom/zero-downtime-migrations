@@ -77,10 +77,6 @@ impl Rule for R003RunSQLCreateIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::MigrationExtractor;
-    use crate::config::Config;
-    use crate::parser::ParsedMigration;
-    use std::path::Path;
 
     const RUNSQL_CREATE_INDEX_BAD: &str = r#"
 from django.db import migrations
@@ -123,15 +119,7 @@ class Migration(migrations.Migration):
 "#;
 
     fn check_migration(source: &str) -> Vec<Diagnostic> {
-        let parsed = ParsedMigration::parse(source).unwrap();
-        let extractor = MigrationExtractor::new(&parsed);
-        let migration = extractor.extract(Path::new("test.py")).unwrap();
-        let config = Config::default();
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("test.py"),
-        };
-        R003RunSQLCreateIndex.check(&migration, &ctx)
+        crate::rules::test_support::check_rule(&R003RunSQLCreateIndex, source)
     }
 
     #[test]

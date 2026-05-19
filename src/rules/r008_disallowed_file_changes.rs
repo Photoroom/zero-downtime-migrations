@@ -122,12 +122,12 @@ class Migration(migrations.Migration):
         let migrations = vec![&migration];
         let other_files = vec![Path::new("app/models.py"), Path::new("app/views.py")];
         let config = Config::default();
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("."),
-        };
-
-        let diagnostics = R008DisallowedFileChanges.check(&migrations, &other_files, &ctx);
+        let diagnostics = crate::rules::test_support::check_changeset_rule(
+            &R008DisallowedFileChanges,
+            &migrations,
+            &other_files,
+            &config,
+        );
 
         // No allowed patterns configured, all non-migration files are rejected
         assert_eq!(diagnostics.len(), 2);
@@ -142,12 +142,12 @@ class Migration(migrations.Migration):
             allowed_file_patterns: vec!["*.json".to_string()],
             ..Default::default()
         };
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("."),
-        };
-
-        let diagnostics = R008DisallowedFileChanges.check(&migrations, &other_files, &ctx);
+        let diagnostics = crate::rules::test_support::check_changeset_rule(
+            &R008DisallowedFileChanges,
+            &migrations,
+            &other_files,
+            &config,
+        );
 
         // *.py is not allowed, *.json is
         assert_eq!(diagnostics.len(), 1);
@@ -163,12 +163,12 @@ class Migration(migrations.Migration):
             allowed_file_patterns: vec!["*.json".to_string()],
             ..Default::default()
         };
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("."),
-        };
-
-        let diagnostics = R008DisallowedFileChanges.check(&migrations, &other_files, &ctx);
+        let diagnostics = crate::rules::test_support::check_changeset_rule(
+            &R008DisallowedFileChanges,
+            &migrations,
+            &other_files,
+            &config,
+        );
 
         assert!(diagnostics.is_empty());
     }
@@ -179,12 +179,12 @@ class Migration(migrations.Migration):
         let migrations = vec![&migration];
         let other_files: Vec<&Path> = vec![];
         let config = Config::default();
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("."),
-        };
-
-        let diagnostics = R008DisallowedFileChanges.check(&migrations, &other_files, &ctx);
+        let diagnostics = crate::rules::test_support::check_changeset_rule(
+            &R008DisallowedFileChanges,
+            &migrations,
+            &other_files,
+            &config,
+        );
 
         assert!(diagnostics.is_empty());
     }
@@ -197,12 +197,12 @@ class Migration(migrations.Migration):
             allowed_file_patterns: vec!["*.json".to_string()],
             ..Default::default()
         };
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("."),
-        };
-
-        let diagnostics = R008DisallowedFileChanges.check(&migrations, &other_files, &ctx);
+        let diagnostics = crate::rules::test_support::check_changeset_rule(
+            &R008DisallowedFileChanges,
+            &migrations,
+            &other_files,
+            &config,
+        );
 
         // No migrations changed, so no warning
         assert!(diagnostics.is_empty());
@@ -221,12 +221,12 @@ class Migration(migrations.Migration):
             allowed_file_patterns: vec!["*.json".to_string(), "*.yaml".to_string()],
             ..Default::default()
         };
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("."),
-        };
-
-        let diagnostics = R008DisallowedFileChanges.check(&migrations, &other_files, &ctx);
+        let diagnostics = crate::rules::test_support::check_changeset_rule(
+            &R008DisallowedFileChanges,
+            &migrations,
+            &other_files,
+            &config,
+        );
 
         // Only *.py should trigger
         assert_eq!(diagnostics.len(), 1);
@@ -242,12 +242,12 @@ class Migration(migrations.Migration):
             allowed_file_patterns: vec!["backend/media/models.py".to_string()],
             ..Default::default()
         };
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("."),
-        };
-
-        let diagnostics = R008DisallowedFileChanges.check(&migrations, &other_files, &ctx);
+        let diagnostics = crate::rules::test_support::check_changeset_rule(
+            &R008DisallowedFileChanges,
+            &migrations,
+            &other_files,
+            &config,
+        );
 
         assert!(diagnostics.is_empty());
     }
@@ -261,12 +261,12 @@ class Migration(migrations.Migration):
             allowed_file_patterns: vec!["backend/**/models.py".to_string()],
             ..Default::default()
         };
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("."),
-        };
-
-        let diagnostics = R008DisallowedFileChanges.check(&migrations, &other_files, &ctx);
+        let diagnostics = crate::rules::test_support::check_changeset_rule(
+            &R008DisallowedFileChanges,
+            &migrations,
+            &other_files,
+            &config,
+        );
 
         assert!(diagnostics.is_empty());
     }
@@ -280,12 +280,12 @@ class Migration(migrations.Migration):
             allowed_file_patterns: vec!["models.py".to_string()],
             ..Default::default()
         };
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("."),
-        };
-
-        let diagnostics = R008DisallowedFileChanges.check(&migrations, &other_files, &ctx);
+        let diagnostics = crate::rules::test_support::check_changeset_rule(
+            &R008DisallowedFileChanges,
+            &migrations,
+            &other_files,
+            &config,
+        );
 
         assert!(diagnostics.is_empty());
     }

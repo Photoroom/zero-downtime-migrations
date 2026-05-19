@@ -8,6 +8,9 @@
 //!
 //! Each rule implements either the `Rule` trait (per-file) or `ChangesetRule` trait.
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 mod r001_non_concurrent_add_index;
 mod r002_unique_constraint_without_index;
 mod r003_runsql_create_index;

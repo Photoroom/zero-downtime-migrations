@@ -134,10 +134,6 @@ fn normalize_index_column(column: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::MigrationExtractor;
-    use crate::config::Config;
-    use crate::parser::ParsedMigration;
-    use std::path::Path;
 
     const ADD_FK_EXISTING_MODEL_BAD: &str = r#"
 from django.db import migrations, models
@@ -233,15 +229,7 @@ class Migration(migrations.Migration):
 "#;
 
     fn check_migration(source: &str) -> Vec<Diagnostic> {
-        let parsed = ParsedMigration::parse(source).unwrap();
-        let extractor = MigrationExtractor::new(&parsed);
-        let migration = extractor.extract(Path::new("test.py")).unwrap();
-        let config = Config::default();
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("test.py"),
-        };
-        R006AddFieldForeignKey.check(&migration, &ctx)
+        crate::rules::test_support::check_rule(&R006AddFieldForeignKey, source)
     }
 
     #[test]
