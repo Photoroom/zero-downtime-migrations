@@ -99,73 +99,49 @@ impl Config {
     /// Returns `None` if no config file is found within those
     /// bounds.
     fn find_config_dir(start: &Path) -> Option<std::path::PathBuf> {
-        // First: a config file in `start` itself always wins, no
-        // walk-up needed.
-        if start.join("pyproject.toml").exists()
-            || start.join("zero-downtime-migrations.toml").exists()
-        {
+        // Three structural rules, in order:
+        //
+        //   (1) A config in `start` always wins — no walk-up needed.
+        //   (2) If `start` is itself the repo root (has its own
+        //       `.git`), we never climb. Otherwise a world-writable
+        //       `/tmp/zero-downtime-migrations.toml` next to a
+        //       temp-dir repo would be adopted as "the project
+        //       config". On Unix this case is also caught by
+        //       `anchor_dir_is_trusted`, but on Windows the trust
+        //       check is a no-op, so we need a structural guard
+        //       too.
+        //   (3) Otherwise, the walk-up only runs *inside* a
+        //       trusted git repository: there must be a `.git`-
+        //       bearing ancestor we own, strictly *above* `start`.
+        //       This authorises upward movement and pins its bounds.
+        //   (4) Walk upward from `start`, stopping at the first
+        //       directory that holds a config file, or at the
+        //       trusted anchor itself if no config is found before
+        //       reaching it.
+        //
+        // The trust check on the anchor is the security-critical
+        // piece — see `anchor_dir_is_trusted` for the world-
+        // writable `/tmp` threat model.
+        if has_config_file(start) {
             return Some(start.to_path_buf());
         }
-
-        // If `start` IS the repo root (has its own `.git`), we are
-        // already at the boundary — never walk into `start.parent()`,
-        // even if another `.git` exists further up. A world-writable
-        // `/tmp/zero-downtime-migrations.toml` next to a temp-dir
-        // repo would otherwise be adopted as "the project config";
-        // earlier this fix only blocked the no-`.git`-anywhere case
-        // and missed the `.git`-is-in-start case.
-        //
-        // `.git` can be a directory (regular repo) or a file
-        // (worktree / submodule with a gitdir pointer); accept
-        // either form as the stop signal.
         if start.join(".git").exists() {
             return None;
         }
 
-        // Preflight: is there a `.git` ancestor strictly above
-        // `start`? If not, we won't climb at all — the walk-up is
-        // only authorised inside a confirmed repository.
-        //
-        // Trust hardening (Unix only): the anchor directory must
-        // also be owned by the current effective uid. Without this
-        // check, an attacker with write access to a shared parent
-        // (the classic example: world-writable `/tmp` with sticky
-        // bit) can plant `/tmp/.git` and
-        // `/tmp/zero-downtime-migrations.toml`, then any zdm run
-        // from inside `/tmp/<victim>/...` adopts the hostile
-        // config — disabling rules, flipping warnings-as-errors,
-        // etc. The uid check rejects an anchor we don't own.
-        //
-        // On Windows ownership semantics differ (ACLs, no simple
-        // uid), so the check is a no-op there — the same threat
-        // model would need a Windows-specific guard.
-        let mut probe = start;
-        let mut have_git_anchor = false;
-        while let Some(parent) = probe.parent() {
-            if parent.join(".git").exists() && anchor_dir_is_trusted(parent) {
-                have_git_anchor = true;
-                break;
-            }
-            probe = parent;
-        }
-        if !have_git_anchor {
-            return None;
-        }
+        let anchor = trusted_git_anchor_strictly_above(start)?;
 
-        // Walk up looking for a config file, stopping at the
-        // `.git`-bearing directory.
         let mut current = start;
-        loop {
-            current = current.parent()?;
-            if current.join("pyproject.toml").exists()
-                || current.join("zero-downtime-migrations.toml").exists()
-            {
+        while let Some(parent) = current.parent() {
+            current = parent;
+            if has_config_file(current) {
                 return Some(current.to_path_buf());
             }
-            if current.join(".git").exists() {
+            if current == anchor {
                 return None;
             }
         }
+        None
     }
 
     /// Load whichever config files exist in a single directory,
@@ -260,6 +236,41 @@ impl Config {
             self.warnings_as_errors = true;
         }
     }
+}
+
+/// `true` iff a project config file lives directly in `dir`.
+/// `pyproject.toml` and the standalone `zero-downtime-migrations.toml`
+/// both count; precedence (standalone wins where both exist) is
+/// resolved at load time by `load_from_single_dir`, not here.
+fn has_config_file(dir: &Path) -> bool {
+    dir.join("pyproject.toml").exists() || dir.join("zero-downtime-migrations.toml").exists()
+}
+
+/// The closest directory *strictly above* `start` that holds a
+/// `.git` entry AND passes the trust check (see
+/// `anchor_dir_is_trusted`). `None` means the walk-up is not
+/// authorised — either we're not inside a git repo or the only
+/// `.git` we can see was planted by another user.
+///
+/// "Strictly above" is the important bit. If `start` itself holds
+/// `.git`, the function returns `None`: a config file next to a
+/// `.git`-bearing `start` was already handled by `find_config_dir`'s
+/// rule (1), so reaching this helper means we should not climb
+/// further. A world-writable `/tmp/zero-downtime-migrations.toml`
+/// next to a temp-dir repo would otherwise be adopted as "the
+/// project config" via `start.parent()`.
+///
+/// `.git` can be a directory (regular repo) or a file (worktree /
+/// submodule gitdir pointer); both forms count.
+fn trusted_git_anchor_strictly_above(start: &Path) -> Option<std::path::PathBuf> {
+    let mut probe = start;
+    while let Some(parent) = probe.parent() {
+        if parent.join(".git").exists() && anchor_dir_is_trusted(parent) {
+            return Some(parent.to_path_buf());
+        }
+        probe = parent;
+    }
+    None
 }
 
 /// On Unix: `true` iff `dir` exists and its owner uid matches the
