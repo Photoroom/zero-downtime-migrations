@@ -172,22 +172,18 @@ class Migration(migrations.Migration):
         // Previously R004 used `Span::default()` (line 1), so a
         // `# zdm: ignore R004` placed on or above the Migration class
         // line couldn't suppress the diagnostic — only line 1 worked.
-        // Anchor the span at the class definition instead.
-        let parsed = ParsedMigration::parse(CONCURRENT_NO_ATOMIC_BAD).unwrap();
-        let extractor = MigrationExtractor::new(&parsed);
-        let migration = extractor.extract(Path::new("test.py")).unwrap();
-        let config = Config::default();
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("test.py"),
-        };
-        let diagnostics = R004MissingAtomicFalse.check(&migration, &ctx);
-
+        // Anchor the span at the class definition instead, and pin
+        // that anchor by *deriving* the expected line from the
+        // fixture (rather than hard-coding `6`, which would force a
+        // test update on any whitespace tweak above the class).
+        let diagnostics = check_migration(CONCURRENT_NO_ATOMIC_BAD);
         assert_eq!(diagnostics.len(), 1);
-        // The fixture's `class Migration` starts on line 6 of the source
-        // (the raw string starts with a leading newline, then three import
-        // lines, two blank lines, then the class).
-        assert_eq!(diagnostics[0].span.start_line, 6);
+        let class_line = CONCURRENT_NO_ATOMIC_BAD
+            .lines()
+            .position(|l| l.trim_start().starts_with("class Migration"))
+            .map(|i| i + 1)
+            .expect("fixture contains `class Migration`");
+        assert_eq!(diagnostics[0].span.start_line, class_line);
     }
 
     const SUPPRESSED_ABOVE_CLASS: &str = r#"

@@ -6,7 +6,7 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
 use predicates::prelude::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Helper to create a command for the `zdm` binary
 fn zdm() -> Command {
@@ -22,6 +22,79 @@ fn fixtures_dir() -> &'static Path {
 fn fixtures_root() -> &'static Path {
     Path::new("tests/fixtures")
 }
+
+/// Lint `fixture` with `--output-format json` and assert that
+/// exactly `expected_count` diagnostics with rule_id `rule_id`
+/// fired on a file whose path's last segment matches the
+/// fixture's basename. Replaces the previous shape
+/// (`.code(1).stdout(contains("R001"))`) which would have
+/// silently accepted double-firing, firing on the wrong line,
+/// or firing on the wrong file.
+fn assert_fixture_fires(fixture: &Path, rule_id: &str, expected_count: usize) {
+    let output = zdm()
+        .arg(fixture)
+        .arg("--output-format")
+        .arg("json")
+        .assert()
+        .failure()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value =
+        serde_json::from_slice(&output).expect("expected valid JSON output");
+    let diagnostics = json
+        .get("diagnostics")
+        .and_then(|d| d.as_array())
+        .expect("`diagnostics` array");
+    let basename = fixture
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("fixture has a basename");
+    let matching: Vec<&serde_json::Value> = diagnostics
+        .iter()
+        .filter(|d| d.get("rule_id").and_then(|v| v.as_str()) == Some(rule_id))
+        .filter(|d| {
+            d.get("path")
+                .and_then(|v| v.as_str())
+                .is_some_and(|p| p.ends_with(basename))
+        })
+        .collect();
+    assert_eq!(
+        matching.len(),
+        expected_count,
+        "expected {expected_count} {rule_id} diagnostic(s) on {basename}, got {} (all: {diagnostics:?})",
+        matching.len(),
+    );
+}
+
+fn assert_pass_fixture_with_live_control(pass_fixture: &Path, fail_fixture: &Path, rule_id: &str) {
+    zdm().arg(pass_fixture).assert().success();
+    assert_fixture_fires(fail_fixture, rule_id, 1);
+}
+
+fn temp_migration_project() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(temp.path().join(".git")).unwrap();
+    let migrations_dir = temp.path().join("app").join("migrations");
+    std::fs::create_dir_all(&migrations_dir).unwrap();
+    std::fs::write(migrations_dir.join("__init__.py"), "").unwrap();
+    (temp, migrations_dir)
+}
+
+const R001_ADD_INDEX_TRIGGER: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(fields=['name'], name='product_name_idx'),
+        ),
+    ]
+"#;
 
 // =============================================================================
 // R001 Tests - Non-Concurrent AddIndex
@@ -42,39 +115,16 @@ fn e2e_r001_fail_non_concurrent_add_index() {
 
 #[test]
 fn e2e_r001_pass_concurrent_add_index() {
-    // Pass-only assertions like `.success().code(0)` are
-    // self-confirming: if the entire rule registry silently
-    // stopped emitting diagnostics on this fixture (or any
-    // fixture), the test would still pass. Pair every pass
-    // fixture with a sibling lint of the matching fail fixture
-    // to prove the rule is alive on this branch.
     let pass_fixture = fixtures_dir().join("R001/pass_concurrent_add_index.py");
-    zdm().arg(&pass_fixture).assert().success().code(0);
-
     let fail_fixture = fixtures_dir().join("R001/fail_non_concurrent_add_index.py");
-    zdm()
-        .arg(&fail_fixture)
-        .assert()
-        .failure()
-        .code(1)
-        .stdout(predicate::str::contains("R001"));
+    assert_pass_fixture_with_live_control(&pass_fixture, &fail_fixture, "R001");
 }
 
 #[test]
 fn e2e_r001_pass_add_index_on_new_model() {
-    // CreateModel exemption — adding index on newly created
-    // model is safe. Paired with the same fail-fixture sibling
-    // as above to defend against silent registry regressions.
     let pass_fixture = fixtures_dir().join("R001/pass_add_index_on_new_model.py");
-    zdm().arg(&pass_fixture).assert().success().code(0);
-
     let fail_fixture = fixtures_dir().join("R001/fail_non_concurrent_add_index.py");
-    zdm()
-        .arg(&fail_fixture)
-        .assert()
-        .failure()
-        .code(1)
-        .stdout(predicate::str::contains("R001"));
+    assert_pass_fixture_with_live_control(&pass_fixture, &fail_fixture, "R001");
 }
 
 // =============================================================================
@@ -83,19 +133,9 @@ fn e2e_r001_pass_add_index_on_new_model() {
 
 #[test]
 fn e2e_r010_pass_nullable_field() {
-    // Paired with the fail fixture (see e2e_r001 pass tests for
-    // rationale) so a silent registry regression on R010 can't
-    // pass this test by emitting nothing.
     let pass_fixture = fixtures_dir().join("R010/pass_nullable_field.py");
-    zdm().arg(&pass_fixture).assert().success().code(0);
-
     let fail_fixture = fixtures_dir().join("R010/fail_add_field_not_null.py");
-    zdm()
-        .arg(&fail_fixture)
-        .assert()
-        .failure()
-        .code(1)
-        .stdout(predicate::str::contains("R010"));
+    assert_pass_fixture_with_live_control(&pass_fixture, &fail_fixture, "R010");
 }
 
 #[test]
@@ -129,19 +169,9 @@ fn e2e_r016_fail_non_concurrent_remove_index() {
 
 #[test]
 fn e2e_r016_pass_concurrent_remove_index() {
-    // Paired with the fail fixture so a silent registry
-    // regression on R016 can't pass this test by emitting
-    // nothing.
     let pass_fixture = fixtures_dir().join("R016/pass_concurrent_remove_index.py");
-    zdm().arg(&pass_fixture).assert().success().code(0);
-
     let fail_fixture = fixtures_dir().join("R016/fail_remove_index_non_concurrent.py");
-    zdm()
-        .arg(&fail_fixture)
-        .assert()
-        .failure()
-        .code(1)
-        .stdout(predicate::str::contains("R016"));
+    assert_pass_fixture_with_live_control(&pass_fixture, &fail_fixture, "R016");
 }
 
 // =============================================================================
@@ -157,13 +187,7 @@ fn e2e_r016_pass_concurrent_remove_index() {
 #[test]
 fn e2e_r002_fail_unique_constraint() {
     let fixture = fixtures_dir().join("R002/fail_unique_constraint.py");
-
-    zdm()
-        .arg(&fixture)
-        .assert()
-        .failure()
-        .code(1)
-        .stdout(predicate::str::contains("R002"));
+    assert_fixture_fires(&fixture, "R002", 1);
 }
 
 #[test]
@@ -182,25 +206,13 @@ fn e2e_r003_fail_run_sql_create_index() {
 #[test]
 fn e2e_r006_fail_add_field_fk() {
     let fixture = fixtures_dir().join("R006/fail_add_field_fk.py");
-
-    zdm()
-        .arg(&fixture)
-        .assert()
-        .failure()
-        .code(1)
-        .stdout(predicate::str::contains("R006"));
+    assert_fixture_fires(&fixture, "R006", 1);
 }
 
 #[test]
 fn e2e_r011_fail_rename_field() {
     let fixture = fixtures_dir().join("R011/fail_rename_field.py");
-
-    zdm()
-        .arg(&fixture)
-        .assert()
-        .failure()
-        .code(1)
-        .stdout(predicate::str::contains("R011"));
+    assert_fixture_fires(&fixture, "R011", 1);
 }
 
 #[test]
@@ -214,7 +226,6 @@ fn e2e_r012_fail_run_python_irreversible() {
         .arg(&fixture)
         .assert()
         .success()
-        .code(0)
         .stdout(predicate::str::contains("R012"));
 }
 
@@ -256,15 +267,7 @@ fn e2e_oversized_file_is_rejected_with_parse_error_exit_code() {
     use std::io::Write;
     use zero_downtime_migrations::parser::MAX_FILE_SIZE;
 
-    let temp = tempfile::TempDir::new().unwrap();
-    // Plant `.git` so the config walk-up stays scoped to the temp
-    // dir. The current test only exercises parser-level rejection,
-    // but the boundary pin keeps it robust to future code paths
-    // that load config during single-file invocations.
-    std::fs::create_dir_all(temp.path().join(".git")).unwrap();
-    let migrations_dir = temp.path().join("app").join("migrations");
-    std::fs::create_dir_all(&migrations_dir).unwrap();
-    std::fs::write(migrations_dir.join("__init__.py"), "").unwrap();
+    let (_temp, migrations_dir) = temp_migration_project();
 
     let huge_path = migrations_dir.join("0001_huge.py");
     let mut file = File::create(&huge_path).unwrap();
@@ -309,7 +312,6 @@ fn e2e_r015_warns_alter_field_not_null() {
         .arg(&fixture)
         .assert()
         .success()
-        .code(0)
         .stdout(predicate::str::contains("R015"));
 }
 
@@ -397,8 +399,7 @@ fn e2e_ignore_rule_skips_detection() {
         .arg("--ignore")
         .arg("R001")
         .assert()
-        .success()
-        .code(0);
+        .success();
 }
 
 #[test]
@@ -425,8 +426,7 @@ fn e2e_select_rule_only_checks_that_rule() {
         .arg("--select")
         .arg("R002")
         .assert()
-        .success()
-        .code(0);
+        .success();
 }
 
 // =============================================================================
@@ -483,31 +483,9 @@ fn e2e_hostile_filename_with_newline_does_not_inject_fake_diagnostics() {
     // line shows up as `\x0a` and the user sees one logical line.
     use std::fs;
 
-    let temp = tempfile::TempDir::new().unwrap();
-    // Plant `.git` so the config walk-up doesn't escape into the
-    // host's pyproject.
-    fs::create_dir_all(temp.path().join(".git")).unwrap();
-    let migrations_dir = temp.path().join("app").join("migrations");
-    fs::create_dir_all(&migrations_dir).unwrap();
-    fs::write(migrations_dir.join("__init__.py"), "").unwrap();
-
-    // Write content that will trigger R001 to ensure the path
-    // appears in a diagnostic.
-    let trigger = r#"
-from django.db import migrations, models
-
-
-class Migration(migrations.Migration):
-
-    operations = [
-        migrations.AddIndex(
-            model_name='product',
-            index=models.Index(fields=['name'], name='product_name_idx'),
-        ),
-    ]
-"#;
+    let (temp, migrations_dir) = temp_migration_project();
     let hostile_path = migrations_dir.join("0001_hostile\n  --> /etc/passwd:1\nfake.py");
-    let write_result = fs::write(&hostile_path, trigger);
+    let write_result = fs::write(&hostile_path, R001_ADD_INDEX_TRIGGER);
     if let Err(e) = write_result {
         // Some filesystems (notably ZFS with utf8only=on, and
         // a handful of sandboxed CI runners) reject control
@@ -549,27 +527,10 @@ fn e2e_explicit_symlink_path_is_rejected_not_followed() {
     use std::fs;
     use std::os::unix::fs::symlink;
 
-    let temp = tempfile::TempDir::new().unwrap();
-    fs::create_dir_all(temp.path().join(".git")).unwrap();
-    let migrations_dir = temp.path().join("app").join("migrations");
-    fs::create_dir_all(&migrations_dir).unwrap();
-    fs::write(migrations_dir.join("__init__.py"), "").unwrap();
+    let (temp, migrations_dir) = temp_migration_project();
 
     let real_target = temp.path().join("secret_real.py");
-    let real_content = r#"
-from django.db import migrations, models
-
-
-class Migration(migrations.Migration):
-
-    operations = [
-        migrations.AddIndex(
-            model_name='product',
-            index=models.Index(fields=['name'], name='product_name_idx'),
-        ),
-    ]
-"#;
-    fs::write(&real_target, real_content).unwrap();
+    fs::write(&real_target, R001_ADD_INDEX_TRIGGER).unwrap();
 
     let symlink_path = migrations_dir.join("0001_link.py");
     symlink(&real_target, &symlink_path).unwrap();
@@ -607,25 +568,13 @@ class Migration(migrations.Migration):
 #[test]
 fn e2e_r004_fail_concurrent_without_atomic_false() {
     let fixture = fixtures_dir().join("R004/fail_concurrent_without_atomic_false.py");
-
-    zdm()
-        .arg(&fixture)
-        .assert()
-        .failure()
-        .code(1)
-        .stdout(predicate::str::contains("R004"));
+    assert_fixture_fires(&fixture, "R004", 1);
 }
 
 #[test]
 fn e2e_r005_fail_remove_field_without_separate() {
     let fixture = fixtures_dir().join("R005/fail_remove_field_without_separate.py");
-
-    zdm()
-        .arg(&fixture)
-        .assert()
-        .failure()
-        .code(1)
-        .stdout(predicate::str::contains("R005"));
+    assert_fixture_fires(&fixture, "R005", 1);
 }
 
 #[test]
@@ -639,7 +588,6 @@ fn e2e_r013_fail_irreversible_run_sql() {
         .arg(&fixture)
         .assert()
         .success()
-        .code(0)
         .stdout(predicate::str::contains("R013"))
         .stdout(predicate::str::contains("warning"));
 }
@@ -647,11 +595,5 @@ fn e2e_r013_fail_irreversible_run_sql() {
 #[test]
 fn e2e_r017_fail_check_constraint() {
     let fixture = fixtures_dir().join("R017/fail_check_constraint.py");
-
-    zdm()
-        .arg(&fixture)
-        .assert()
-        .failure()
-        .code(1)
-        .stdout(predicate::str::contains("R017"));
+    assert_fixture_fires(&fixture, "R017", 1);
 }

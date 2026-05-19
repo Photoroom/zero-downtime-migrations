@@ -190,7 +190,15 @@ class Migration(migrations.Migration):
         let temp = TempDir::new().unwrap();
         fs::create_dir_all(temp.path().join(".git")).unwrap();
 
-        zdm().arg(temp.path()).assert().success().code(0);
+        // Pin "no migrations" produces empty stdout — a future
+        // change that surfaces an "scanned 0 files" line would
+        // change observable behaviour and should fail this test.
+        zdm()
+            .arg(temp.path())
+            .assert()
+            .success()
+            .code(0)
+            .stdout(predicate::str::is_empty());
     }
 }
 
@@ -707,14 +715,33 @@ class Migration(migrations.Migration):
     fn select_multiple_rules() {
         let temp = setup_migrations(&[("0001_multi.py", MIGRATION_WITH_MULTIPLE_ISSUES)]);
 
-        zdm()
+        // Substring-only assertions would silently pass if a
+        // third rule erroneously fired alongside R001 and R016;
+        // pin the count via JSON.
+        let output = zdm()
             .arg(temp.path())
             .arg("--select")
             .arg("R001,R016")
+            .arg("--output-format")
+            .arg("json")
             .assert()
             .failure()
-            .stdout(predicate::str::contains("R001"))
-            .stdout(predicate::str::contains("R016"));
+            .get_output()
+            .stdout
+            .clone();
+        let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let ids: Vec<&str> = json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["rule_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"R001"));
+        assert!(ids.contains(&"R016"));
+        assert!(
+            ids.iter().all(|id| matches!(*id, "R001" | "R016")),
+            "no rule other than R001/R016 should fire, got {ids:?}",
+        );
     }
 
     #[test]
