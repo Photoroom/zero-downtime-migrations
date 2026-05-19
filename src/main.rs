@@ -200,43 +200,56 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
-/// Print every rule the binary recognises, sorted by ID, with its
-/// name and severity. One row per rule, columns separated by two
-/// spaces — easy to grep and reasonable to read.
-fn list_rules() -> Result<ExitCode> {
+/// Every (id, name, severity, description) tuple across both
+/// registries. Deduplicated and sorted by ID so the rule
+/// catalogue is stable across invocations. Used by both
+/// `--list-rules` and `rule <id>` (and the latter's "unknown
+/// rule: did you mean…" suggestion list), so the three call
+/// sites can't drift apart.
+fn all_rule_metadata() -> Vec<(String, String, Severity, String)> {
     let registry = RuleRegistry::new();
     let changeset_registry = ChangesetRuleRegistry::new();
-
-    let mut rows: Vec<(String, String, String)> = registry
+    let mut rows: Vec<(String, String, Severity, String)> = registry
         .rules()
         .iter()
         .map(|r| {
             (
                 r.id().to_string(),
                 r.name().to_string(),
-                format!("{:?}", r.severity()),
+                r.severity(),
+                r.description().to_string(),
             )
         })
         .chain(changeset_registry.rules().iter().map(|r| {
             (
                 r.id().to_string(),
                 r.name().to_string(),
-                format!("{:?}", r.severity()),
+                r.severity(),
+                r.description().to_string(),
             )
         }))
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     rows.dedup_by(|a, b| a.0 == b.0);
+    rows
+}
 
-    // Width the ID and severity columns so the name column lines up.
-    let id_width = rows.iter().map(|r| r.0.len()).max().unwrap_or(4);
-    let sev_width = rows.iter().map(|r| r.2.len()).max().unwrap_or(7);
+/// Print every rule the binary recognises, sorted by ID, with
+/// its name and severity. One row per rule.
+fn list_rules() -> Result<ExitCode> {
+    let rows = all_rule_metadata();
+    let id_width = rows.iter().map(|(id, ..)| id.len()).max().unwrap_or(4);
+    let sev_width = rows
+        .iter()
+        .map(|(_, _, sev, _)| format!("{sev:?}").len())
+        .max()
+        .unwrap_or(7);
 
-    for (id, name, sev) in &rows {
+    for (id, name, sev, _) in &rows {
         println!(
             "{:<id_width$}  {:<sev_width$}  {}",
             id.bold().cyan(),
-            sev,
+            format!("{sev:?}"),
             name,
             id_width = id_width,
             sev_width = sev_width,
@@ -247,26 +260,13 @@ fn list_rules() -> Result<ExitCode> {
 }
 
 fn run_rule_command(rule_id: &str) -> Result<ExitCode> {
-    let registry = RuleRegistry::new();
-    let changeset_registry = ChangesetRuleRegistry::new();
-
-    // Check per-file rules
-    if let Some(rule) = registry.get(rule_id) {
-        println!("{}", rule_id.bold().cyan());
-        println!("{}: {}", "Name".bold(), rule.name());
-        println!("{}: {:?}", "Severity".bold(), rule.severity());
+    let rows = all_rule_metadata();
+    if let Some((id, name, severity, description)) = rows.iter().find(|(id, ..)| id == rule_id) {
+        println!("{}", id.bold().cyan());
+        println!("{}: {}", "Name".bold(), name);
+        println!("{}: {:?}", "Severity".bold(), severity);
         println!();
-        println!("{}", rule.description());
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    // Check changeset rules
-    if let Some(rule) = changeset_registry.get(rule_id) {
-        println!("{}", rule_id.bold().cyan());
-        println!("{}: {}", "Name".bold(), rule.name());
-        println!("{}: {:?}", "Severity".bold(), rule.severity());
-        println!();
-        println!("{}", rule.description());
+        println!("{}", description);
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -276,19 +276,7 @@ fn run_rule_command(rule_id: &str) -> Result<ExitCode> {
     // rule: X" line. The error carries the sorted list of valid rule
     // IDs so the user gets actionable feedback instead of having to
     // grep the docs.
-    let mut available: Vec<String> = registry
-        .rules()
-        .iter()
-        .map(|r| r.id().to_string())
-        .chain(
-            changeset_registry
-                .rules()
-                .iter()
-                .map(|r| r.id().to_string()),
-        )
-        .collect();
-    available.sort();
-    available.dedup();
+    let available: Vec<String> = rows.into_iter().map(|(id, ..)| id).collect();
     Err(Error::unknown_rule(rule_id, available))
 }
 
