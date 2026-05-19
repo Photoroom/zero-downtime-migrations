@@ -1,0 +1,8 @@
+PostgreSQL has no NOT VALID form for EXCLUDE constraints, and `ALTER TABLE ... ADD CONSTRAINT ... EXCLUDE USING gist` always builds its own index under ACCESS EXCLUSIVE — `USING INDEX` is accepted only for UNIQUE and PRIMARY KEY, not EXCLUDE.
+
+There is no fully-online path in stock PostgreSQL. Mitigations:
+  - Defer the migration to a low-traffic window.
+  - Define the constraint at table creation (CreateModel) if the table is new.
+  - Enforce the rule with a trigger instead of a constraint while the table is live.
+
+If you accept the lock anyway, run with `atomic = False` and `SET lock_timeout` so a queued reader doesn't block all writes indefinitely.

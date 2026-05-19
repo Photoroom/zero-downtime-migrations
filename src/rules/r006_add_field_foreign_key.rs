@@ -119,23 +119,7 @@ impl Rule for R006AddFieldForeignKey {
                 severity: self.severity(),
                 path: ctx.path.to_path_buf(),
                 span: op.span,
-                help: Some(
-                    "Either pre-create the index with AddIndexConcurrently \
-                     (in the same migration, *before* the AddField), or split \
-                     the operation via SeparateDatabaseAndState: add the column \
-                     without the FK constraint first, backfill, then add the \
-                     constraint.\n\n\
-                     The exemption requires a plain btree index whose first \
-                     column matches the FK. A `condition=` (partial), \
-                     `opclasses=` (non-btree), or expression-based index won't \
-                     satisfy the FK enforcement lookup even if its leading \
-                     column matches — zdm currently can't detect those \
-                     attributes, so a partial concurrent index on the FK \
-                     column will be accepted as the exemption. Use a plain \
-                     index, or accept that R006 might fire even when an \
-                     exotic index exists."
-                        .to_string(),
-                ),
+                help: Some(include_str!("help/r006_add_fk.txt").to_string()),
             });
         });
 

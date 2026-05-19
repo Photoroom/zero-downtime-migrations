@@ -52,41 +52,15 @@ impl Rule for R002UniqueConstraintWithoutIndex {
             }
 
             diagnostics.push(Diagnostic {
-                        rule_id: self.id(),
-                        rule_name: self.name(),
-                        message: "AddConstraint with UniqueConstraint locks the table while it builds the index"
-                            .to_string(),
-                        severity: self.severity(),
-                        path: ctx.path.to_path_buf(),
-                        span: op.span,
-                        help: Some(
-                            "Django's AddConstraint cannot reuse a pre-built index. \
-                             To avoid the lock, build the index concurrently first and \
-                             attach it via two RunSQL operations, wrapped in \
-                             SeparateDatabaseAndState so Django's model state still \
-                             records the constraint (otherwise the next `makemigrations` \
-                             regenerates this AddConstraint and re-introduces the lock):\n\
-                             \n  \
-                             SeparateDatabaseAndState(\n      \
-                                 state_operations=[\n          \
-                                     migrations.AddConstraint(\n              \
-                                         model_name='<table>',\n              \
-                                         constraint=models.UniqueConstraint(fields=[<cols>], name='<name>'),\n          \
-                                     ),\n      \
-                                 ],\n      \
-                                 database_operations=[\n          \
-                                     migrations.RunSQL('CREATE UNIQUE INDEX CONCURRENTLY <name> ON <table> (<cols>);'),\n          \
-                                     migrations.RunSQL('ALTER TABLE <table> ADD CONSTRAINT <name> UNIQUE USING INDEX <name>;'),\n      \
-                                 ],\n  \
-                             )\n\
-                             \n\
-                             Two RunSQL operations are required because \
-                             `CREATE INDEX CONCURRENTLY` must run outside a transaction; \
-                             bundling both statements in one RunSQL would still be a single \
-                             transaction. Set `atomic = False` on the migration so RunSQL \
-                             doesn't open one."
-                                .to_string(),
-                        ),
+                rule_id: self.id(),
+                rule_name: self.name(),
+                message:
+                    "AddConstraint with UniqueConstraint locks the table while it builds the index"
+                        .to_string(),
+                severity: self.severity(),
+                path: ctx.path.to_path_buf(),
+                span: op.span,
+                help: Some(include_str!("help/r002_unique_constraint.txt").to_string()),
             });
         });
 

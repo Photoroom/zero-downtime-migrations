@@ -1,0 +1,3 @@
+Use RunSQL to add the constraint with NOT VALID, then validate in a separate migration:
+  ALTER TABLE ... ADD CONSTRAINT <name> CHECK (...) NOT VALID;
+  ALTER TABLE ... VALIDATE CONSTRAINT <name>;  -- table-scan without blocking writes

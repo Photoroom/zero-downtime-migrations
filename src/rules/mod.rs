@@ -190,7 +190,6 @@ impl RuleRegistry {
         };
 
         let mut diagnostics = Vec::new();
-
         for rule in self.enabled_rules(config) {
             let mut rule_diagnostics = rule.check(migration, &ctx);
 
@@ -200,19 +199,27 @@ impl RuleRegistry {
                 !migration.is_rule_suppressed_at(d.rule_id, d.span.start_line, d.span.end_line)
             });
 
-            // Apply warnings_as_errors
-            if config.warnings_as_errors {
-                for diag in &mut rule_diagnostics {
-                    if diag.severity == Severity::Warning {
-                        diag.severity = Severity::Error;
-                    }
-                }
-            }
-
+            apply_warnings_as_errors(&mut rule_diagnostics, config);
             diagnostics.extend(rule_diagnostics);
         }
 
         diagnostics
+    }
+}
+
+/// Promote every `Warning` to `Error` if `config.warnings_as_errors`
+/// is set. Shared post-processing between `RuleRegistry::check` and
+/// `ChangesetRuleRegistry::check` — both registries used to have a
+/// hand-rolled copy of the same loop, and a future severity tweak
+/// would have needed two edits.
+fn apply_warnings_as_errors(diagnostics: &mut [Diagnostic], config: &Config) {
+    if !config.warnings_as_errors {
+        return;
+    }
+    for diag in diagnostics {
+        if diag.severity == Severity::Warning {
+            diag.severity = Severity::Error;
+        }
     }
 }
 
@@ -295,15 +302,7 @@ impl ChangesetRuleRegistry {
                     }
                 });
 
-                // Apply warnings_as_errors
-                if config.warnings_as_errors {
-                    for diag in &mut rule_diagnostics {
-                        if diag.severity == Severity::Warning {
-                            diag.severity = Severity::Error;
-                        }
-                    }
-                }
-
+                apply_warnings_as_errors(&mut rule_diagnostics, config);
                 diagnostics.extend(rule_diagnostics);
             }
         }

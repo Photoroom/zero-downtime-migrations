@@ -61,30 +61,13 @@ impl Rule for R017NonConcurrentAddConstraint {
             let (message, help) = match data.constraint_type {
                 ConstraintType::Check => (
                     "AddConstraint with a CHECK constraint validates all rows".to_string(),
-                    "Use RunSQL to add the constraint with NOT VALID, then validate \
-                     in a separate migration:\n  \
-                     ALTER TABLE ... ADD CONSTRAINT <name> CHECK (...) NOT VALID;\n  \
-                     ALTER TABLE ... VALIDATE CONSTRAINT <name>;  -- table-scan without blocking writes"
-                        .to_string(),
+                    include_str!("help/r017_check_constraint.txt").to_string(),
                 ),
                 ConstraintType::Exclusion => (
                     "AddConstraint with an EXCLUDE constraint builds its index \
                      non-concurrently, locking the table"
                         .to_string(),
-                    "PostgreSQL has no NOT VALID form for EXCLUDE constraints, and \
-                     `ALTER TABLE ... ADD CONSTRAINT ... EXCLUDE USING gist` always \
-                     builds its own index under ACCESS EXCLUSIVE — `USING INDEX` is \
-                     accepted only for UNIQUE and PRIMARY KEY, not EXCLUDE.\n\n\
-                     There is no fully-online path in stock PostgreSQL. Mitigations:\n  \
-                     - Defer the migration to a low-traffic window.\n  \
-                     - Define the constraint at table creation (CreateModel) if the \
-                     table is new.\n  \
-                     - Enforce the rule with a trigger instead of a constraint while \
-                     the table is live.\n\n\
-                     If you accept the lock anyway, run with `atomic = False` and \
-                     `SET lock_timeout` so a queued reader doesn't block all writes \
-                     indefinitely."
-                        .to_string(),
+                    include_str!("help/r017_exclusion_constraint.txt").to_string(),
                 ),
                 _ => return,
             };
