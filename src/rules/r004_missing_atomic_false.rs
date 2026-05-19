@@ -149,7 +149,7 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn test_concurrent_no_atomic_bad() {
+    fn test_addindexconcurrently_without_atomic_false_is_flagged() {
         let diagnostics = check_migration(CONCURRENT_NO_ATOMIC_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R004");

@@ -98,7 +98,7 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn test_irreversible_run_python_warns() {
+    fn test_runpython_without_reverse_code_is_flagged() {
         let diagnostics = check_migration(IRREVERSIBLE_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R012");

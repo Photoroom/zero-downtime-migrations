@@ -75,7 +75,7 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn test_rename_field_warns() {
+    fn test_renamefield_is_flagged() {
         let diagnostics = check_migration(RENAME_FIELD_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R011");

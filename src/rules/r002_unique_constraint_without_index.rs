@@ -126,7 +126,7 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn test_unique_constraint_bad() {
+    fn test_addconstraint_unique_on_existing_model_is_flagged() {
         let diagnostics = check_migration(UNIQUE_CONSTRAINT_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R002");

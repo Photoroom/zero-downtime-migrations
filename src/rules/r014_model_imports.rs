@@ -97,7 +97,7 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn test_model_import_bad() {
+    fn test_direct_model_class_import_is_flagged() {
         let diagnostics = check_migration(MODEL_IMPORT_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R014");

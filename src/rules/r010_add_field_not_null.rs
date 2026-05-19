@@ -140,7 +140,7 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn test_not_null_no_default_bad() {
+    fn test_addfield_notnull_without_default_is_flagged() {
         let diagnostics = check_migration(NOT_NULL_NO_DEFAULT_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R010");

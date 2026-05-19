@@ -123,7 +123,7 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn test_runsql_create_index_bad() {
+    fn test_runsql_create_index_without_concurrently_is_flagged() {
         let diagnostics = check_migration(RUNSQL_CREATE_INDEX_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R003");
