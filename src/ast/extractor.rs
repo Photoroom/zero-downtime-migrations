@@ -14,55 +14,74 @@ use crate::diagnostics::Span;
 use crate::error::Result;
 use crate::parser::ParsedMigration;
 
-/// Check if `text` contains a `keyword=value` assignment that sits at a
-/// keyword-argument boundary inside a call. Both `null=True` and
-/// `null = True` match, but `not_null=True` (no boundary before) and
-/// `null=Truthy` (no boundary after the value) do not.
-fn contains_keyword_assignment(text: &str, keyword: &str, value: &str) -> bool {
-    let normalized = strip_whitespace(text);
-    let value_bytes = value.as_bytes();
-    for after_eq in keyword_eq_positions(&normalized, keyword) {
-        if !normalized[after_eq..].starts_with(value_bytes) {
-            continue;
-        }
-        let next = normalized
-            .get(after_eq + value_bytes.len())
-            .copied()
-            .unwrap_or(b')');
-        if matches!(next, b',' | b')') {
-            return true;
+/// Map the source text of a `models.<Type>(...)` call expression
+/// to a Django field-type label. The list is the closed set of
+/// types any rule currently inspects; an unrecognised call (a
+/// user-defined field class, a third-party field) becomes
+/// "Unknown" so no rule fires on it spuriously.
+fn classify_field_call(call_text: &str) -> &'static str {
+    const KNOWN: &[&str] = &[
+        "ForeignKey",
+        "CharField",
+        "IntegerField",
+        "BooleanField",
+        "TextField",
+    ];
+    KNOWN
+        .iter()
+        .find(|t| call_text.contains(*t))
+        .copied()
+        .unwrap_or("Unknown")
+}
+
+/// `true` if the `models.<Type>(...)` call rooted at `value` has
+/// a `keyword=expected` kwarg. Descends the tree-sitter AST so
+/// `null=True`, `null = True`, and `null=\nTrue` all match,
+/// and `null_field=True` doesn't accidentally fire.
+fn field_kwarg_equals(
+    ex: &MigrationExtractor<'_>,
+    value: Node<'_>,
+    keyword: &str,
+    expected: &str,
+) -> bool {
+    field_call_kwargs(value).any(|kw| {
+        kw.child_by_field_name("name")
+            .is_some_and(|n| ex.node_text(n) == keyword)
+            && kw
+                .child_by_field_name("value")
+                .is_some_and(|v| ex.node_text(v).trim() == expected)
+    })
+}
+
+/// `true` if the `models.<Type>(...)` call rooted at `value` has
+/// a `keyword=<anything>` kwarg. Same AST-walking shape as
+/// [`field_kwarg_equals`] but ignores the value.
+fn field_has_kwarg(ex: &MigrationExtractor<'_>, value: Node<'_>, keyword: &str) -> bool {
+    field_call_kwargs(value).any(|kw| {
+        kw.child_by_field_name("name")
+            .is_some_and(|n| ex.node_text(n) == keyword)
+    })
+}
+
+/// Iterate the `keyword_argument` children of the `arguments`
+/// list inside a call expression. Walks into `value`'s
+/// `arguments` field if `value` is a call (the normal case:
+/// `value = models.CharField(...)`); otherwise yields nothing.
+fn field_call_kwargs(value: Node<'_>) -> impl Iterator<Item = Node<'_>> {
+    let args = if value.kind() == "call" {
+        value.child_by_field_name("arguments")
+    } else {
+        None
+    };
+    let mut children: Vec<Node<'_>> = Vec::new();
+    if let Some(args) = args {
+        for child in args.children(&mut args.walk()) {
+            if child.kind() == "keyword_argument" {
+                children.push(child);
+            }
         }
     }
-    false
-}
-
-/// Check if `text` contains `keyword=...` where `keyword` is a complete
-/// kwarg name (preceded by `(`, `,`, or start of text).
-fn contains_keyword_with_value(text: &str, keyword: &str) -> bool {
-    let normalized = strip_whitespace(text);
-    !keyword_eq_positions(&normalized, keyword).is_empty()
-}
-
-/// Indices in `normalized` just after each `<keyword>=` whose keyword sits
-/// at a kwarg boundary (preceded by `(`, `,`, or start of text).
-fn keyword_eq_positions(normalized: &[u8], keyword: &str) -> Vec<usize> {
-    let kw_eq: Vec<u8> = keyword.bytes().chain(std::iter::once(b'=')).collect();
-    let mut hits = Vec::new();
-    for i in 0..normalized.len() {
-        if !normalized[i..].starts_with(&kw_eq) {
-            continue;
-        }
-        let prev = if i == 0 { b'(' } else { normalized[i - 1] };
-        if !matches!(prev, b'(' | b',') {
-            continue;
-        }
-        hits.push(i + kw_eq.len());
-    }
-    hits
-}
-
-fn strip_whitespace(text: &str) -> Vec<u8> {
-    text.bytes().filter(|b| !b.is_ascii_whitespace()).collect()
+    children.into_iter()
 }
 
 /// Parse a `# zdm: ignore RXXX[, RYYY]` comment into its rule-ID set,
@@ -338,9 +357,6 @@ impl<'a> MigrationExtractor<'a> {
         ModelOperation {
             name: name.unwrap_or_default(),
             old_name: None,
-            // Field extraction not implemented: no current rules need CreateModel field details.
-            // The CreateModel exemption logic uses model name matching, not field inspection.
-            fields: vec![],
         }
     }
 
@@ -364,51 +380,20 @@ impl<'a> MigrationExtractor<'a> {
     }
 
     /// Extract field info from a field argument.
+    ///
+    /// The shape is `migrations.AddField(field=models.CharField(...))`
+    /// (or `ForeignKey`, `IntegerField`, etc.). We find the
+    /// `field=` kwarg, then descend the `models.<Type>(...)`
+    /// call to read its `null=` and `default=` kwargs from the
+    /// AST directly — no raw-text scanning, no keyword-boundary
+    /// gymnastics on a normalised byte buffer.
     fn extract_field_info(&self, args: Node) -> Option<FieldInfo> {
-        for child in args.children(&mut args.walk()) {
-            if child.kind() == "keyword_argument" {
-                if let Some(name) = child.child_by_field_name("name") {
-                    if self.node_text(name) == "field" {
-                        if let Some(value) = child.child_by_field_name("value") {
-                            let raw_text = self.node_text(value).to_string();
-
-                            // Determine field type
-                            let field_type = if raw_text.contains("ForeignKey") {
-                                "ForeignKey".to_string()
-                            } else if raw_text.contains("CharField") {
-                                "CharField".to_string()
-                            } else if raw_text.contains("IntegerField") {
-                                "IntegerField".to_string()
-                            } else if raw_text.contains("BooleanField") {
-                                "BooleanField".to_string()
-                            } else if raw_text.contains("TextField") {
-                                "TextField".to_string()
-                            } else {
-                                "Unknown".to_string()
-                            };
-
-                            // Check nullable (handles whitespace: null=True, null = True)
-                            let is_nullable =
-                                contains_keyword_assignment(&raw_text, "null", "True");
-
-                            // Check default (handles whitespace: default=, default =)
-                            let has_default = contains_keyword_with_value(&raw_text, "default");
-
-                            return Some(FieldInfo {
-                                field_type,
-                                is_nullable,
-                                has_default,
-                                // FK target extraction not implemented: R006 only needs to know
-                                // a field is a ForeignKey, not which model it references.
-                                references: None,
-                                raw_text,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        None
+        let value = self.get_keyword_arg_value(args, "field")?;
+        Some(FieldInfo {
+            field_type: classify_field_call(self.node_text(value)).to_string(),
+            is_nullable: field_kwarg_equals(self, value, "null", "True"),
+            has_default: field_has_kwarg(self, value, "default"),
+        })
     }
 
     /// Extract constraint operation data.
@@ -1149,72 +1134,6 @@ class Migration(migrations.Migration):
         } else {
             panic!("Expected RunPython data");
         }
-    }
-
-    #[test]
-    fn test_contains_keyword_assignment() {
-        // Whitespace variants of the positive case.
-        assert!(contains_keyword_assignment("null=True", "null", "True"));
-        assert!(contains_keyword_assignment("null = True", "null", "True"));
-        assert!(contains_keyword_assignment("null  =  True", "null", "True"));
-        assert!(contains_keyword_assignment(
-            "field(null = True)",
-            "null",
-            "True"
-        ));
-
-        // Wrong value.
-        assert!(!contains_keyword_assignment("null=False", "null", "True"));
-
-        // Lookalike keywords. The old substring-only implementation matched
-        // these because, after stripping whitespace, "nullable=True" /
-        // "not_null=True" each contain the substring "null=True".
-        assert!(!contains_keyword_assignment(
-            "nullable=True",
-            "null",
-            "True"
-        ));
-        assert!(!contains_keyword_assignment(
-            "models.CharField(not_null=True)",
-            "null",
-            "True"
-        ));
-
-        // Lookalike values: "True" appearing as a prefix of "Truthy".
-        assert!(!contains_keyword_assignment(
-            "models.CharField(null=Truthy)",
-            "null",
-            "True"
-        ));
-
-        // Real usage with surrounding kwargs.
-        assert!(contains_keyword_assignment(
-            "models.CharField(max_length=50, null=True, default='x')",
-            "null",
-            "True"
-        ));
-    }
-
-    #[test]
-    fn test_contains_keyword_with_value() {
-        assert!(contains_keyword_with_value("default='foo'", "default"));
-        assert!(contains_keyword_with_value("default = 'foo'", "default"));
-        assert!(contains_keyword_with_value("default=None", "default"));
-        assert!(!contains_keyword_with_value("no_default_here", "default"));
-
-        // Lookalike keyword: "my_default=5" should not match the keyword
-        // "default" because `default` is not at a kwarg boundary.
-        assert!(!contains_keyword_with_value("my_default=5", "default"));
-        assert!(!contains_keyword_with_value(
-            "models.CharField(my_default=5)",
-            "default"
-        ));
-
-        // Real usage.
-        assert!(contains_keyword_with_value(
-            "models.CharField(max_length=50, default='x')",
-            "default"
-        ));
     }
 
     const FIELD_WITH_WHITESPACE_NULLABLE: &str = r#"

@@ -13,7 +13,7 @@ use zero_downtime_migrations::config::Config;
 use zero_downtime_migrations::diagnostics::{Diagnostic, Severity};
 use zero_downtime_migrations::discovery;
 use zero_downtime_migrations::error::{Error, Result};
-use zero_downtime_migrations::git::GitRepo;
+use zero_downtime_migrations::git::{ChangedKind, DiffSource, GitRepo};
 use zero_downtime_migrations::rules::{ChangesetRuleRegistry, RuleRegistry};
 
 /// Zero-Downtime Migrations - A PostgreSQL migration safety linter for Django
@@ -313,20 +313,19 @@ fn discover_migrations(
         // In diff mode, get changed migrations from git
         let repo = GitRepo::open(Path::new("."))?;
         let migrations = match diff_mode {
-            DiffMode::Head { base_ref } => repo.changed_migration_paths(base_ref)?,
-            DiffMode::Staged { base_ref } => repo.changed_staged_migration_paths(base_ref)?,
+            DiffMode::Head { base_ref } => {
+                repo.changed_paths(base_ref, DiffSource::Head, ChangedKind::Migrations)?
+            }
+            DiffMode::Staged { base_ref } => {
+                repo.changed_paths(base_ref, DiffSource::Index, ChangedKind::Migrations)?
+            }
         };
 
         // Apply exclude patterns to diff mode as well
         if exclude_patterns.is_empty() {
             Ok(migrations)
         } else {
-            let patterns: Vec<glob::Pattern> = exclude_patterns
-                .iter()
-                .map(|p| {
-                    glob::Pattern::new(p).expect("exclude patterns are validated at config load")
-                })
-                .collect();
+            let patterns = compile_glob_patterns(exclude_patterns)?;
             Ok(migrations
                 .into_iter()
                 .filter(|p| {
@@ -341,11 +340,7 @@ fn discover_migrations(
         // For directories, use the migration pattern discovery
         let mut all_migrations = Vec::new();
 
-        // Compile exclude patterns once
-        let patterns: Vec<glob::Pattern> = exclude_patterns
-            .iter()
-            .map(|p| glob::Pattern::new(p).expect("exclude patterns are validated at config load"))
-            .collect();
+        let patterns = compile_glob_patterns(exclude_patterns)?;
 
         for path in paths {
             if !path.exists() {
@@ -385,14 +380,30 @@ fn discover_migrations(
     }
 }
 
+fn compile_glob_patterns(patterns: &[String]) -> Result<Vec<glob::Pattern>> {
+    patterns
+        .iter()
+        .map(|p| {
+            glob::Pattern::new(p).map_err(|e| Error::InvalidGlobPattern {
+                pattern: p.clone(),
+                message: e.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Returns repo-relative paths so changeset rules can match without
 /// touching the filesystem.
 fn discover_non_migration_files(diff_mode: DiffMode<'_>) -> Result<Vec<PathBuf>> {
     let repo = GitRepo::open(Path::new("."))?;
     let root = repo.root()?;
     let absolute = match diff_mode {
-        DiffMode::Head { base_ref } => repo.changed_non_migration_paths(base_ref)?,
-        DiffMode::Staged { base_ref } => repo.changed_staged_non_migration_paths(base_ref)?,
+        DiffMode::Head { base_ref } => {
+            repo.changed_paths(base_ref, DiffSource::Head, ChangedKind::NonMigrations)?
+        }
+        DiffMode::Staged { base_ref } => {
+            repo.changed_paths(base_ref, DiffSource::Index, ChangedKind::NonMigrations)?
+        }
     };
     Ok(absolute
         .into_iter()
@@ -441,29 +452,8 @@ fn output_diagnostics(diagnostics: &[Diagnostic], format: &OutputFormat) {
     }
 }
 
-/// What kind of value we're sanitizing, which controls newline
-/// handling. Everything else (control chars 0x00–0x1F minus
-/// whichever newlines are kept, plus 0x7F DEL) is always escaped
-/// to `\xHH`.
-///
-/// - `Multiline` is for help text and rule messages, where the
-///   author legitimately uses `\n` for layout. Tabs and CR are
-///   still escaped (a `\t`-heavy message would desync the compact
-///   format's column layout; a CR would let a hostile message
-///   repaint the prefix the renderer just printed).
-/// - `SingleLine` is for paths, error-chain strings, and anything
-///   else the renderer prints on a single line. Embedded `\n`
-///   would inject fake diagnostic lines into stderr (a POSIX
-///   filename can contain newlines, and the default and compact
-///   formats both interpolate the path unescaped).
-///
-/// Out of scope on either policy: dangerous Unicode codepoints
-/// (bidi-override U+202E, zero-width joiner, line/paragraph
-/// separators U+2028/U+2029). Rule messages legitimately contain
-/// em-dashes and smart quotes, so a blanket non-ASCII escape would
-/// mangle them. JSON output is already safe — `serde_json`
-/// escapes 0x00–0x1F by default — so this sanitizer is for the
-/// human-facing renderers only.
+/// Controls whether literal newlines are preserved while escaping
+/// terminal control characters for human-readable output.
 #[derive(Debug, Clone, Copy)]
 enum SanitizePolicy {
     Multiline,
@@ -484,9 +474,6 @@ fn sanitize_text(s: &str, policy: SanitizePolicy) -> String {
     out
 }
 
-/// Render a path for terminal display, escaping control
-/// characters in case the filename itself is hostile (Unix
-/// allows ESC, BEL, CR, and even `\n` in filenames).
 fn sanitize_path(path: &std::path::Path) -> String {
     sanitize_text(&path.display().to_string(), SanitizePolicy::SingleLine)
 }
@@ -498,11 +485,6 @@ fn output_default(diagnostics: &[Diagnostic]) {
             Severity::Warning => "warning".yellow().bold(),
         };
 
-        // Messages are single-line by convention (R008 etc. interpolate
-        // paths into the message text, so a `\n` in a hostile filename
-        // would inject fake diagnostic lines). Help text legitimately
-        // uses newlines for multi-line layout — it gets the
-        // newline-preserving sanitizer.
         println!(
             "{}: {} [{} {}]",
             severity_str,
@@ -541,48 +523,49 @@ fn output_default(diagnostics: &[Diagnostic]) {
     if error_count > 0 || warning_count > 0 {
         let mut parts = Vec::new();
         if error_count > 0 {
-            parts.push(
-                format!(
-                    "{} {}",
-                    error_count,
-                    if error_count == 1 { "error" } else { "errors" }
-                )
-                .red()
-                .to_string(),
-            );
+            parts.push(pluralize(error_count, "error", "errors").red().to_string());
         }
         if warning_count > 0 {
             parts.push(
-                format!(
-                    "{} {}",
-                    warning_count,
-                    if warning_count == 1 {
-                        "warning"
-                    } else {
-                        "warnings"
-                    }
-                )
-                .yellow()
-                .to_string(),
+                pluralize(warning_count, "warning", "warnings")
+                    .yellow()
+                    .to_string(),
             );
         }
         println!("{}", parts.join(", "));
     }
 }
 
-fn output_json(diagnostics: &[Diagnostic]) {
-    #[derive(serde::Serialize)]
-    struct JsonDiagnostic {
-        rule_id: String,
-        rule_name: String,
-        message: String,
-        severity: String,
-        path: String,
-        line: usize,
-        column: usize,
-        help: Option<String>,
-    }
+fn pluralize(n: usize, one: &str, many: &str) -> String {
+    format!("{} {}", n, if n == 1 { one } else { many })
+}
 
+#[derive(serde::Serialize)]
+struct JsonDiagnostic {
+    rule_id: String,
+    rule_name: String,
+    message: String,
+    severity: String,
+    path: String,
+    line: usize,
+    column: usize,
+    help: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct JsonOutput {
+    diagnostics: Vec<JsonDiagnostic>,
+    summary: JsonSummary,
+}
+
+#[derive(serde::Serialize)]
+struct JsonSummary {
+    total: usize,
+    errors: usize,
+    warnings: usize,
+}
+
+fn output_json(diagnostics: &[Diagnostic]) {
     let json_diagnostics: Vec<JsonDiagnostic> = diagnostics
         .iter()
         .map(|d| JsonDiagnostic {
@@ -596,19 +579,6 @@ fn output_json(diagnostics: &[Diagnostic]) {
             help: d.help.clone(),
         })
         .collect();
-
-    #[derive(serde::Serialize)]
-    struct JsonOutput {
-        diagnostics: Vec<JsonDiagnostic>,
-        summary: JsonSummary,
-    }
-
-    #[derive(serde::Serialize)]
-    struct JsonSummary {
-        total: usize,
-        errors: usize,
-        warnings: usize,
-    }
 
     let output = JsonOutput {
         diagnostics: json_diagnostics,
@@ -661,97 +631,36 @@ mod tests {
     use super::{sanitize_text, SanitizePolicy};
 
     #[test]
-    fn sanitize_passes_through_printable_ascii() {
-        assert_eq!(
-            sanitize_text("hello world", SanitizePolicy::Multiline),
-            "hello world"
-        );
-    }
-
-    #[test]
-    fn sanitize_preserves_newlines_but_escapes_tabs() {
-        // Newlines are used by multi-line help text, so they pass
-        // through. Tabs would desync the compact format's
-        // `path:line:severity:[rule] message` column layout, so they
-        // are escaped.
-        assert_eq!(
-            sanitize_text("a\nb\tc", SanitizePolicy::Multiline),
-            "a\nb\\x09c"
-        );
-    }
-
-    #[test]
-    fn sanitize_escapes_backspace() {
-        // \x08 can erase preceding chars on most terminals, hiding
-        // arbitrary content from a diagnostic.
-        assert_eq!(
-            sanitize_text("foo\x08\x08bar", SanitizePolicy::Multiline),
-            "foo\\x08\\x08bar"
-        );
-    }
-
-    #[test]
-    fn sanitize_escapes_ansi_color_injection() {
-        // A migration whose model name is `evil\x1b[31mRED\x1b[0m`
-        // would otherwise repaint the terminal when R005 renders
-        // "RemoveField 'evil...RED...'".
-        let attack = "evil\x1b[31mRED\x1b[0m";
-        let out = sanitize_text(attack, SanitizePolicy::Multiline);
-        assert_eq!(out, "evil\\x1b[31mRED\\x1b[0m");
-    }
-
-    #[test]
-    fn sanitize_escapes_carriage_return_and_bel() {
-        // \r alone is a common trick to overwrite the current line;
-        // \x07 rings the terminal bell.
-        assert_eq!(
-            sanitize_text("\rfoo", SanitizePolicy::Multiline),
-            "\\x0dfoo"
-        );
-        assert_eq!(
-            sanitize_text("bar\x07", SanitizePolicy::Multiline),
-            "bar\\x07"
-        );
-    }
-
-    #[test]
-    fn sanitize_escapes_del() {
-        assert_eq!(
-            sanitize_text("a\x7fb", SanitizePolicy::Multiline),
-            "a\\x7fb"
-        );
-    }
-
-    #[test]
-    fn sanitize_passes_through_unicode() {
-        // Non-ASCII printable codepoints are not terminal control
-        // sequences and should not be escaped — the rule messages
-        // already use em-dashes and smart quotes.
-        assert_eq!(
-            sanitize_text("café — naïve", SanitizePolicy::Multiline),
-            "café — naïve"
-        );
+    fn sanitize_multiline_preserves_newlines_and_escapes_controls() {
+        let cases = [
+            ("hello world", "hello world"),
+            ("a\nb\tc", "a\nb\\x09c"),
+            ("evil\x1b[31mRED\x1b[0m", "evil\\x1b[31mRED\\x1b[0m"),
+            ("\rfoo", "\\x0dfoo"),
+            ("bar\x07", "bar\\x07"),
+            ("a\x7fb", "a\\x7fb"),
+            ("café — naïve", "café — naïve"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(sanitize_text(input, SanitizePolicy::Multiline), expected);
+        }
     }
 
     #[test]
     fn sanitize_single_line_escapes_newlines_and_carriage_returns() {
-        // The newline-preserving sanitizer is the wrong tool for
-        // values that must render on one line: a POSIX filename
-        // containing a literal `\n` would otherwise inject fake
-        // diagnostic lines into stderr (the `path:line:` prefix in
-        // every output format interpolates untrusted path data).
-        assert_eq!(
-            sanitize_text("foo\n  --> /etc/passwd:1\nbar", SanitizePolicy::SingleLine),
-            "foo\\x0a  --> /etc/passwd:1\\x0abar",
-        );
-        assert_eq!(sanitize_text("a\rb", SanitizePolicy::SingleLine), "a\\x0db");
-    }
-
-    #[test]
-    fn sanitize_single_line_keeps_normal_text() {
-        assert_eq!(
-            sanitize_text("/repo/app/migrations/0001.py", SanitizePolicy::SingleLine),
-            "/repo/app/migrations/0001.py",
-        );
+        let cases = [
+            (
+                "foo\n  --> /etc/passwd:1\nbar",
+                "foo\\x0a  --> /etc/passwd:1\\x0abar",
+            ),
+            ("a\rb", "a\\x0db"),
+            (
+                "/repo/app/migrations/0001.py",
+                "/repo/app/migrations/0001.py",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(sanitize_text(input, SanitizePolicy::SingleLine), expected);
+        }
     }
 }

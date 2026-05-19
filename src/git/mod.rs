@@ -33,9 +33,23 @@ pub enum FileStatus {
 
 /// Which subset of changed files a caller wants.
 #[derive(Debug, Clone, Copy)]
-enum ChangedKind {
+pub enum ChangedKind {
+    /// Files under `*/migrations/*.py` (the Django convention).
     Migrations,
+    /// Everything else — `models.py`, settings, fixtures, etc.
     NonMigrations,
+}
+
+/// Where to source the diff from. Two callers in the binary:
+/// `--diff <ref>` (tree-to-tree, [`DiffSource::Head`]) and
+/// `--diff-staged <ref>` (tree-to-index, [`DiffSource::Index`])
+/// for the pre-commit hook flow.
+#[derive(Debug, Clone, Copy)]
+pub enum DiffSource {
+    /// Diff between `base_ref` and the working tree's HEAD.
+    Head,
+    /// Diff between `base_ref` and the git index (staged-only).
+    Index,
 }
 
 /// A changed file in the git diff.
@@ -206,31 +220,24 @@ impl GitRepo {
             })
     }
 
-    /// Get paths of all changed migration files (absolute paths under
-    /// the repo root).
-    pub fn changed_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
-        self.paths_from(self.changed_files(base_ref)?, ChangedKind::Migrations)
-    }
-
-    /// Get paths of all staged changed migration files.
-    pub fn changed_staged_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
-        self.paths_from(
-            self.changed_staged_files(base_ref)?,
-            ChangedKind::Migrations,
-        )
-    }
-
-    /// Get paths of all non-migration files changed in the diff.
-    pub fn changed_non_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
-        self.paths_from(self.changed_files(base_ref)?, ChangedKind::NonMigrations)
-    }
-
-    /// Get paths of all staged non-migration files changed in the diff.
-    pub fn changed_staged_non_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
-        self.paths_from(
-            self.changed_staged_files(base_ref)?,
-            ChangedKind::NonMigrations,
-        )
+    /// Project the diff against `base_ref` into absolute file
+    /// paths under the repo root, filtered by `source` (HEAD vs
+    /// index) and `kind` (migrations vs non-migrations). The
+    /// four call sites in `main.rs` cover every (source, kind)
+    /// combination, so the previous four wrapper methods
+    /// (`changed_migration_paths`, `changed_staged_migration_paths`,
+    /// etc.) collapsed into this single entry point.
+    pub fn changed_paths(
+        &self,
+        base_ref: &str,
+        source: DiffSource,
+        kind: ChangedKind,
+    ) -> Result<Vec<PathBuf>> {
+        let files = match source {
+            DiffSource::Head => self.changed_files(base_ref)?,
+            DiffSource::Index => self.changed_staged_files(base_ref)?,
+        };
+        self.paths_from(files, kind)
     }
 
     /// Project a list of `ChangedFile`s into absolute paths, filtering
@@ -459,7 +466,9 @@ mod tests {
 
         // The filter keeps the migration and drops __init__.py and the
         // regular models.py.
-        let migration_paths = repo.changed_migration_paths("HEAD~1").unwrap();
+        let migration_paths = repo
+            .changed_paths("HEAD~1", DiffSource::Head, ChangedKind::Migrations)
+            .unwrap();
         assert_eq!(migration_paths.len(), 1);
         assert!(migration_paths[0]
             .to_string_lossy()
@@ -480,7 +489,9 @@ mod tests {
         fs::write(migrations_dir.join("0001_test.py"), "# migration").unwrap();
         commit(&temp, "Add migration");
 
-        let paths = repo.changed_migration_paths("HEAD~1").unwrap();
+        let paths = repo
+            .changed_paths("HEAD~1", DiffSource::Head, ChangedKind::Migrations)
+            .unwrap();
         assert_eq!(paths.len(), 1);
         assert!(paths[0].ends_with("0001_test.py"));
         // Should be absolute path
@@ -503,7 +514,9 @@ mod tests {
         fs::write(temp.path().join("app").join("views.py"), "# views").unwrap();
         commit(&temp, "Add files");
 
-        let non_migrations = repo.changed_non_migration_paths("HEAD~1").unwrap();
+        let non_migrations = repo
+            .changed_paths("HEAD~1", DiffSource::Head, ChangedKind::NonMigrations)
+            .unwrap();
         assert_eq!(non_migrations.len(), 2);
         assert!(non_migrations.iter().any(|p| p.ends_with("models.py")));
         assert!(non_migrations.iter().any(|p| p.ends_with("views.py")));

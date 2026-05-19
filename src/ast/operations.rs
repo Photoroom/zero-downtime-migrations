@@ -164,24 +164,6 @@ pub struct ModelOperation {
     pub name: String,
     /// Old name (for RenameModel).
     pub old_name: Option<String>,
-    /// Fields (for CreateModel).
-    pub fields: Vec<FieldDefinition>,
-}
-
-/// A field definition in CreateModel.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct FieldDefinition {
-    /// The field name.
-    pub name: String,
-    /// The field type (e.g., "CharField", "ForeignKey").
-    pub field_type: String,
-    /// Whether the field is nullable.
-    pub is_nullable: bool,
-    /// Whether the field has a default value.
-    pub has_default: bool,
-    /// For ForeignKey, the referenced model.
-    pub references: Option<String>,
 }
 
 /// Data for field operations (AddField, RemoveField, etc.).
@@ -210,10 +192,6 @@ pub struct FieldInfo {
     pub is_nullable: bool,
     /// Whether the field has a default value.
     pub has_default: bool,
-    /// For ForeignKey, the referenced model.
-    pub references: Option<String>,
-    /// The raw field definition text.
-    pub raw_text: String,
 }
 
 /// Data for constraint operations.
