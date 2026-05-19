@@ -56,36 +56,41 @@ impl Config {
         selected && !ignored
     }
 
-    /// Load configuration from a directory, walking up the directory
-    /// tree until a config file is found, the search hits a directory
-    /// containing a `.git` entry (project root), or the filesystem
-    /// root is reached. This lets developers run `zdm` from a
-    /// subdirectory of their project without losing the repo-level
-    /// configuration.
+    /// Load configuration from a directory. If `dir` is inside a trusted
+    /// git repository, walk up within that repository until a config file is
+    /// found or the repository root is reached. Without a `.git` ancestor,
+    /// only `dir` itself is checked so zdm does not accidentally adopt
+    /// config from a shared parent directory.
     ///
-    /// At each level, both `pyproject.toml` and
-    /// `zero-downtime-migrations.toml` are tried (standalone wins
-    /// where both are present). The walk stops at the first level
-    /// that has either file — multi-level merging would surprise
-    /// users with `[tool.zdm]` blocks scattered across nested
-    /// pyprojects.
+    /// At each level, standalone config and `pyproject.toml [tool.zdm]`
+    /// are tried (standalone wins where both are present). A
+    /// `pyproject.toml` without `[tool.zdm]` is ignored so unrelated
+    /// tool config in a subdirectory does not shadow repo-level zdm
+    /// config. Multi-level merging is not performed.
     ///
     /// Glob patterns in `exclude` and `allowed_file_patterns` are
     /// validated at load time; an invalid pattern surfaces as
     /// `Error::InvalidGlobPattern` instead of being silently dropped
     /// at the match site.
     pub fn load_from_directory(dir: &Path) -> Result<Self> {
-        let config_dir = Self::find_config_dir(dir);
+        let config_dir = Self::find_config_dir(dir)?;
         let search_dir = config_dir.as_deref().unwrap_or(dir);
         Self::load_from_single_dir(search_dir)
     }
 
+    /// Load configuration from exactly `dir`, without walking upward.
+    ///
+    /// Standalone config still overrides `pyproject.toml [tool.zdm]` within
+    /// that one directory, and glob patterns are still validated.
+    pub fn load_from_exact_directory(dir: &Path) -> Result<Self> {
+        Self::load_from_single_dir(dir)
+    }
+
     /// Walk upward from `start` looking for the first directory that
-    /// contains either `pyproject.toml` or
-    /// `zero-downtime-migrations.toml`. Stop at any directory that
-    /// holds a `.git` entry (the repository root — a config above
-    /// the repo would belong to a parent project and is not ours to
-    /// read).
+    /// contains `zero-downtime-migrations.toml` or a `pyproject.toml`
+    /// with `[tool.zdm]`. Stop at any directory that holds a `.git`
+    /// entry (the repository root — a config above the repo would
+    /// belong to a parent project and is not ours to read).
     ///
     /// The walk only escapes `start` when a `.git` ancestor actually
     /// exists somewhere above. Without that anchor — for example,
@@ -98,7 +103,7 @@ impl Config {
     ///
     /// Returns `None` if no config file is found within those
     /// bounds.
-    fn find_config_dir(start: &Path) -> Option<std::path::PathBuf> {
+    fn find_config_dir(start: &Path) -> Result<Option<std::path::PathBuf>> {
         // Four structural rules, in order:
         //
         //   (1) A config in `start` always wins — no walk-up needed.
@@ -122,26 +127,28 @@ impl Config {
         // The trust check on the anchor is the security-critical
         // piece — see `anchor_dir_is_trusted` for the world-
         // writable `/tmp` threat model.
-        if has_config_file(start) {
-            return Some(start.to_path_buf());
+        if has_zdm_config_file(start)? {
+            return Ok(Some(start.to_path_buf()));
         }
         if start.join(".git").exists() {
-            return None;
+            return Ok(None);
         }
 
-        let anchor = trusted_git_anchor_strictly_above(start)?;
+        let Some(anchor) = trusted_git_anchor_strictly_above(start) else {
+            return Ok(None);
+        };
 
         let mut current = start;
         while let Some(parent) = current.parent() {
             current = parent;
-            if has_config_file(current) {
-                return Some(current.to_path_buf());
+            if has_zdm_config_file(current)? {
+                return Ok(Some(current.to_path_buf()));
             }
             if current == anchor {
-                return None;
+                return Ok(None);
             }
         }
-        None
+        Ok(None)
     }
 
     /// Load whichever config files exist in a single directory,
@@ -238,12 +245,19 @@ impl Config {
     }
 }
 
-/// `true` iff a project config file lives directly in `dir`.
-/// `pyproject.toml` and the standalone `zero-downtime-migrations.toml`
-/// both count; precedence (standalone wins where both exist) is
-/// resolved at load time by `load_from_single_dir`, not here.
-fn has_config_file(dir: &Path) -> bool {
-    dir.join("pyproject.toml").exists() || dir.join("zero-downtime-migrations.toml").exists()
+/// `true` iff a zdm config file lives directly in `dir`.
+///
+/// A bare `pyproject.toml` for another tool does not count; otherwise it
+/// would shadow a repo-level zdm config while contributing only defaults.
+fn has_zdm_config_file(dir: &Path) -> Result<bool> {
+    if dir.join("zero-downtime-migrations.toml").exists() {
+        return Ok(true);
+    }
+    let pyproject_path = dir.join("pyproject.toml");
+    if !pyproject_path.exists() {
+        return Ok(false);
+    }
+    Config::load_pyproject(&pyproject_path).map(|config| config.is_some())
 }
 
 /// The closest directory *strictly above* `start` that holds a
@@ -681,6 +695,49 @@ exclude = ["**/test_migrations/**", "**/fixtures/**"]
             !config.ignore.contains("R001"),
             "outer config should not bleed through when the inner config exists",
         );
+    }
+
+    #[test]
+    fn test_nested_pyproject_without_zdm_does_not_shadow_parent_config() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join(".git")).unwrap();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"ignore = ["R001"]"#,
+        )
+        .unwrap();
+
+        let nested = temp.path().join("apps/myapp");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("pyproject.toml"),
+            r#"
+[tool.black]
+line-length = 88
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_from_directory(&nested).unwrap();
+        assert!(
+            config.ignore.contains("R001"),
+            "pyproject.toml without [tool.zdm] should not hide parent zdm config",
+        );
+    }
+
+    #[test]
+    fn test_load_from_exact_directory_does_not_walk_up() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"ignore = ["R001"]"#,
+        )
+        .unwrap();
+        let nested = temp.path().join("apps/myapp");
+        fs::create_dir_all(&nested).unwrap();
+
+        let config = Config::load_from_exact_directory(&nested).unwrap();
+        assert!(config.ignore.is_empty());
     }
 
     #[test]

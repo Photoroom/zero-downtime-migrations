@@ -183,6 +183,45 @@ class Migration(migrations.Migration):
     ]
 "#;
 
+    const STATE_ONLY_NON_LITERAL_MIGRATION: &str = r#"
+from django.db import migrations
+
+
+STATE_OPS = [
+    migrations.RemoveField(
+        model_name='product',
+        name='deprecated_field',
+    ),
+]
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            state_operations=STATE_OPS,
+        ),
+    ]
+"#;
+
+    const DB_ONLY_NON_LITERAL_MIGRATION: &str = r#"
+from django.db import migrations
+
+
+DB_OPS = [
+    migrations.RunSQL('DROP COLUMN deprecated_field'),
+]
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=DB_OPS,
+        ),
+    ]
+"#;
+
     const OTHER_MIGRATION: &str = r#"
 from django.db import migrations, models
 
@@ -260,6 +299,18 @@ class Migration(migrations.Migration):
         let messages: std::collections::HashSet<_> =
             diagnostics.iter().map(|d| d.message.clone()).collect();
         assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn test_non_literal_state_and_db_arms_still_count_as_present() {
+        let state_migration = parse_migration(STATE_ONLY_NON_LITERAL_MIGRATION, "0001_state.py");
+        let db_migration = parse_migration(DB_ONLY_NON_LITERAL_MIGRATION, "0002_db.py");
+        let migrations = vec![&state_migration, &db_migration];
+
+        let diagnostics = run(&migrations);
+
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics.iter().all(|d| d.rule_id == "R009"));
     }
 
     #[test]

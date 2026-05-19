@@ -402,8 +402,20 @@ impl RunPythonOperation {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct SeparateDatabaseAndStateOperation {
-    /// Whether state_operations is present.
+    /// Whether state_operations contains meaningful operations.
+    ///
+    /// Literal `[]` and `None` are treated as absent. Non-literal values
+    /// are treated as present because rules cannot prove they are empty.
     pub has_state_operations: bool,
-    /// Whether database_operations is present.
+    /// Whether database_operations contains meaningful operations.
+    ///
+    /// Literal `[]` and `None` are treated as absent. Non-literal values
+    /// are treated as present because rules cannot prove they are empty.
     pub has_database_operations: bool,
+    /// Operations inside the `database_operations=[...]` arm.
+    ///
+    /// These are database-effective operations and keep their original
+    /// operation spans for diagnostics and inline ignore directives.
+    /// State-side operations are metadata-only and are not retained here.
+    pub database_operations: Vec<Operation>,
 }

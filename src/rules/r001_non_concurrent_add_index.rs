@@ -136,8 +136,8 @@ class Migration(migrations.Migration):
         // still runs a non-concurrent CREATE INDEX against the live
         // schema. Wrapping the op in SDaS doesn't make the lock
         // safer — it just hides the operation from a naive top-level
-        // walk. The shared rule traversal includes
-        // `wrapped_database_ops` so the hidden lock surfaces.
+        // walk. The shared rule traversal expands database-side SDaS
+        // operations in place so the hidden lock surfaces.
         let diagnostics = check_migration(ADD_INDEX_INSIDE_SDAS_DATABASE_OPS_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R001");
@@ -165,8 +165,8 @@ class Migration(migrations.Migration):
     fn test_add_index_inside_sdas_state_ops_is_not_flagged() {
         // `state_operations` is metadata-only — Django updates its
         // migration state graph but does not touch the database.
-        // The extractor deliberately omits state-side ops from
-        // `wrapped_database_ops`, so the rule leaves them alone.
+        // The database-effective traversal deliberately omits state-side
+        // ops, so the rule leaves them alone.
         let diagnostics = check_migration(ADD_INDEX_INSIDE_SDAS_STATE_OPS_GOOD);
         assert!(diagnostics.is_empty());
     }

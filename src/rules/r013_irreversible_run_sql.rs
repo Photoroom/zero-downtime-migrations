@@ -31,7 +31,7 @@ impl Rule for R013IrreversibleRunSQL {
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        for op in migration.operations_of_type(OperationType::RunSQL) {
+        for op in migration.database_effective_operations_of_type(OperationType::RunSQL) {
             if let OperationData::RunSQL(data) = &op.data {
                 if data.reverse_sql.is_none() {
                     diagnostics.push(Diagnostic {
@@ -86,6 +86,20 @@ class Migration(migrations.Migration):
     ]
 "#;
 
+    const NOOP_REVERSE_GOOD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL(
+            sql='UPDATE table SET column = value;',
+            reverse_sql=migrations.RunSQL.noop,
+        ),
+    ]
+"#;
+
     fn check_migration(source: &str) -> Vec<Diagnostic> {
         crate::rules::test_support::check_rule(&R013IrreversibleRunSQL, source)
     }
@@ -100,6 +114,12 @@ class Migration(migrations.Migration):
     #[test]
     fn test_reversible_run_sql_good() {
         let diagnostics = check_migration(REVERSIBLE_GOOD);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_runsql_noop_reverse_is_reversible() {
+        let diagnostics = check_migration(NOOP_REVERSE_GOOD);
         assert!(diagnostics.is_empty());
     }
 }

@@ -31,7 +31,7 @@ impl Rule for R012IrreversibleRunPython {
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        for op in migration.operations_of_type(OperationType::RunPython) {
+        for op in migration.database_effective_operations_of_type(OperationType::RunPython) {
             if let OperationData::RunPython(data) = &op.data {
                 if !data.is_reversible() {
                     diagnostics.push(Diagnostic {

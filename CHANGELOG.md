@@ -1,12 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 - Unreleased
 
 Accumulating changes since 0.3.2. The notes below describe the
-user-visible behaviour shifts; the actual release tag and version
-bump will land in a separate commit when we cut the next version.
-Severity flips and behavioural widenings will likely warrant a
-minor bump (`0.4.0`) rather than a patch.
+user-visible behaviour shifts for the next 0.4.0 release.
 
 ### Rules
 
@@ -27,6 +24,10 @@ minor bump (`0.4.0`) rather than a patch.
   wrapped inside `SeparateDatabaseAndState(database_operations=[...])`.
   Wrapping doesn't defang the lock — Django runs the wrapped op
   against the live schema.
+- **R003, R012, R013, and R015** now also inspect literal
+  `SeparateDatabaseAndState(database_operations=[...])` operations.
+  Diagnostics keep the inner operation span so inline ignores attach
+  to the operation being reported.
 - **R001, R002, R006, R010, R016, R017** CreateModel exemptions are now
   order-aware. A `CreateModel` placed *after* the flagged op no
   longer retroactively exempts it (previously these rules consulted
@@ -105,10 +106,10 @@ be present on every diagnostic.
 
 ### Internal
 
-- AST extractor surfaces `Migration.wrapped_database_ops` so rules
-  can inspect operations hidden inside
-  `SeparateDatabaseAndState(database_operations=[...])`. R001 is
-  the first consumer.
+- AST extractor surfaces database-effective operations hidden inside
+  `SeparateDatabaseAndState(database_operations=[...])` so rules can
+  inspect them in execution order while preserving each operation's
+  source span.
 - AST extractor captures index column lists and names on
   `IndexOperation` so R006 can do leading-column matching against
   pre-existing concurrent indexes.

@@ -38,7 +38,7 @@ impl Rule for R005RemoveFieldWithoutSeparate {
         // separate operation. Therefore, any RemoveField we see here is NOT wrapped
         // and should be flagged.
 
-        for op in migration.operations_of_type(OperationType::RemoveField) {
+        for op in migration.top_level_operations_of_type(OperationType::RemoveField) {
             diagnostics.push(Diagnostic {
                 rule_id: self.id(),
                 rule_name: self.name(),

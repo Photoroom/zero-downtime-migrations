@@ -180,15 +180,30 @@ impl GitRepo {
     pub fn read_staged_file(&self, path: &Path) -> Result<String> {
         let root = self.root()?;
         let relative_path: PathBuf = if path.is_absolute() {
-            path.strip_prefix(&root)
-                .map_err(|_| {
-                    Error::git_error_msg(format!(
-                        "File '{}' is not inside repository '{}'",
-                        path.display(),
-                        root.display()
-                    ))
-                })?
-                .to_path_buf()
+            match path.strip_prefix(&root) {
+                Ok(relative) => relative.to_path_buf(),
+                Err(_) => {
+                    let canonical_root = root.canonicalize().map_err(|e| Error::io(e, &root))?;
+                    let canonical_path = path.canonicalize().map_err(|e| {
+                        Error::git_error_msg(format!(
+                            "File '{}' is not inside repository '{}': {}",
+                            path.display(),
+                            root.display(),
+                            e
+                        ))
+                    })?;
+                    canonical_path
+                        .strip_prefix(&canonical_root)
+                        .map_err(|_| {
+                            Error::git_error_msg(format!(
+                                "File '{}' is not inside repository '{}'",
+                                path.display(),
+                                root.display()
+                            ))
+                        })?
+                        .to_path_buf()
+                }
+            }
         } else {
             path.to_path_buf()
         };
@@ -203,6 +218,12 @@ impl GitRepo {
                 relative_path.display()
             ))
         })?;
+        if entry.mode & 0o170000 != 0o100000 {
+            return Err(Error::git_error_msg(format!(
+                "Refusing to read non-regular staged file '{}' from git index",
+                relative_path.display()
+            )));
+        }
         let blob = self
             .repo
             .find_blob(entry.id)
@@ -238,6 +259,26 @@ impl GitRepo {
             DiffSource::Index => self.changed_staged_files(base_ref)?,
         };
         self.paths_from(files, kind)
+    }
+
+    /// Compatibility shim for callers that want changed migration files in HEAD.
+    pub fn changed_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
+        self.changed_paths(base_ref, DiffSource::Head, ChangedKind::Migrations)
+    }
+
+    /// Compatibility shim for callers that want changed migration files in the index.
+    pub fn changed_staged_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
+        self.changed_paths(base_ref, DiffSource::Index, ChangedKind::Migrations)
+    }
+
+    /// Compatibility shim for callers that want changed non-migration files in HEAD.
+    pub fn changed_non_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
+        self.changed_paths(base_ref, DiffSource::Head, ChangedKind::NonMigrations)
+    }
+
+    /// Compatibility shim for callers that want changed non-migration files in the index.
+    pub fn changed_staged_non_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
+        self.changed_paths(base_ref, DiffSource::Index, ChangedKind::NonMigrations)
     }
 
     /// Project a list of `ChangedFile`s into absolute paths, filtering
@@ -601,15 +642,6 @@ mod tests {
         assert_eq!(content, "staged");
     }
 
-    // Note: a portable regression test for the old `canonicalize` path
-    // would require manufacturing a repo whose libgit2 workdir prefix
-    // differs from the path the caller hands in (the macOS
-    // `/tmp` ↔ `/private/tmp` case) AND the worktree copy being absent.
-    // That's hard to construct cross-platform; the relative-path test
-    // below covers the only branch that survives in the new code, and
-    // the absolute path under `repo.root()` is covered by
-    // `test_read_staged_file_ignores_unstaged_worktree_changes` above.
-
     #[test]
     fn test_read_staged_file_accepts_repo_relative_path() {
         // Relative paths skip `strip_prefix` entirely; this is the path
@@ -631,6 +663,57 @@ mod tests {
 
         let content = repo.read_staged_file(Path::new("file.py")).unwrap();
         assert_eq!(content, "v1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_staged_file_accepts_canonical_equivalent_absolute_path() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = create_test_repo();
+        let root = repo.root().unwrap();
+
+        fs::write(root.join("README.md"), "# Test").unwrap();
+        commit(&temp, "Initial");
+
+        fs::write(root.join("file.py"), "staged").unwrap();
+        Command::new("git")
+            .args(["add", "file.py"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let alias_parent = TempDir::new().unwrap();
+        let alias_root = alias_parent.path().join("repo-alias");
+        symlink(&root, &alias_root).unwrap();
+
+        let content = repo.read_staged_file(&alias_root.join("file.py")).unwrap();
+        assert_eq!(content, "staged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_staged_file_rejects_index_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = create_test_repo();
+        let root = repo.root().unwrap();
+
+        fs::write(root.join("README.md"), "# Test").unwrap();
+        commit(&temp, "Initial");
+
+        symlink("README.md", root.join("link.py")).unwrap();
+        Command::new("git")
+            .args(["add", "link.py"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let err = repo.read_staged_file(Path::new("link.py")).unwrap_err();
+        assert!(
+            err.to_string().contains("non-regular staged file"),
+            "expected staged symlink rejection, got: {err}",
+        );
     }
 
     #[test]

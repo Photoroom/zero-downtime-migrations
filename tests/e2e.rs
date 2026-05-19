@@ -268,25 +268,20 @@ fn e2e_r014_fail_model_import() {
 
 #[test]
 fn e2e_oversized_file_is_rejected_with_parse_error_exit_code() {
-    // The parser caps inputs at `MAX_FILE_SIZE` to bound memory. A
-    // file just over the cap should be rejected before tree-sitter
-    // sees it; the CLI surfaces the rejection as a parse error and
-    // exits 2. Derive the fixture size from the constant so a
-    // future cap change doesn't silently desync the test (we'd
-    // ship a fixture below the new cap and stop exercising the
-    // rejection path).
+    // The parser caps inputs to bound memory. A very large file
+    // should be rejected before tree-sitter sees it; the CLI surfaces
+    // the rejection as a parse error and exits 2. Exact boundary
+    // behaviour lives in parser unit tests so this e2e stays focused
+    // on CLI error handling.
     use std::fs::File;
     use std::io::Write;
-    use zero_downtime_migrations::parser::MAX_FILE_SIZE;
 
     let (_temp, migrations_dir) = temp_migration_project();
 
     let huge_path = migrations_dir.join("0001_huge.py");
     let mut file = File::create(&huge_path).unwrap();
-    // Exactly `MAX_FILE_SIZE + 1` bytes — the smallest input that
-    // trips the cap.
     let chunk = vec![b'#'; 4096];
-    let target = MAX_FILE_SIZE + 1;
+    let target = 11 * 1024 * 1024;
     let mut written = 0u64;
     while written + chunk.len() as u64 <= target {
         file.write_all(&chunk).unwrap();
@@ -325,6 +320,109 @@ fn e2e_r015_warns_alter_field_not_null() {
         .assert()
         .success()
         .stdout(predicate::str::contains("R015"));
+}
+
+#[test]
+fn e2e_database_operations_are_checked_by_rules_that_use_database_effective_traversal() {
+    let (_temp, migrations_dir) = temp_migration_project();
+    let migration_path = migrations_dir.join("0001_wrapped_database_ops.py");
+    std::fs::write(
+        &migration_path,
+        r#"
+from django.db import migrations, models
+
+
+def forwards(apps, schema_editor):
+    pass
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.RunSQL(
+                    sql='CREATE INDEX idx_product_name ON product (name);',
+                    reverse_sql='DROP INDEX idx_product_name;',
+                ),
+                migrations.RunPython(forwards),
+                migrations.RunSQL(sql='UPDATE product SET name = name;'),
+                migrations.AlterField(
+                    model_name='product',
+                    name='name',
+                    field=models.CharField(max_length=255),
+                ),
+            ],
+            state_operations=[
+                migrations.RunSQL(sql='CREATE INDEX idx_state_only ON product (state_only);'),
+                migrations.AlterModelOptions(name='product', options={}),
+            ],
+        ),
+    ]
+"#,
+    )
+    .unwrap();
+
+    let output = zdm()
+        .arg(&migration_path)
+        .arg("--select")
+        .arg("R003,R012,R013,R015")
+        .arg("--output-format")
+        .arg("json")
+        .assert()
+        .failure()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value =
+        serde_json::from_slice(&output).expect("expected valid JSON output");
+    let diagnostics = json
+        .get("diagnostics")
+        .and_then(|d| d.as_array())
+        .expect("`diagnostics` array");
+    assert_eq!(
+        diagnostics.len(),
+        4,
+        "expected only database_operations diagnostics, got: {diagnostics:?}",
+    );
+    for rule_id in ["R003", "R012", "R013", "R015"] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.get("rule_id").and_then(|v| v.as_str()) == Some(rule_id)),
+            "expected wrapped database_operations to emit {rule_id}, got: {diagnostics:?}",
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_explicit_symlink_directory_is_rejected_not_followed() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join(".git")).unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    let outside_migrations = outside.path().join("migrations");
+    fs::create_dir_all(&outside_migrations).unwrap();
+    fs::write(outside_migrations.join("__init__.py"), "").unwrap();
+    fs::write(
+        outside_migrations.join("0001_bad.py"),
+        R001_ADD_INDEX_TRIGGER,
+    )
+    .unwrap();
+    let link_path = temp.path().join("linked_app");
+    symlink(outside.path(), &link_path).unwrap();
+
+    zdm()
+        .arg(&link_path)
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("Invalid path"))
+        .stderr(predicate::str::contains("linked_app"));
 }
 
 // =============================================================================
@@ -532,10 +630,9 @@ fn e2e_explicit_symlink_path_is_rejected_not_followed() {
     // explicitly-passed-file branch in main.rs used to call
     // `path.is_file()` which transparently follows symlinks, so a
     // symlink to e.g. `/etc/passwd` could still reach the parser.
-    // This e2e pins that the binary now applies the same
-    // rejection on the explicit branch — the source under the
-    // symlink target must not appear in output, and the binary
-    // must not crash by trying to parse it as Python.
+    // This e2e pins that the binary now rejects explicit symlink
+    // paths loudly instead of following them or silently treating
+    // them as an empty discovery result.
     use std::fs;
     use std::os::unix::fs::symlink;
 
@@ -550,15 +647,13 @@ fn e2e_explicit_symlink_path_is_rejected_not_followed() {
     // Pass the symlink path explicitly. Without the fix, the
     // explicit-path branch would follow the link, parse the
     // target, and emit R001 against the symlink path.
-    let output = zdm().arg(&symlink_path).output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        !stdout.contains("R001") && !stderr.contains("R001"),
-        "explicit symlink path should be skipped, not followed and linted; \
-         got stdout:\n{stdout}\nstderr:\n{stderr}",
-    );
+    zdm()
+        .arg(&symlink_path)
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("Invalid path"))
+        .stderr(predicate::str::contains("0001_link.py"));
 }
 
 // =============================================================================

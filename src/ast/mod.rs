@@ -37,21 +37,10 @@ pub struct Migration {
     pub imports: Vec<Import>,
     /// Operations extracted from
     /// `SeparateDatabaseAndState(database_operations=[...])` arms in this
-    /// migration. These represent the "database-side" half of a two-step
-    /// deployment — they execute real schema changes without the
-    /// state-side preamble, so a rule that scans for schema-locking
-    /// patterns can inspect this field alongside `operations` to avoid
-    /// silently ignoring locks hidden inside an SDaS wrapper.
-    ///
-    /// The rule traversal treats these as database-effective operations
-    /// without inheriting top-level `CreateModel` exemptions, because
-    /// the wrapper implies the operation targets a live schema.
-    ///
-    /// State-side operations are deliberately not surfaced because
-    /// they're metadata-only — Django updates its migration state
-    /// graph but doesn't touch the database. A rule that wants to
-    /// inspect `state_operations` must walk the original
-    /// `OperationData::SeparateDatabaseAndState` payload itself.
+    /// migration. Kept as a compatibility projection; new rule code should
+    /// prefer [`Self::database_effective_operations`] so wrapped operations
+    /// are traversed in database execution order while retaining their
+    /// original operation spans.
     pub wrapped_database_ops: Vec<Operation>,
     /// Span of the `class Migration(...)` definition, when present. Used
     /// as the anchor for class-level diagnostics (e.g. R004's missing
@@ -99,10 +88,55 @@ impl Migration {
             .map_err(|e| crate::error::Error::parse(path.to_path_buf(), e.to_string()))
     }
 
-    /// Get all operations of a specific type.
-    pub fn operations_of_type(&self, op_type: OperationType) -> impl Iterator<Item = &Operation> {
+    /// Get top-level operations of a specific type.
+    pub fn top_level_operations_of_type(
+        &self,
+        op_type: OperationType,
+    ) -> impl Iterator<Item = &Operation> {
         self.operations
             .iter()
+            .filter(move |op| op.op_type == op_type)
+    }
+
+    /// Get top-level operations of a specific type.
+    ///
+    /// Prefer [`Self::top_level_operations_of_type`] when the distinction
+    /// matters. This compatibility shim preserves the pre-existing public
+    /// API and intentionally keeps its top-level semantics.
+    pub fn operations_of_type(&self, op_type: OperationType) -> impl Iterator<Item = &Operation> {
+        self.top_level_operations_of_type(op_type)
+    }
+
+    /// Get database-effective operations in execution order.
+    ///
+    /// Top-level `SeparateDatabaseAndState` wrappers are expanded in place to
+    /// their literal `database_operations` arm. Wrapped operations retain their
+    /// original spans. State-side operations are metadata-only and are
+    /// deliberately omitted.
+    pub fn database_effective_operations(&self) -> impl Iterator<Item = &Operation> {
+        let mut top_level = self.operations.iter();
+        let mut wrapped = [].iter();
+
+        std::iter::from_fn(move || loop {
+            if let Some(op) = wrapped.next() {
+                return Some(op);
+            }
+            let op = top_level.next()?;
+            match &op.data {
+                OperationData::SeparateDatabaseAndState(data) => {
+                    wrapped = data.database_operations.iter();
+                }
+                _ => return Some(op),
+            }
+        })
+    }
+
+    /// Get database-effective operations of a specific type in execution order.
+    pub fn database_effective_operations_of_type(
+        &self,
+        op_type: OperationType,
+    ) -> impl Iterator<Item = &Operation> {
+        self.database_effective_operations()
             .filter(move |op| op.op_type == op_type)
     }
 

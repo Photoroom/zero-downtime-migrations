@@ -13,10 +13,7 @@ use crate::error::{Error, Result};
 
 /// Maximum size (in bytes) of a single migration file the
 /// parser will accept. Bounds memory use and parse time when
-/// processing untrusted input. Currently a hard-coded 10 MiB;
-/// the test suite reaches this constant to construct a fixture
-/// just past the limit, hence the `pub` (otherwise this would
-/// be `pub(crate)`).
+/// processing untrusted input. Currently a hard-coded 10 MiB.
 pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Returns `Err(Error::FileTooLarge)` if the given byte count exceeds

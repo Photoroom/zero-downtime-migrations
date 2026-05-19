@@ -394,6 +394,155 @@ mod diff_mode {
     }
 
     #[test]
+    fn diff_mode_respects_positional_path_scope() {
+        let temp = setup_git_repo();
+
+        let scoped_dir = temp.path().join("app").join("migrations");
+        fs::write(
+            scoped_dir.join("0001_scoped_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+
+        let other_dir = temp.path().join("other_app").join("migrations");
+        fs::create_dir_all(&other_dir).unwrap();
+        fs::write(other_dir.join("__init__.py"), "").unwrap();
+        fs::write(
+            other_dir.join("0001_outside_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Add scoped and outside migrations");
+
+        zdm()
+            .current_dir(temp.path())
+            .arg("app")
+            .arg("--diff")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R001")
+            .arg("--output-format")
+            .arg("compact")
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("0001_scoped_bad.py"))
+            .stdout(predicate::str::contains("0001_outside_bad.py").not());
+    }
+
+    #[test]
+    fn diff_mode_rejects_invalid_positional_path_scope() {
+        let temp = setup_git_repo();
+        fs::write(
+            temp.path().join("app/migrations/0001_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Add migration");
+
+        zdm()
+            .current_dir(temp.path())
+            .arg("missing_app")
+            .arg("--diff")
+            .arg("origin/main")
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains("Invalid path"))
+            .stderr(predicate::str::contains("missing_app"));
+    }
+
+    #[test]
+    fn diff_mode_rejects_existing_path_scope_outside_repo() {
+        let temp = setup_git_repo();
+        let outside = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("app/migrations/0001_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Add migration");
+
+        zdm()
+            .current_dir(temp.path())
+            .arg(outside.path())
+            .arg("--diff")
+            .arg("origin/main")
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains("Invalid path"))
+            .stderr(predicate::str::contains(
+                outside.path().to_string_lossy().as_ref(),
+            ));
+    }
+
+    #[test]
+    fn diff_mode_normalizes_positional_path_scope() {
+        let temp = setup_git_repo();
+        let app_dir = temp.path().join("app");
+        fs::write(
+            app_dir.join("migrations/0001_scoped_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Add scoped migration");
+
+        zdm()
+            .current_dir(temp.path().join("app/migrations"))
+            .arg("../..//app")
+            .arg("--diff")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R001")
+            .arg("--output-format")
+            .arg("compact")
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("0001_scoped_bad.py"));
+    }
+
+    #[test]
+    fn diff_mode_scopes_non_migration_files_for_r008() {
+        let temp = setup_git_repo();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"allowed-file-patterns = []"#,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Add config");
+        set_base_to_head(temp.path());
+
+        fs::write(
+            temp.path().join("app/migrations/0001_scoped.py"),
+            CLEAN_MIGRATION,
+        )
+        .unwrap();
+        fs::write(temp.path().join("app/views.py"), "# scoped view").unwrap();
+        let other_dir = temp.path().join("other_app");
+        fs::create_dir_all(&other_dir).unwrap();
+        fs::write(other_dir.join("views.py"), "# outside view").unwrap();
+        git_commit_all(temp.path(), "Add scoped migration and mixed app changes");
+
+        zdm()
+            .current_dir(temp.path())
+            .arg("app")
+            .arg("--diff")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R008")
+            .arg("--output-format")
+            .arg("compact")
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("R008"))
+            .stdout(predicate::str::contains("app/views.py"))
+            .stdout(predicate::str::contains("other_app/views.py").not());
+    }
+
+    #[test]
     fn r008_allows_basename_patterns() {
         // This is currently the ONLY R008 coverage outside unit
         // tests, and the bare `.success().code(0)` would pass if
@@ -1015,26 +1164,30 @@ mod list_rules {
 
     #[test]
     fn list_rules_includes_every_documented_rule() {
-        // Drive the expected list from the actual registries (which
-        // is what the binary walks) so the test can't desync from
-        // the source of truth. The previous hardcoded array would
-        // have silently passed if a contributor added a rule to the
-        // registry but forgot to add it to the test list — and
-        // would have silently failed if a rule was retired from the
-        // registry but left in the array.
-        use zero_downtime_migrations::rules::{ChangesetRuleRegistry, RuleRegistry};
-
-        let mut expected_ids: Vec<&'static str> = RuleRegistry::new()
-            .rules()
-            .iter()
-            .map(|r| r.id())
-            .chain(ChangesetRuleRegistry::new().rules().iter().map(|r| r.id()))
+        let expected_ids = [
+            "R001", "R002", "R003", "R004", "R005", "R006", "R008", "R009", "R010", "R011", "R012",
+            "R013", "R014", "R015", "R016", "R017",
+        ];
+        let readme = fs::read_to_string("README.md").expect("README should be readable");
+        let documented_ids: Vec<String> = readme
+            .lines()
+            .filter_map(|line| {
+                let mut cells = line.split('|').map(str::trim);
+                cells.next();
+                let id = cells.next()?;
+                (id.len() == 4
+                    && id.starts_with('R')
+                    && id[1..].chars().all(|c| c.is_ascii_digit()))
+                .then(|| id.to_string())
+            })
             .collect();
-        expected_ids.sort();
-        expected_ids.dedup();
-        assert!(
-            !expected_ids.is_empty(),
-            "registry returned zero rules — listing test is now self-confirming",
+        assert_eq!(
+            documented_ids,
+            expected_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>(),
+            "README rule table is out of sync with expected active rules",
         );
 
         let output = zdm().arg("--list-rules").output().expect("zdm should run");
@@ -1044,7 +1197,7 @@ mod list_rules {
             output.status,
         );
         let stdout = String::from_utf8(output.stdout).expect("--list-rules output is UTF-8");
-        for id in &expected_ids {
+        for id in expected_ids {
             assert!(
                 stdout.contains(id),
                 "--list-rules output is missing rule {id}; got:\n{stdout}",
@@ -1059,7 +1212,7 @@ mod list_rules {
         // `R\d{3}\s` regex keeps the assertion stable across
         // format changes (e.g. an ANSI-colour prefix or
         // indented continuation line).
-        for id in &expected_ids {
+        for id in expected_ids {
             let needle = format!("{id} ");
             let occurrences = stdout.lines().filter(|l| l.contains(&needle)).count();
             assert_eq!(
@@ -1067,5 +1220,83 @@ mod list_rules {
                 "expected exactly one line mentioning {id}, got {occurrences}\noutput:\n{stdout}",
             );
         }
+
+        let actual_ids: Vec<String> = stdout
+            .lines()
+            .filter_map(|line| {
+                line.split_whitespace().find_map(|token| {
+                    let id: String = token
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric())
+                        .collect();
+                    (id.len() == 4
+                        && id.starts_with('R')
+                        && id[1..].chars().all(|c| c.is_ascii_digit()))
+                    .then_some(id)
+                })
+            })
+            .collect();
+        assert_eq!(
+            actual_ids,
+            expected_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>(),
+            "--list-rules printed unexpected rule rows:\n{stdout}",
+        );
+    }
+
+    #[test]
+    fn list_rules_rejects_linting_flags() {
+        zdm()
+            .arg("--list-rules")
+            .arg("--select")
+            .arg("R001")
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "--list-rules cannot be combined with paths or linting flags",
+            ))
+            .stderr(predicate::str::contains("Git error").not());
+    }
+
+    #[test]
+    fn public_compatibility_shims_remain_available() {
+        use zero_downtime_migrations::ast::{Migration, OperationType};
+        use zero_downtime_migrations::parser::MAX_FILE_SIZE;
+
+        let migration = Migration::from_source(
+            std::path::Path::new("test.py"),
+            r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL("SELECT 1"),
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.RunSQL("SELECT 2"),
+            ],
+        ),
+    ]
+"#,
+        )
+        .unwrap();
+
+        let max_file_size = std::hint::black_box(MAX_FILE_SIZE);
+        assert!(max_file_size > 0);
+        assert_eq!(
+            migration.operations_of_type(OperationType::RunSQL).count(),
+            1,
+        );
+        assert_eq!(
+            migration
+                .database_effective_operations_of_type(OperationType::RunSQL)
+                .count(),
+            2,
+        );
     }
 }

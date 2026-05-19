@@ -43,9 +43,9 @@ pub fn discover_migrations_with_exclude(
             if is_migration_file(path) && !is_excluded(path, &patterns) {
                 migrations.push(path.clone());
             }
-        } else if path.is_dir() {
+        } else if is_directory(path) {
             discover_in_directory(path, &mut migrations, &patterns)?;
-        } else if !path.exists() {
+        } else {
             return Err(Error::InvalidPath { path: path.clone() });
         }
     }
@@ -66,6 +66,12 @@ pub fn discover_migrations_with_exclude(
 fn is_regular_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_file())
+        .unwrap_or(false)
+}
+
+fn is_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_dir())
         .unwrap_or(false)
 }
 

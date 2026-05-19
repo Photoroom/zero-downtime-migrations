@@ -107,6 +107,18 @@ fn run(cli: Cli) -> Result<ExitCode> {
     // `--list-rules` short-circuits before anything else: no config
     // load, no file discovery, just print the catalogue and exit.
     if cli.list_rules {
+        if cli.paths != [PathBuf::from(".")]
+            || cli.diff.is_some()
+            || cli.diff_staged.is_some()
+            || !matches!(cli.output_format, OutputFormat::Default)
+            || cli.select.is_some()
+            || cli.ignore.is_some()
+            || cli.warnings_as_errors
+        {
+            return Err(Error::cli_usage(
+                "--list-rules cannot be combined with paths or linting flags",
+            ));
+        }
         return list_rules();
     }
 
@@ -157,7 +169,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
     // Run changeset rules if in diff mode
     if let Some(diff_mode) = diff_mode {
-        let other_files = discover_non_migration_files(diff_mode)?;
+        let other_files = discover_non_migration_files(diff_mode, &cli.paths)?;
         let changeset_registry = ChangesetRuleRegistry::new();
         let migration_refs: Vec<&Migration> = migrations.iter().collect();
         let other_file_refs: Vec<&Path> = other_files.iter().map(|p| p.as_path()).collect();
@@ -308,6 +320,8 @@ fn discover_migrations(
                 repo.changed_paths(base_ref, DiffSource::Index, ChangedKind::Migrations)?
             }
         };
+        let root = repo.root()?;
+        let migrations = filter_paths_by_cli_scope(migrations, paths, &root)?;
 
         // Apply exclude patterns to diff mode as well
         if exclude_patterns.is_empty() {
@@ -342,9 +356,9 @@ fn discover_migrations(
             // CLI's symlink-rejection policy is uniform across
             // the discovery walk, the explicit-path branch
             // here, and the parser's size check.
-            let is_regular_file = std::fs::symlink_metadata(path)
-                .map(|m| m.file_type().is_file())
-                .unwrap_or(false);
+            let file_type = std::fs::symlink_metadata(path).map(|m| m.file_type());
+            let is_regular_file = file_type.as_ref().map(|t| t.is_file()).unwrap_or(false);
+            let is_directory = file_type.as_ref().map(|t| t.is_dir()).unwrap_or(false);
             if is_regular_file {
                 // Accept any .py file passed explicitly
                 if path.extension().is_some_and(|ext| ext == "py") {
@@ -354,17 +368,92 @@ fn discover_migrations(
                         all_migrations.push(path.clone());
                     }
                 }
-            } else {
+            } else if is_directory {
                 // For directories, use pattern-based discovery with exclude
                 let migrations = discovery::discover_migrations_with_exclude(
                     std::slice::from_ref(path),
                     exclude_patterns,
                 )?;
                 all_migrations.extend(migrations);
+            } else {
+                return Err(Error::path_not_found(path.clone()));
             }
         }
 
         Ok(all_migrations)
+    }
+}
+
+fn filter_paths_by_cli_scope(
+    paths: Vec<PathBuf>,
+    scopes: &[PathBuf],
+    repo_root: &Path,
+) -> Result<Vec<PathBuf>> {
+    if scopes == [PathBuf::from(".")] {
+        return Ok(paths);
+    }
+    let current_dir = normalize_existing_path(
+        &std::env::current_dir().map_err(|e| Error::io(e, PathBuf::from(".")))?,
+    )?;
+    let original_repo_root = repo_root.to_path_buf();
+    let normalized_repo_root = normalize_existing_path(repo_root)?;
+    let absolute_scopes: Vec<PathBuf> = scopes
+        .iter()
+        .map(|scope| {
+            let path = if scope.is_absolute() {
+                scope.clone()
+            } else {
+                current_dir.join(scope)
+            };
+            if !path.exists() {
+                return Err(Error::path_not_found(scope.clone()));
+            }
+            let normalized_scope = normalize_existing_path(&path)?;
+            if !path_is_in_scope(&normalized_scope, &normalized_repo_root) {
+                return Err(Error::path_not_found(scope.clone()));
+            }
+            Ok(normalized_scope)
+        })
+        .collect::<Result<_>>()?;
+    Ok(paths
+        .into_iter()
+        .filter(|path| {
+            let normalized_path =
+                normalize_changed_path_for_scope(path, &original_repo_root, &normalized_repo_root);
+            absolute_scopes
+                .iter()
+                .any(|scope| path_is_in_scope(&normalized_path, scope))
+        })
+        .collect())
+}
+
+fn path_is_in_scope(path: &Path, scope: &Path) -> bool {
+    if scope == Path::new(".") {
+        return true;
+    }
+    path == scope || path.starts_with(scope)
+}
+
+fn normalize_existing_path(path: &Path) -> Result<PathBuf> {
+    path.canonicalize()
+        .map_err(|e| Error::io(e, path.to_path_buf()))
+}
+
+fn normalize_changed_path_for_scope(
+    path: &Path,
+    original_repo_root: &Path,
+    normalized_repo_root: &Path,
+) -> PathBuf {
+    if let Ok(normalized) = normalize_existing_path(path) {
+        return normalized;
+    }
+    if path.is_absolute() {
+        if let Ok(relative) = path.strip_prefix(original_repo_root) {
+            return normalized_repo_root.join(relative);
+        }
+        path.to_path_buf()
+    } else {
+        normalized_repo_root.join(path)
     }
 }
 
@@ -382,7 +471,10 @@ fn compile_glob_patterns(patterns: &[String]) -> Result<Vec<glob::Pattern>> {
 
 /// Returns repo-relative paths so changeset rules can match without
 /// touching the filesystem.
-fn discover_non_migration_files(diff_mode: DiffMode<'_>) -> Result<Vec<PathBuf>> {
+fn discover_non_migration_files(
+    diff_mode: DiffMode<'_>,
+    paths: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
     let repo = GitRepo::open(Path::new("."))?;
     let root = repo.root()?;
     let absolute = match diff_mode {
@@ -393,9 +485,20 @@ fn discover_non_migration_files(diff_mode: DiffMode<'_>) -> Result<Vec<PathBuf>>
             repo.changed_paths(base_ref, DiffSource::Index, ChangedKind::NonMigrations)?
         }
     };
+    let absolute = filter_paths_by_cli_scope(absolute, paths, &root)?;
+    let normalized_root = normalize_existing_path(&root)?;
     Ok(absolute
         .into_iter()
-        .map(|p| p.strip_prefix(&root).map(|r| r.to_path_buf()).unwrap_or(p))
+        .map(|p| {
+            p.strip_prefix(&root)
+                .map(|r| r.to_path_buf())
+                .or_else(|_| {
+                    normalize_changed_path_for_scope(&p, &root, &normalized_root)
+                        .strip_prefix(&normalized_root)
+                        .map(|r| r.to_path_buf())
+                })
+                .unwrap_or(p)
+        })
         .collect())
 }
 
@@ -616,7 +719,8 @@ fn output_compact(diagnostics: &[Diagnostic]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_text, SanitizePolicy};
+    use super::{normalize_changed_path_for_scope, sanitize_text, SanitizePolicy};
+    use std::path::Path;
 
     #[test]
     fn sanitize_multiline_preserves_newlines_and_escapes_controls() {
@@ -650,5 +754,18 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(sanitize_text(input, SanitizePolicy::SingleLine), expected);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_changed_path_rebuilds_missing_repo_relative_absolute_path_from_normalized_root() {
+        let original_root = Path::new("/tmp/project");
+        let normalized_root = Path::new("/private/tmp/project");
+        let staged_only_path = Path::new("/tmp/project/app/migrations/0001.py");
+
+        assert_eq!(
+            normalize_changed_path_for_scope(staged_only_path, original_root, normalized_root),
+            Path::new("/private/tmp/project/app/migrations/0001.py"),
+        );
     }
 }

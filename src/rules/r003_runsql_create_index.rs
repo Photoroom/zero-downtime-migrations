@@ -31,7 +31,7 @@ impl Rule for R003RunSQLCreateIndex {
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        for op in migration.operations_of_type(OperationType::RunSQL) {
+        for op in migration.database_effective_operations_of_type(OperationType::RunSQL) {
             if let OperationData::RunSQL(data) = &op.data {
                 // Strip comments and string literals before splitting,
                 // so an `INSERT INTO log VALUES ('CREATE INDEX ...; ...')`
@@ -231,6 +231,53 @@ class Migration(migrations.Migration):
         // The fix walks statement-by-statement after splitting on
         // `;` so each CREATE INDEX is evaluated independently.
         let diagnostics = check_migration(RUNSQL_MIXED_CONCURRENT_AND_NON_CONCURRENT_BAD);
+        assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+        assert_eq!(diagnostics[0].rule_id, "R003");
+    }
+
+    const RUNSQL_SEQUENCE_MIXED_CONCURRENT_AND_NON_CONCURRENT_BAD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+    atomic = False
+
+    operations = [
+        migrations.RunSQL(
+            sql=[
+                'CREATE INDEX a_idx ON t (a)',
+                'CREATE INDEX CONCURRENTLY b_idx ON t (b)',
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_statement_sequence_preserves_boundaries_for_concurrently_check() {
+        let diagnostics = check_migration(RUNSQL_SEQUENCE_MIXED_CONCURRENT_AND_NON_CONCURRENT_BAD);
+        assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+        assert_eq!(diagnostics[0].rule_id, "R003");
+    }
+
+    const RUNSQL_PARAMETERIZED_SEQUENCE_BAD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+    atomic = False
+
+    operations = [
+        migrations.RunSQL(
+            sql=[
+                ('CREATE INDEX a_idx ON t (a) WHERE tenant_id = %s', [1]),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_parameterized_statement_sequence_is_checked() {
+        let diagnostics = check_migration(RUNSQL_PARAMETERIZED_SEQUENCE_BAD);
         assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
         assert_eq!(diagnostics[0].rule_id, "R003");
     }

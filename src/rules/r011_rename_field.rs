@@ -31,7 +31,7 @@ impl Rule for R011RenameField {
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        for op in migration.operations_of_type(OperationType::RenameField) {
+        for op in migration.top_level_operations_of_type(OperationType::RenameField) {
             diagnostics.push(Diagnostic {
                 rule_id: self.id(),
                 rule_name: self.name(),

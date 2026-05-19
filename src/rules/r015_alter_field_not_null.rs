@@ -61,7 +61,7 @@ impl Rule for R015AlterFieldNotNull {
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        for op in migration.operations_of_type(OperationType::AlterField) {
+        for op in migration.database_effective_operations_of_type(OperationType::AlterField) {
             if let OperationData::Field(data) = &op.data {
                 if let Some(ref field) = data.field {
                     if !field.is_nullable {

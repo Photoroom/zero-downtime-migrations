@@ -101,27 +101,36 @@ impl CreatedModels {
 /// Walk a migration's database-effective operations in source order,
 /// threading created-model state through each callback.
 ///
-/// Wrapped `database_operations` are visited after the top-level
-/// list with an empty created set, because those operations target
-/// the live schema and must not inherit state-only `CreateModel`
-/// exemptions.
+/// Wrapped `database_operations` are visited at the wrapper's source
+/// position. They inherit real top-level `CreateModel` operations that
+/// came before the wrapper, but state-side operations inside the wrapper
+/// remain metadata-only and do not mutate the created-model set.
 pub(crate) fn walk_with_created_models(
     migration: &Migration,
     mut handle: impl FnMut(&Operation, &CreatedModels),
 ) {
     let mut created = CreatedModels::new();
     for op in &migration.operations {
-        if op.op_type == OperationType::CreateModel {
-            if let OperationData::Model(ModelOperation { name, .. }) = &op.data {
-                created.insert(name);
+        match &op.data {
+            OperationData::SeparateDatabaseAndState(data) => {
+                for db_op in &data.database_operations {
+                    if db_op.op_type == OperationType::CreateModel {
+                        if let OperationData::Model(ModelOperation { name, .. }) = &db_op.data {
+                            created.insert(name);
+                        }
+                    }
+                    handle(db_op, &created);
+                }
+            }
+            _ => {
+                if op.op_type == OperationType::CreateModel {
+                    if let OperationData::Model(ModelOperation { name, .. }) = &op.data {
+                        created.insert(name);
+                    }
+                }
+                handle(op, &created);
             }
         }
-        handle(op, &created);
-    }
-
-    let wrapped_created = CreatedModels::new();
-    for op in &migration.wrapped_database_ops {
-        handle(op, &wrapped_created);
     }
 }
 
@@ -639,6 +648,60 @@ class Migration(migrations.Migration):
             saw_uppercase |= created.contains("PRODUCT");
         });
         assert!(saw_lowercase && saw_titlecase && saw_uppercase);
+    }
+
+    #[test]
+    fn walk_with_created_models_visits_wrapped_database_ops_in_source_order() {
+        let source = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.CreateModel(
+            name='Product',
+            fields=[('id', models.BigAutoField(primary_key=True))],
+        ),
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.AddIndex(
+                    model_name='product',
+                    index=models.Index(fields=['name'], name='product_name_idx'),
+                ),
+            ],
+            state_operations=[
+                migrations.CreateModel(
+                    name='StateOnly',
+                    fields=[('id', models.BigAutoField(primary_key=True))],
+                ),
+            ],
+        ),
+        migrations.AddIndex(
+            model_name='stateonly',
+            index=models.Index(fields=['name'], name='stateonly_name_idx'),
+        ),
+    ]
+"#;
+        let migration = extract(source);
+        let mut seen: Vec<(OperationType, bool, bool)> = Vec::new();
+        walk_with_created_models(&migration, |op, created| {
+            seen.push((
+                op.op_type,
+                created.contains("product"),
+                created.contains("stateonly"),
+            ));
+        });
+        assert_eq!(
+            seen,
+            vec![
+                (OperationType::CreateModel, true, false),
+                (OperationType::AddIndex, true, false),
+                (OperationType::AddIndex, true, false),
+            ],
+            "wrapped database ops should inherit prior real CreateModel state, \
+             and state_operations must not create database state",
+        );
     }
 
     #[test]

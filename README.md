@@ -181,11 +181,11 @@ exclude = ["**/test_migrations/**"]
 Settings are applied in this order (highest to lowest priority):
 
 1. **CLI flags** (`--select`, `--ignore`, `--warnings-as-errors`)
-2. **`zero-downtime-migrations.toml`** found by walking up the directory tree
+2. **`zero-downtime-migrations.toml`** found in the current directory or a trusted repo ancestor
 3. **`pyproject.toml`** `[tool.zdm]` section in the same directory
 4. **Default values**
 
-The config search starts in the current working directory and walks upward, stopping at the first directory that contains either config file. The walk also stops at any directory containing a `.git` entry (the project root) or at the filesystem root — so running `zdm` from `repo/apps/myapp/migrations/` picks up `repo/zero-downtime-migrations.toml`, but a stray config above the repo is ignored.
+The config search starts in the current working directory. If zdm is running inside a trusted git repository, it walks upward within that repository and stops at the first directory that contains `zero-downtime-migrations.toml` or a `pyproject.toml` with `[tool.zdm]`. A pyproject for another tool is ignored, so running `zdm` from `repo/apps/myapp/migrations/` still picks up `repo/zero-downtime-migrations.toml`. Without a `.git` ancestor, only the current directory is checked; parent configs in shared build or temp directories are intentionally ignored.
 
 CLI flags always override config file settings. If both `zero-downtime-migrations.toml` and `pyproject.toml` exist in the same directory, the standalone file takes precedence; multi-level merging is not performed.
 
@@ -196,7 +196,7 @@ Add to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/Photoroom/zero-downtime-migrations
-    rev: v0.3.2
+    rev: <latest release tag>
     hooks:
       - id: zdm
 ```
@@ -206,7 +206,7 @@ Or use diff mode to only check changed migrations:
 ```yaml
 repos:
   - repo: https://github.com/Photoroom/zero-downtime-migrations
-    rev: v0.3.2
+    rev: <latest release tag>
     hooks:
       - id: zdm-diff
 ```
@@ -231,8 +231,8 @@ pre-commit is validating, rather than the previous `HEAD` commit.
 | **Requires Django installed** | No | Yes | Yes |
 | **Requires project setup** | No | Yes (settings.py) | Yes (full environment) |
 | **Checks for missing migrations** | No | No | Yes |
-| **Checks for unsafe operations** | Yes (16 rules; `zdm --list-rules`) | Yes (~8 rules) | No |
-| **Configurable via `pyproject.toml`** | Yes (walks up to repo root) | Yes | N/A |
+| **Checks for unsafe operations** | Yes (16 active rules; `zdm --list-rules`) | Yes (~8 rules) | No |
+| **Configurable via `pyproject.toml`** | Yes (walks up within trusted repos) | Yes | N/A |
 | **Can run without database** | Yes | Yes | No |
 | **Language** | Rust | Python | Python |
 

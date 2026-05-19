@@ -112,6 +112,11 @@ pub enum Error {
     )]
     InvalidGitReference { reference: String },
 
+    /// Invalid command-line flag or argument combination.
+    #[error("CLI usage error: {message}")]
+    #[diagnostic(code(zdm::cli::usage_error))]
+    CliUsage { message: String },
+
     /// Unknown rule. Format is single-line because the top-level
     /// error sink runs the chain through `sanitize_single_line`,
     /// which would otherwise escape an embedded `\n` into `\x0a`.
@@ -197,6 +202,13 @@ impl Error {
         Self::GitError {
             message: message.into(),
             source: None,
+        }
+    }
+
+    /// Create a CLI usage error.
+    pub fn cli_usage(message: impl Into<String>) -> Self {
+        Self::CliUsage {
+            message: message.into(),
         }
     }
 

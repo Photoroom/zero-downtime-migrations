@@ -14,12 +14,11 @@ use crate::diagnostics::Span;
 use crate::error::Result;
 use crate::parser::ParsedMigration;
 
-/// Map the source text of a `models.<Type>(...)` call expression
-/// to a Django field-type label. The list is the closed set of
-/// types any rule currently inspects; an unrecognised call (a
-/// user-defined field class, a third-party field) becomes
-/// "Unknown" so no rule fires on it spuriously.
-fn classify_field_call(call_text: &str) -> &'static str {
+/// Map the final function identifier of a field constructor call to a
+/// Django field-type label. The list is the closed set of types any rule
+/// currently inspects; an unrecognised call (a user-defined field class,
+/// a third-party field) becomes "Unknown" so no rule fires on it spuriously.
+fn classify_field_call(value: Node<'_>, ex: &MigrationExtractor<'_>) -> &'static str {
     const KNOWN: &[&str] = &[
         "ForeignKey",
         "CharField",
@@ -27,9 +26,17 @@ fn classify_field_call(call_text: &str) -> &'static str {
         "BooleanField",
         "TextField",
     ];
+    let Some(function) = value.child_by_field_name("function") else {
+        return "Unknown";
+    };
+    let function_text = ex.node_text(function);
+    let field_name = function_text
+        .split('.')
+        .next_back()
+        .unwrap_or(function_text);
     KNOWN
         .iter()
-        .find(|t| call_text.contains(*t))
+        .find(|t| **t == field_name)
         .copied()
         .unwrap_or("Unknown")
 }
@@ -176,14 +183,9 @@ impl<'a> MigrationExtractor<'a> {
             let Some(op) = self.extract_operation(child) else {
                 continue;
             };
-            if op.op_type == OperationType::SeparateDatabaseAndState {
-                if let Some(args) = child.child_by_field_name("arguments") {
-                    let list = self
-                        .get_keyword_arg_value(args, "database_operations")
-                        .or_else(|| self.get_nth_positional_value(args, 0));
-                    if let Some(list) = list {
-                        wrapped_database.extend(self.extract_operations_from_list(list));
-                    }
+            if let OperationData::SeparateDatabaseAndState(data) = &op.data {
+                for wrapped in &data.database_operations {
+                    wrapped_database.push(wrapped.clone());
                 }
             }
             top_level.push(op);
@@ -390,7 +392,7 @@ impl<'a> MigrationExtractor<'a> {
     fn extract_field_info(&self, args: Node) -> Option<FieldInfo> {
         let value = self.get_keyword_arg_value(args, "field")?;
         Some(FieldInfo {
-            field_type: classify_field_call(self.node_text(value)).to_string(),
+            field_type: classify_field_call(value, self).to_string(),
             is_nullable: field_kwarg_equals(self, value, "null", "True"),
             has_default: field_has_kwarg(self, value, "default"),
         })
@@ -482,25 +484,48 @@ impl<'a> MigrationExtractor<'a> {
 
     /// Extract SeparateDatabaseAndState operation data.
     fn extract_separate_db_state_operation(&self, args: Node) -> SeparateDatabaseAndStateOperation {
-        let mut has_state_operations = false;
-        let mut has_database_operations = false;
+        let database_operations_node = self
+            .get_keyword_arg_value(args, "database_operations")
+            .or_else(|| self.get_nth_positional_value(args, 0));
+        let state_operations_node = self
+            .get_keyword_arg_value(args, "state_operations")
+            .or_else(|| self.get_nth_positional_value(args, 1));
 
-        for child in args.children(&mut args.walk()) {
-            if child.kind() == "keyword_argument" {
-                if let Some(name) = child.child_by_field_name("name") {
-                    let name_text = self.node_text(name);
-                    if name_text == "state_operations" {
-                        has_state_operations = true;
-                    } else if name_text == "database_operations" {
-                        has_database_operations = true;
-                    }
-                }
-            }
-        }
+        let database_operations = database_operations_node
+            .map(|node| self.extract_operations_from_list(node))
+            .unwrap_or_default();
+        let state_operations = state_operations_node
+            .map(|node| self.extract_operations_from_list(node))
+            .unwrap_or_default();
+        let has_database_operations =
+            self.sdas_arm_has_meaningful_operations(database_operations_node, &database_operations);
+        let has_state_operations =
+            self.sdas_arm_has_meaningful_operations(state_operations_node, &state_operations);
 
         SeparateDatabaseAndStateOperation {
             has_state_operations,
             has_database_operations,
+            database_operations,
+        }
+    }
+
+    fn sdas_arm_has_meaningful_operations(
+        &self,
+        arm: Option<Node<'_>>,
+        extracted_operations: &[Operation],
+    ) -> bool {
+        let Some(arm) = arm else {
+            return false;
+        };
+        match arm.kind() {
+            "none" => false,
+            "list" => {
+                !extracted_operations.is_empty()
+                    || arm
+                        .named_children(&mut arm.walk())
+                        .any(|child| child.kind() != "comment")
+            }
+            _ => true,
         }
     }
 
@@ -633,13 +658,64 @@ impl<'a> MigrationExtractor<'a> {
     /// treat raw node text as the value.
     fn resolve_string_value(&self, node: Node<'_>) -> Option<String> {
         match node.kind() {
-            "string" => Some(self.extract_string_value(node)),
+            "string" | "concatenated_string" => Some(self.extract_string_value(node)),
+            "list" | "tuple" => self.resolve_sql_sequence_value(node),
             "identifier" => {
                 let name = self.node_text(node).to_string();
                 self.resolve_module_string_binding(&name)
             }
+            "attribute" => self.is_run_sql_noop(node).then(String::new),
             _ => None,
         }
+    }
+
+    fn resolve_sql_sequence_value(&self, node: Node<'_>) -> Option<String> {
+        let mut parts = Vec::new();
+        for child in node.named_children(&mut node.walk()) {
+            match child.kind() {
+                "string" | "concatenated_string" => {
+                    parts.push(Self::trim_sequence_statement(
+                        self.extract_string_value(child),
+                    ));
+                }
+                "list" | "tuple" => {
+                    parts.push(self.resolve_parameterized_sql_statement(child)?);
+                }
+                "comment" => {}
+                _ => return None,
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            // Django treats a sequence as separate SQL statements. Preserve
+            // that boundary so statement-level rules do not let CONCURRENTLY
+            // in one element exempt a blocking CREATE INDEX in another.
+            Some(parts.join(";\n"))
+        }
+    }
+
+    fn resolve_parameterized_sql_statement(&self, node: Node<'_>) -> Option<String> {
+        let first = node
+            .named_children(&mut node.walk())
+            .find(|child| child.kind() != "comment")?;
+        match first.kind() {
+            "string" | "concatenated_string" => Some(Self::trim_sequence_statement(
+                self.extract_string_value(first),
+            )),
+            _ => None,
+        }
+    }
+
+    fn trim_sequence_statement(statement: String) -> String {
+        statement.trim_end_matches(';').to_string()
+    }
+
+    fn is_run_sql_noop(&self, node: Node<'_>) -> bool {
+        matches!(
+            self.node_text(node),
+            "migrations.RunSQL.noop" | "RunSQL.noop"
+        )
     }
 
     /// Find a module-level `name = "string-literal"` assignment and return
@@ -667,7 +743,7 @@ impl<'a> MigrationExtractor<'a> {
             let Some(right) = assignment.child_by_field_name("right") else {
                 continue;
             };
-            if right.kind() == "string" {
+            if matches!(right.kind(), "string" | "concatenated_string") {
                 return Some(self.extract_string_value(right));
             }
         }
@@ -941,6 +1017,46 @@ class Migration(migrations.Migration):
         }
     }
 
+    const RUN_SQL_LITERAL_SHAPES: &str = r#"
+from django.db import migrations
+
+
+CREATE_SQL = "CREATE " "INDEX idx_a ON tbl (a);"
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL(sql=CREATE_SQL),
+        migrations.RunSQL(sql=["DROP INDEX idx_a;", "DROP INDEX idx_b;"]),
+        migrations.RunSQL(("CREATE INDEX idx_c ON tbl (c);", "DROP INDEX idx_c;")),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_run_sql_concatenated_and_sequence_literals() {
+        let parsed = ParsedMigration::parse(RUN_SQL_LITERAL_SHAPES).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let sql: Vec<_> = migration
+            .operations
+            .iter()
+            .map(|op| match &op.data {
+                OperationData::RunSQL(data) => data.sql.as_str(),
+                _ => panic!("Expected RunSQL data"),
+            })
+            .collect();
+        assert_eq!(
+            sql,
+            vec![
+                "CREATE INDEX idx_a ON tbl (a);",
+                "DROP INDEX idx_a;\nDROP INDEX idx_b",
+                "CREATE INDEX idx_c ON tbl (c);\nDROP INDEX idx_c",
+            ],
+        );
+    }
+
     const RUN_SQL_UNRESOLVABLE: &str = r#"
 from django.db import migrations
 
@@ -1150,6 +1266,36 @@ class Migration(migrations.Migration):
         }
     }
 
+    const CUSTOM_FOREIGN_KEY_FIELD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddField(
+            model_name='product',
+            name='external_id',
+            field=fields.CustomForeignKeyField(null=True),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_custom_field_name_containing_foreign_key_is_unknown() {
+        let parsed = ParsedMigration::parse(CUSTOM_FOREIGN_KEY_FIELD).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Field(data) = &migration.operations[0].data else {
+            panic!("Expected Field data");
+        };
+        assert_eq!(
+            data.field.as_ref().map(|field| field.field_type.as_str()),
+            Some("Unknown"),
+        );
+    }
+
     const SEPARATE_DB_AND_STATE_MIGRATION: &str = r#"
 from django.db import migrations, models
 
@@ -1327,6 +1473,85 @@ class Migration(migrations.Migration):
 
         assert_eq!(migration.operations.len(), 1);
         assert!(migration.wrapped_database_ops.is_empty());
+        let OperationData::SeparateDatabaseAndState(data) = &migration.operations[0].data else {
+            panic!("Expected SeparateDatabaseAndState data");
+        };
+        assert!(!data.has_database_operations);
+        assert!(!data.has_state_operations);
+    }
+
+    const SDAS_NON_LITERAL_ARMS: &str = r#"
+from django.db import migrations
+
+
+DB_OPS = [
+    migrations.RunSQL(sql='ALTER TABLE app_order DROP COLUMN legacy_id;'),
+]
+STATE_OPS = [
+    migrations.RemoveField(model_name='order', name='legacy_id'),
+]
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=DB_OPS,
+            state_operations=STATE_OPS,
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_sdas_non_literal_arms_count_as_present_but_are_not_expanded() {
+        let parsed = ParsedMigration::parse(SDAS_NON_LITERAL_ARMS).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        assert_eq!(migration.operations.len(), 1);
+        assert!(migration.wrapped_database_ops.is_empty());
+        let OperationData::SeparateDatabaseAndState(data) = &migration.operations[0].data else {
+            panic!("Expected SeparateDatabaseAndState data");
+        };
+        assert!(data.has_database_operations);
+        assert!(data.has_state_operations);
+        assert!(data.database_operations.is_empty());
+    }
+
+    const SDAS_NON_EMPTY_UNEXPANDED_LIST_ARMS: &str = r#"
+from django.db import migrations
+
+
+DB_OP = migrations.RunSQL(sql='ALTER TABLE app_order DROP COLUMN legacy_id;')
+STATE_OPS = [
+    migrations.RemoveField(model_name='order', name='legacy_id'),
+]
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[DB_OP],
+            state_operations=[*STATE_OPS],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_sdas_non_empty_unexpanded_list_arms_count_as_present() {
+        let parsed = ParsedMigration::parse(SDAS_NON_EMPTY_UNEXPANDED_LIST_ARMS).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        assert_eq!(migration.operations.len(), 1);
+        assert!(migration.wrapped_database_ops.is_empty());
+        let OperationData::SeparateDatabaseAndState(data) = &migration.operations[0].data else {
+            panic!("Expected SeparateDatabaseAndState data");
+        };
+        assert!(data.has_database_operations);
+        assert!(data.has_state_operations);
+        assert!(data.database_operations.is_empty());
     }
 
     const SDAS_NESTED: &str = r#"
