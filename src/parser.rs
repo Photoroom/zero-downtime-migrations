@@ -18,7 +18,7 @@ pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 /// Returns `Err(Error::FileTooLarge)` if the given byte count exceeds
 /// `MAX_FILE_SIZE`. Callers that already hold a source string should pass
 /// `source.len() as u64`; callers reading from disk can stat the file first.
-pub fn check_size(path: &Path, size: u64) -> Result<()> {
+pub(crate) fn check_size(path: &Path, size: u64) -> Result<()> {
     if size > MAX_FILE_SIZE {
         return Err(Error::file_too_large(path, size, MAX_FILE_SIZE));
     }
@@ -32,7 +32,7 @@ static PYTHON_LANGUAGE: Lazy<Language> = Lazy::new(|| tree_sitter_python::LANGUA
 #[derive(Debug)]
 pub struct ParsedMigration {
     /// The source code.
-    pub source: String,
+    pub(crate) source: String,
     /// The tree-sitter parse tree.
     tree: Tree,
 }
@@ -48,7 +48,7 @@ impl ParsedMigration {
 
         let tree = parser
             .parse(&source, None)
-            .ok_or_else(|| Error::parse_error("<source>", "tree-sitter failed to parse"))?;
+            .ok_or_else(|| Error::parse("<source>", "tree-sitter failed to parse"))?;
 
         Ok(Self { source, tree })
     }
@@ -88,7 +88,7 @@ impl ParsedMigration {
 
         let tree = parser
             .parse(&source, None)
-            .ok_or_else(|| Error::parse_error(path, "tree-sitter failed to parse"))?;
+            .ok_or_else(|| Error::parse(path, "tree-sitter failed to parse"))?;
 
         // Check for parse errors
         if tree.root_node().has_error() {
@@ -106,12 +106,12 @@ impl ParsedMigration {
     }
 
     /// Get the root node of the parse tree.
-    pub fn root_node(&self) -> Node<'_> {
+    pub(crate) fn root_node(&self) -> Node<'_> {
         self.tree.root_node()
     }
 
     /// Get the source code as bytes.
-    pub fn source_bytes(&self) -> &[u8] {
+    pub(crate) fn source_bytes(&self) -> &[u8] {
         self.source.as_bytes()
     }
 
@@ -138,7 +138,7 @@ impl ParsedMigration {
     }
 
     /// Find the operations list node, if present.
-    pub fn find_operations_list(&self) -> Option<Node<'_>> {
+    pub(crate) fn find_operations_list(&self) -> Option<Node<'_>> {
         let class_node = self.find_migration_class()?;
         let source = self.source_bytes();
 
@@ -228,7 +228,7 @@ impl ParsedMigration {
     }
 
     /// Get all import statements in the file.
-    pub fn get_imports(&self) -> Vec<Node<'_>> {
+    pub(crate) fn get_imports(&self) -> Vec<Node<'_>> {
         let root = self.root_node();
         let mut imports = Vec::new();
 
@@ -242,7 +242,7 @@ impl ParsedMigration {
     }
 
     /// Get the text of a node.
-    pub fn node_text(&self, node: Node<'_>) -> &str {
+    pub(crate) fn node_text(&self, node: Node<'_>) -> &str {
         node.utf8_text(self.source_bytes()).unwrap_or("")
     }
 }

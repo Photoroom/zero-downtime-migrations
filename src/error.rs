@@ -72,22 +72,30 @@ pub enum Error {
         column: usize,
     },
 
-    /// Configuration parse error
+    /// Configuration parse error.
+    ///
+    /// The `source` is an opaque [`ConfigParseSource`] so that a
+    /// future major version of the underlying TOML library can be
+    /// adopted without it being a breaking change for our consumers.
     #[error("Failed to parse configuration: {path}")]
     #[diagnostic(code(zdm::config::parse_error))]
     ConfigParseError {
         path: PathBuf,
         #[source]
-        source: toml::de::Error,
+        source: ConfigParseSource,
     },
 
-    /// Git error
+    /// Git error.
+    ///
+    /// The `source` is an opaque [`GitSource`] for the same
+    /// reason as `ConfigParseError`: keeps git2 out of our
+    /// public ABI.
     #[error("Git error: {message}")]
     #[diagnostic(code(zdm::git::error))]
     GitError {
         message: String,
         #[source]
-        source: Option<git2::Error>,
+        source: Option<GitSource>,
     },
 
     /// The supplied `--diff` reference does not exist (libgit2's NotFound).
@@ -167,14 +175,6 @@ impl Error {
         }
     }
 
-    /// Create a parse error.
-    pub fn parse_error(path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
-        Self::ParseError {
-            path: path.into(),
-            message: message.into(),
-        }
-    }
-
     /// Create a parse error with location.
     pub fn parse_error_with_location(path: impl Into<PathBuf>, line: usize, column: usize) -> Self {
         Self::ParseErrorWithLocation {
@@ -188,7 +188,7 @@ impl Error {
     pub fn config_parse_error(path: impl Into<PathBuf>, source: toml::de::Error) -> Self {
         Self::ConfigParseError {
             path: path.into(),
-            source,
+            source: source.into(),
         }
     }
 
@@ -229,5 +229,47 @@ impl Error {
     /// Create a path not found error.
     pub fn path_not_found(path: impl Into<PathBuf>) -> Self {
         Self::InvalidPath { path: path.into() }
+    }
+}
+
+/// Opaque wrapper around a TOML parse failure. Implements
+/// `std::error::Error + Display` so it shows up as the
+/// `#[source]` of [`Error::ConfigParseError`]; consumers can
+/// print it but cannot downcast to the underlying TOML library
+/// type. That keeps the TOML crate out of our public ABI — a
+/// future major version of it is not a breaking change for us.
+#[derive(Debug)]
+pub struct ConfigParseSource(toml::de::Error);
+
+impl std::fmt::Display for ConfigParseSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for ConfigParseSource {}
+
+impl From<toml::de::Error> for ConfigParseSource {
+    fn from(e: toml::de::Error) -> Self {
+        Self(e)
+    }
+}
+
+/// Opaque wrapper around a libgit2 failure. See
+/// [`ConfigParseSource`] for the rationale.
+#[derive(Debug)]
+pub struct GitSource(git2::Error);
+
+impl std::fmt::Display for GitSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for GitSource {}
+
+impl From<git2::Error> for GitSource {
+    fn from(e: git2::Error) -> Self {
+        Self(e)
     }
 }

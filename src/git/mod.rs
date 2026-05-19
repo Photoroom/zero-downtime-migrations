@@ -18,7 +18,12 @@ use crate::discovery::is_migration_file;
 use crate::error::{Error, Result};
 
 /// Status of a file in the git diff.
+///
+/// `#[non_exhaustive]`: libgit2 distinguishes Copied,
+/// Typechange, Unmodified, etc.; we surface only the four we
+/// currently act on, and reserve room to surface more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum FileStatus {
     Added,
     Modified,

@@ -8,14 +8,12 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 
-use zero_downtime_migrations::ast::extractor::MigrationExtractor;
 use zero_downtime_migrations::ast::Migration;
 use zero_downtime_migrations::config::Config;
 use zero_downtime_migrations::diagnostics::{Diagnostic, Severity};
 use zero_downtime_migrations::discovery;
 use zero_downtime_migrations::error::{Error, Result};
 use zero_downtime_migrations::git::GitRepo;
-use zero_downtime_migrations::parser::{self, ParsedMigration};
 use zero_downtime_migrations::rules::{ChangesetRuleRegistry, RuleRegistry};
 
 /// Zero-Downtime Migrations - A PostgreSQL migration safety linter for Django
@@ -408,34 +406,19 @@ fn parse_and_check_file(
     config: &Config,
     diff_mode: Option<DiffMode<'_>>,
 ) -> Result<(Migration, Vec<Diagnostic>)> {
-    // Both paths enforce a size cap (parser::MAX_FILE_SIZE) to bound memory
-    // and parse time on untrusted input. The regular path uses parse_file,
-    // which also reports syntax errors with line/column. The staged path
-    // emits a less precise error on syntax failure; aligning the two would
-    // mean exposing parse_file's internals as a source-string variant —
-    // tracked as a follow-up.
-    let parsed = match diff_mode {
+    // Migration::from_source / from_path bundle size check +
+    // parse + extract, returning a path-bearing error on syntax
+    // failure either way. Staged content comes from the git
+    // index blob (which has its own MAX_FILE_SIZE enforced by
+    // GitRepo); disk content goes through parse_file.
+    let migration = match diff_mode {
         Some(DiffMode::Staged { .. }) => {
             let repo = GitRepo::open(Path::new("."))?;
             let source = repo.read_staged_file(path)?;
-            parser::check_size(path, source.len() as u64)?;
-            let parsed = ParsedMigration::parse(&source)
-                .map_err(|e| Error::parse(path.to_path_buf(), e.to_string()))?;
-            if parsed.has_errors() {
-                return Err(Error::parse(
-                    path.to_path_buf(),
-                    "syntax error in migration file".to_string(),
-                ));
-            }
-            parsed
+            Migration::from_source(path, &source)?
         }
-        _ => ParsedMigration::parse_file(path)?,
+        _ => Migration::from_path(path)?,
     };
-
-    let extractor = MigrationExtractor::new(&parsed);
-    let migration = extractor
-        .extract(path)
-        .map_err(|e| Error::parse(path.to_path_buf(), e.to_string()))?;
 
     // Run rules
     let diagnostics = rule_registry.check(&migration, config);
@@ -513,13 +496,6 @@ fn output_default(diagnostics: &[Diagnostic]) {
         let severity_str = match diag.severity {
             Severity::Error => "error".red().bold(),
             Severity::Warning => "warning".yellow().bold(),
-            // `Severity` is `#[non_exhaustive]`; render any
-            // future variant the binary doesn't yet know about
-            // as a plain string so the diagnostic still shows up.
-            _ => format!("{:?}", diag.severity)
-                .to_lowercase()
-                .normal()
-                .bold(),
         };
 
         // Messages are single-line by convention (R008 etc. interpolate
@@ -664,10 +640,6 @@ fn output_compact(diagnostics: &[Diagnostic]) {
         let severity_char = match diag.severity {
             Severity::Error => "E",
             Severity::Warning => "W",
-            // `Severity` is `#[non_exhaustive]`; unknown future
-            // variants get a generic marker so the compact line
-            // still parses.
-            _ => "?",
         };
         println!(
             "{}:{}: {}: [{} {}] {}",

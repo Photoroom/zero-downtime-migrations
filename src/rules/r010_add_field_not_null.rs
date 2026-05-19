@@ -70,7 +70,7 @@ impl Rule for R010AddFieldNotNull {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::extractor::MigrationExtractor;
+    use crate::ast::MigrationExtractor;
     use crate::config::Config;
     use crate::parser::ParsedMigration;
     use std::path::Path;

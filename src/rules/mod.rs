@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_changeset_registry_honours_inline_suppression() {
-        use crate::ast::extractor::MigrationExtractor;
+        use crate::ast::MigrationExtractor;
         use crate::parser::ParsedMigration;
         use std::path::Path;
 
@@ -488,7 +488,7 @@ class Migration(migrations.Migration):
 
     #[test]
     fn test_changeset_registry_suppresses_r008_via_any_migration() {
-        use crate::ast::extractor::MigrationExtractor;
+        use crate::ast::MigrationExtractor;
         use crate::parser::ParsedMigration;
         use std::path::Path;
 
@@ -529,7 +529,7 @@ class Migration(migrations.Migration):
 
     #[test]
     fn test_changeset_registry_does_not_suppress_r008_via_unrelated_rule() {
-        use crate::ast::extractor::MigrationExtractor;
+        use crate::ast::MigrationExtractor;
         use crate::parser::ParsedMigration;
         use std::path::Path;
 
@@ -571,7 +571,7 @@ class Migration(migrations.Migration):
     // silently change exemption behaviour for all six rules at once.
     // -------------------------------------------------------------------
 
-    use crate::ast::extractor::MigrationExtractor;
+    use crate::ast::MigrationExtractor;
     use crate::parser::ParsedMigration;
     use std::path::Path;
 

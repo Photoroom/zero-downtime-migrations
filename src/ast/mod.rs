@@ -3,12 +3,17 @@
 //! This module provides typed Rust representations of Django migration
 //! operations extracted from tree-sitter Python AST nodes.
 
-pub mod extractor;
+pub(crate) mod extractor;
 mod operations;
 
-pub use extractor::MigrationExtractor;
+pub(crate) use extractor::MigrationExtractor;
 pub(crate) use operations::strip_sql_noise;
-pub use operations::*;
+pub(crate) use operations::FieldInfo;
+pub use operations::{
+    ConstraintOperation, ConstraintType, FieldOperation, IndexOperation, ModelOperation, Operation,
+    OperationData, OperationType, RunPythonOperation, RunSQLOperation,
+    SeparateDatabaseAndStateOperation,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -60,6 +65,40 @@ pub struct Migration {
 }
 
 impl Migration {
+    /// Load and extract a migration from a file on disk. Enforces
+    /// the size cap, parses with tree-sitter, surfaces syntax
+    /// errors with line/column, and returns the typed
+    /// `Migration`. This is the one-stop entry point for
+    /// programmatic consumers; out-of-tree rule authors writing
+    /// tests should reach for this rather than the lower-level
+    /// `ParsedMigration` / extractor pipeline.
+    pub fn from_path(path: &std::path::Path) -> crate::error::Result<Self> {
+        let parsed = crate::parser::ParsedMigration::parse_file(path)?;
+        MigrationExtractor::new(&parsed)
+            .extract(path)
+            .map_err(|e| crate::error::Error::parse(path.to_path_buf(), e.to_string()))
+    }
+
+    /// Extract a migration from in-memory source. Same pipeline
+    /// as [`Self::from_path`], minus the disk read — useful for
+    /// linting staged-but-uncommitted content (where we read the
+    /// git index blob) and for unit-testing custom rules with a
+    /// string literal.
+    pub fn from_source(path: &std::path::Path, source: &str) -> crate::error::Result<Self> {
+        crate::parser::check_size(path, source.len() as u64)?;
+        let parsed = crate::parser::ParsedMigration::parse(source)
+            .map_err(|e| crate::error::Error::parse(path.to_path_buf(), e.to_string()))?;
+        if parsed.has_errors() {
+            return Err(crate::error::Error::parse(
+                path.to_path_buf(),
+                "syntax error in migration file".to_string(),
+            ));
+        }
+        MigrationExtractor::new(&parsed)
+            .extract(path)
+            .map_err(|e| crate::error::Error::parse(path.to_path_buf(), e.to_string()))
+    }
+
     /// Get all operations of a specific type.
     pub fn operations_of_type(&self, op_type: OperationType) -> impl Iterator<Item = &Operation> {
         self.operations
