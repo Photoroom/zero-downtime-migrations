@@ -1,9 +1,9 @@
 # Changelog
 
-## 0.4.0 - Unreleased
+## 0.4.0 - 2026-05-20
 
 Accumulating changes since 0.3.2. The notes below describe the
-user-visible behaviour shifts for the next 0.4.0 release.
+user-visible behaviour shifts in the 0.4.0 release.
 
 ### Rules
 
@@ -34,12 +34,10 @@ user-visible behaviour shifts for the next 0.4.0 release.
   an order-blind `is_model_created` lookup). Real-world migrations
   rarely put the CreateModel below, but generated/auto-merged
   migrations sometimes do.
-- **R006 (add-field-foreign-key)** exemption now requires a plain
-  btree `AddIndexConcurrently` whose **first** column matches the
-  FK column. A non-leading column doesn't help an FK lookup;
-  partial/expression/non-btree indexes can't satisfy FK
-  enforcement and the extractor doesn't see those attributes yet,
-  so the help text now documents this gap.
+- **R006 (add-field-foreign-key)** now deliberately ignores prebuilt
+  index exemptions. Even a matching `AddIndexConcurrently` does not
+  silence a one-step `AddField(ForeignKey)` on an existing table;
+  split the column, index, backfill, and constraint work explicitly.
 
 ### CLI / output
 
@@ -111,8 +109,7 @@ be present on every diagnostic.
   inspect them in execution order while preserving each operation's
   source span.
 - AST extractor captures index column lists and names on
-  `IndexOperation` so R006 can do leading-column matching against
-  pre-existing concurrent indexes.
+  `IndexOperation` for future index-shape analysis.
 - `extract_string_value` now decomposes tree-sitter `string` /
   `concatenated_string` nodes correctly, including raw-prefixed
   (`r"..."`), triple-quoted, and Python's adjacent-literal

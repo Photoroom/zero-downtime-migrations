@@ -1,3 +1,5 @@
-Either pre-create the index with AddIndexConcurrently (in the same migration, *before* the AddField), or split the operation via SeparateDatabaseAndState: add the column without the FK constraint first, backfill, then add the constraint.
+Split the operation via SeparateDatabaseAndState instead of adding the ForeignKey in one AddField on an existing table.
 
-The exemption requires a plain btree index whose first column matches the FK. A `condition=` (partial), `opclasses=` (non-btree), or expression-based index won't satisfy the FK enforcement lookup even if its leading column matches — zdm currently can't detect those attributes, so a partial concurrent index on the FK column will be accepted as the exemption. Use a plain index, or accept that R006 might fire even when an exotic index exists.
+Pre-creating an index with AddIndexConcurrently is no longer treated as sufficient to silence R006. It can help query plans, but the AddField(ForeignKey) operation still couples column creation, implicit index/constraint work, and FK validation into one deployment step.
+
+A safer rollout is: add the column without the FK constraint, backfill if needed, build supporting indexes concurrently, then add/validate the constraint separately while keeping Django state aligned.
