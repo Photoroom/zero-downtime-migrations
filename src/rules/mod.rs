@@ -73,15 +73,8 @@ impl<'a> RuleContext<'a> {
 }
 
 /// Case-insensitive set of model names created so far during a
-/// `walk_with_created_models` traversal.
-///
-/// Django is case-insensitive on `model_name=` lookups (the ORM
-/// lowercases on both sides), so the previous hand-rolled walks
-/// did `created_so_far.contains(&data.model_name.to_lowercase())`
-/// at six call sites. Centralising that into a method here means
-/// (a) a future case-handling change is one edit, and (b) callers
-/// can't accidentally compare a non-lowercased name and silently
-/// miss an exemption.
+/// `walk_with_created_models` traversal. `contains` lowercases
+/// on both sides so callers can pass `model_name` as-is.
 pub struct CreatedModels {
     names: HashSet<String>,
 }
@@ -108,17 +101,10 @@ impl CreatedModels {
 /// Walk a migration's database-effective operations in source order,
 /// threading created-model state through each callback.
 ///
-/// Rules that exempt an operation when its target model was
-/// created earlier in the same migration (R001, R002, R006,
-/// R010, R016, R017) use this. The closure receives the op and
-/// the set; it should call `created.contains(model_name)` to
-/// check for the exemption — no manual lowercasing needed,
-/// `CreatedModels` handles that.
-///
-/// Operations wrapped in `SeparateDatabaseAndState(database_operations=[...])`
-/// are walked after the top-level list with an empty created set:
-/// the wrapper implies the database op targets the live schema, so a
-/// top-level state-only `CreateModel` must not exempt it.
+/// Wrapped `database_operations` are visited after the top-level
+/// list with an empty created set, because those operations target
+/// the live schema and must not inherit state-only `CreateModel`
+/// exemptions.
 pub(crate) fn walk_with_created_models(
     migration: &Migration,
     mut handle: impl FnMut(&Operation, &CreatedModels),

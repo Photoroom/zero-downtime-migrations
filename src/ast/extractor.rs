@@ -459,9 +459,13 @@ impl<'a> MigrationExtractor<'a> {
 
     /// Extract RunPython operation data.
     fn extract_run_python_operation(&self, args: Node) -> RunPythonOperation {
+        let nth_positional_text = |n: usize| {
+            self.get_nth_positional_value(args, n)
+                .map(|node| self.node_text(node).to_string())
+        };
         let code = self
             .get_keyword_arg_string(args, "code")
-            .or_else(|| self.get_nth_positional_arg(args, 0))
+            .or_else(|| nth_positional_text(0))
             .unwrap_or_default();
         // Treat an explicit Python `None` (`RunPython(forward, None)` or
         // `reverse_code=None`) as no reverse. Django itself flags that
@@ -470,7 +474,7 @@ impl<'a> MigrationExtractor<'a> {
         // it for a real callable name.
         let reverse_code = self
             .get_keyword_arg_string(args, "reverse_code")
-            .or_else(|| self.get_nth_positional_arg(args, 1))
+            .or_else(|| nth_positional_text(1))
             .filter(|s| s != "None");
 
         RunPythonOperation { code, reverse_code }
@@ -666,29 +670,6 @@ impl<'a> MigrationExtractor<'a> {
             if right.kind() == "string" {
                 return Some(self.extract_string_value(right));
             }
-        }
-        None
-    }
-
-    /// Get the textual source of the Nth positional argument, regardless
-    /// of expression shape. Skips `keyword_argument` and `comment` named
-    /// children so that e.g. `RunPython(forward, reverse_code=rev)`
-    /// returns `forward` for `n == 0` and yields nothing for `n == 1`,
-    /// and `RunPython(forward, # note\n backward)` returns `backward` for
-    /// `n == 1`. The returned string is the raw node text (e.g.
-    /// `migrations.RunPython.noop`, `helpers.fwd`, `(forward)`, or
-    /// `make_forward()`); callers that need a specific shape should
-    /// inspect it further.
-    fn get_nth_positional_arg(&self, args: Node, n: usize) -> Option<String> {
-        let mut count = 0;
-        for child in args.named_children(&mut args.walk()) {
-            if matches!(child.kind(), "keyword_argument" | "comment") {
-                continue;
-            }
-            if count == n {
-                return Some(self.node_text(child).to_string());
-            }
-            count += 1;
         }
         None
     }

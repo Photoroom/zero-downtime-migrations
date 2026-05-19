@@ -99,7 +99,7 @@ impl Config {
     /// Returns `None` if no config file is found within those
     /// bounds.
     fn find_config_dir(start: &Path) -> Option<std::path::PathBuf> {
-        // Three structural rules, in order:
+        // Four structural rules, in order:
         //
         //   (1) A config in `start` always wins — no walk-up needed.
         //   (2) If `start` is itself the repo root (has its own

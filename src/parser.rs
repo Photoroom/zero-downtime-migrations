@@ -11,8 +11,12 @@ use tree_sitter::{Language, Node, Parser, Tree};
 
 use crate::error::{Error, Result};
 
-/// Maximum file size for migration files (10 MB).
-/// This bounds memory use and parse time when processing untrusted input.
+/// Maximum size (in bytes) of a single migration file the
+/// parser will accept. Bounds memory use and parse time when
+/// processing untrusted input. Currently a hard-coded 10 MiB;
+/// the test suite reaches this constant to construct a fixture
+/// just past the limit, hence the `pub` (otherwise this would
+/// be `pub(crate)`).
 pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Returns `Err(Error::FileTooLarge)` if the given byte count exceeds
