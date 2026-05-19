@@ -7,7 +7,8 @@
 //! This rule was originally split across R006 (FK locks the table) and
 //! R007 (FK should be preceded by a concurrent index). They fired on the
 //! same operation with overlapping prescriptions; R007 was retired and
-//! its order-aware concurrent-index exemption is now part of R006.
+//! R006 now uses the stricter policy: a prebuilt index does not make the
+//! `AddField(ForeignKey)` operation itself safe.
 
 use crate::ast::{Migration, OperationData, OperationType};
 use crate::diagnostics::{Diagnostic, Severity};
@@ -28,8 +29,7 @@ impl Rule for R006AddFieldForeignKey {
     fn description(&self) -> &'static str {
         "AddField with a ForeignKey on an existing table creates an implicit \
          index (locking the table while it builds) and validates the FK \
-         constraint against every existing row. Pre-create the index with \
-         AddIndexConcurrently earlier in the migration, or split the work via \
+         constraint against every existing row. Split the work via \
          SeparateDatabaseAndState."
     }
 
@@ -38,49 +38,9 @@ impl Rule for R006AddFieldForeignKey {
     }
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
-        // R006 needs an extra piece of state on top of the standard
-        // `created_so_far` walk: `leading_columns` tracks concurrent
-        // indexes that appeared *before* the AddField and lead with
-        // the FK column. Postgres can use a btree's leading prefix
-        // for FK lookups/joins but not a non-leading column, so an
-        // index on `(status, customer)` does nothing for an FK on
-        // `customer`. The closure captures both — `created_so_far`
-        // comes from the helper, `leading_columns` is local state
-        // the closure mutates as it iterates.
-        //
-        // Known simplification: this exemption assumes the prior
-        // concurrent index is a plain btree without a `condition=`
-        // (partial) or `opclasses=` set. A partial index on the FK
-        // column doesn't help if the FK target row is filtered out
-        // of the index, and a hash/GiST/GIN index can't satisfy the
-        // FK enforcement lookup. The extractor doesn't surface those
-        // attributes yet, so a savvy attacker who adds an unrelated
-        // partial concurrent index could still trigger the
-        // exemption. In practice the AddIndexConcurrently →
-        // AddField(FK) pattern is almost always a plain btree;
-        // tightening this is tracked for a follow-up alongside
-        // partial/expression index extraction.
         let mut diagnostics = Vec::new();
-        let mut leading_columns: std::collections::HashMap<
-            String,
-            std::collections::HashSet<String>,
-        > = std::collections::HashMap::new();
 
         walk_with_created_models(migration, |op, created| {
-            // First: record any concurrent-index op we see, so
-            // subsequent AddFields can consult `leading_columns`.
-            if op.op_type == OperationType::AddIndexConcurrently {
-                if let OperationData::Index(idx) = &op.data {
-                    if let Some(first) = idx.columns.first() {
-                        leading_columns
-                            .entry(idx.model_name.to_lowercase())
-                            .or_default()
-                            .insert(normalize_index_column(first));
-                    }
-                }
-                return;
-            }
-
             if op.op_type != OperationType::AddField {
                 return;
             }
@@ -93,19 +53,6 @@ impl Rule for R006AddFieldForeignKey {
             }
 
             if created.contains(&data.model_name) {
-                return;
-            }
-            // Django uses lowercase column names; we also accept
-            // the auto-suffixed `<name>_id` form, since FK columns
-            // in Postgres carry that suffix and the user may have
-            // indexed either spelling.
-            let model = data.model_name.to_lowercase();
-            let field_name = data.field_name.to_lowercase();
-            let fk_column = format!("{field_name}_id");
-            if leading_columns
-                .get(&model)
-                .is_some_and(|leads| leads.contains(&field_name) || leads.contains(&fk_column))
-            {
                 return;
             }
 
@@ -125,10 +72,6 @@ impl Rule for R006AddFieldForeignKey {
 
         diagnostics
     }
-}
-
-fn normalize_index_column(column: &str) -> String {
-    column.trim_start_matches('-').to_lowercase()
 }
 
 #[cfg(test)]
@@ -254,9 +197,10 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn test_add_fk_after_concurrent_index_good() {
+    fn test_add_fk_after_concurrent_index_still_flags() {
         let diagnostics = check_migration(ADD_FK_AFTER_CONCURRENT_INDEX_GOOD);
-        assert!(diagnostics.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R006");
     }
 
     #[test]
@@ -322,15 +266,14 @@ class Migration(migrations.Migration):
 "#;
 
     #[test]
-    fn test_add_fk_after_concurrent_index_on_fk_id_column_good() {
-        // Postgres FK columns get a `<name>_id` suffix, so a user may
-        // index either `customer` (Django's field name) or
-        // `customer_id` (the actual SQL column). Both should exempt.
+    fn test_add_fk_after_concurrent_index_on_fk_id_column_still_flags() {
+        // A prebuilt index can help later query plans, but the
+        // AddField(ForeignKey) operation still validates the FK and
+        // can create implicit index/constraint work. R006 keeps the
+        // warning and points users to an explicit split.
         let diagnostics = check_migration(ADD_FK_AFTER_CONCURRENT_INDEX_ON_FK_ID_COLUMN_GOOD);
-        assert!(
-            diagnostics.is_empty(),
-            "expected no diagnostics, got: {diagnostics:?}",
-        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R006");
     }
 
     const ADD_FK_AFTER_DESCENDING_CONCURRENT_INDEX_GOOD: &str = r#"
@@ -355,12 +298,10 @@ class Migration(migrations.Migration):
 "#;
 
     #[test]
-    fn test_add_fk_after_descending_concurrent_index_good() {
+    fn test_add_fk_after_descending_concurrent_index_still_flags() {
         let diagnostics = check_migration(ADD_FK_AFTER_DESCENDING_CONCURRENT_INDEX_GOOD);
-        assert!(
-            diagnostics.is_empty(),
-            "expected no diagnostics, got: {diagnostics:?}",
-        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R006");
     }
 
     const ADD_FK_AFTER_MULTI_COLUMN_INDEX_GOOD: &str = r#"
@@ -388,15 +329,13 @@ class Migration(migrations.Migration):
 "#;
 
     #[test]
-    fn test_add_fk_after_multi_column_index_leading_with_fk_good() {
-        // A composite index on `(customer, status)` is usable for FK
-        // joins/lookups on `customer` because Postgres can use any
-        // leading-prefix of a btree.
+    fn test_add_fk_after_multi_column_index_leading_with_fk_still_flags() {
+        // Even a covering composite index does not make this one-step
+        // AddField(ForeignKey) rollout the pattern R006 wants users to
+        // ship. Keep the diagnostic conservative.
         let diagnostics = check_migration(ADD_FK_AFTER_MULTI_COLUMN_INDEX_GOOD);
-        assert!(
-            diagnostics.is_empty(),
-            "expected no diagnostics, got: {diagnostics:?}",
-        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R006");
     }
 
     const ADD_FK_AFTER_MULTI_COLUMN_INDEX_TRAILING_FK_BAD: &str = r#"
@@ -462,17 +401,11 @@ class Migration(migrations.Migration):
 
     #[test]
     fn test_two_fks_only_one_covered_flags_uncovered() {
-        // Per-FK granularity: the `customer` FK is exempt because of
-        // the prior concurrent index, but the `product` FK has no
-        // matching index and must still be flagged.
+        // Prebuilt indexes do not exempt either FK; both one-step
+        // AddField(ForeignKey) operations should be reported.
         let diagnostics = check_migration(TWO_FKS_ONLY_ONE_COVERED);
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].rule_id, "R006");
-        assert!(
-            diagnostics[0].message.contains("order"),
-            "diagnostic should be on the order model, got: {}",
-            diagnostics[0].message
-        );
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics.iter().all(|d| d.rule_id == "R006"));
     }
 
     const ADD_FK_WITH_DB_COLUMN_KNOWN_LIMITATION: &str = r#"
@@ -532,14 +465,11 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn test_add_fk_with_db_column_is_false_positive() {
-        // Known limitation: the extractor does not capture `db_column`,
-        // so an index on the real SQL column (`legacy_customer`)
-        // doesn't match the field name (`customer`) or its `_id`
-        // suffix. R006 currently flags this even though the user
-        // pre-built a covering index. Pinning the false-positive
-        // behavior so a future `db_column`-aware extractor forces a
-        // re-think instead of silently passing.
+    fn test_add_fk_with_db_column_and_prebuilt_index_still_flags() {
+        // The conservative R006 policy is deliberately independent of
+        // column-name matching: even if the prebuilt index targets the
+        // physical db_column, the AddField(ForeignKey) rollout still
+        // needs to be split explicitly.
         let diagnostics = check_migration(ADD_FK_WITH_DB_COLUMN_KNOWN_LIMITATION);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R006");
