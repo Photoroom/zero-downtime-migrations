@@ -31,7 +31,7 @@ impl Rule for R012IrreversibleRunPython {
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        for op in migration.operations_of_type(OperationType::RunPython) {
+        for op in migration.database_effective_operations_of_type(OperationType::RunPython) {
             if let OperationData::RunPython(data) = &op.data {
                 if !data.is_reversible() {
                     diagnostics.push(Diagnostic {
@@ -58,10 +58,6 @@ impl Rule for R012IrreversibleRunPython {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::extractor::MigrationExtractor;
-    use crate::config::Config;
-    use crate::parser::ParsedMigration;
-    use std::path::Path;
 
     const IRREVERSIBLE_BAD: &str = r#"
 from django.db import migrations
@@ -98,19 +94,11 @@ class Migration(migrations.Migration):
 "#;
 
     fn check_migration(source: &str) -> Vec<Diagnostic> {
-        let parsed = ParsedMigration::parse(source).unwrap();
-        let extractor = MigrationExtractor::new(&parsed);
-        let migration = extractor.extract(Path::new("test.py")).unwrap();
-        let config = Config::default();
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("test.py"),
-        };
-        R012IrreversibleRunPython.check(&migration, &ctx)
+        crate::rules::test_support::check_rule(&R012IrreversibleRunPython, source)
     }
 
     #[test]
-    fn test_irreversible_run_python_warns() {
+    fn test_runpython_without_reverse_code_is_flagged() {
         let diagnostics = check_migration(IRREVERSIBLE_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R012");

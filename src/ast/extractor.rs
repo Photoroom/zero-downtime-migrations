@@ -14,55 +14,81 @@ use crate::diagnostics::Span;
 use crate::error::Result;
 use crate::parser::ParsedMigration;
 
-/// Check if `text` contains a `keyword=value` assignment that sits at a
-/// keyword-argument boundary inside a call. Both `null=True` and
-/// `null = True` match, but `not_null=True` (no boundary before) and
-/// `null=Truthy` (no boundary after the value) do not.
-fn contains_keyword_assignment(text: &str, keyword: &str, value: &str) -> bool {
-    let normalized = strip_whitespace(text);
-    let value_bytes = value.as_bytes();
-    for after_eq in keyword_eq_positions(&normalized, keyword) {
-        if !normalized[after_eq..].starts_with(value_bytes) {
-            continue;
-        }
-        let next = normalized
-            .get(after_eq + value_bytes.len())
-            .copied()
-            .unwrap_or(b')');
-        if matches!(next, b',' | b')') {
-            return true;
+/// Map the final function identifier of a field constructor call to a
+/// Django field-type label. The list is the closed set of types any rule
+/// currently inspects; an unrecognised call (a user-defined field class,
+/// a third-party field) becomes "Unknown" so no rule fires on it spuriously.
+fn classify_field_call(value: Node<'_>, ex: &MigrationExtractor<'_>) -> &'static str {
+    const KNOWN: &[&str] = &[
+        "ForeignKey",
+        "CharField",
+        "IntegerField",
+        "BooleanField",
+        "TextField",
+    ];
+    let Some(function) = value.child_by_field_name("function") else {
+        return "Unknown";
+    };
+    let function_text = ex.node_text(function);
+    let field_name = function_text
+        .split('.')
+        .next_back()
+        .unwrap_or(function_text);
+    KNOWN
+        .iter()
+        .find(|t| **t == field_name)
+        .copied()
+        .unwrap_or("Unknown")
+}
+
+/// `true` if the `models.<Type>(...)` call rooted at `value` has
+/// a `keyword=expected` kwarg. Descends the tree-sitter AST so
+/// `null=True`, `null = True`, and `null=\nTrue` all match,
+/// and `null_field=True` doesn't accidentally fire.
+fn field_kwarg_equals(
+    ex: &MigrationExtractor<'_>,
+    value: Node<'_>,
+    keyword: &str,
+    expected: &str,
+) -> bool {
+    field_call_kwargs(value).any(|kw| {
+        kw.child_by_field_name("name")
+            .is_some_and(|n| ex.node_text(n) == keyword)
+            && kw
+                .child_by_field_name("value")
+                .is_some_and(|v| ex.node_text(v).trim() == expected)
+    })
+}
+
+/// `true` if the `models.<Type>(...)` call rooted at `value` has
+/// a `keyword=<anything>` kwarg. Same AST-walking shape as
+/// [`field_kwarg_equals`] but ignores the value.
+fn field_has_kwarg(ex: &MigrationExtractor<'_>, value: Node<'_>, keyword: &str) -> bool {
+    field_call_kwargs(value).any(|kw| {
+        kw.child_by_field_name("name")
+            .is_some_and(|n| ex.node_text(n) == keyword)
+    })
+}
+
+/// Iterate the `keyword_argument` children of the `arguments`
+/// list inside a call expression. Walks into `value`'s
+/// `arguments` field if `value` is a call (the normal case:
+/// `value = models.CharField(...)`); otherwise yields nothing.
+fn field_call_kwargs(value: Node<'_>) -> impl Iterator<Item = Node<'_>> {
+    let args = if value.kind() == "call" {
+        value.child_by_field_name("arguments")
+    } else {
+        None
+    };
+    let mut children: Vec<Node<'_>> = Vec::new();
+    if let Some(args) = args {
+        for child in args.children(&mut args.walk()) {
+            if child.kind() == "keyword_argument" {
+                children.push(child);
+            }
         }
     }
-    false
-}
-
-/// Check if `text` contains `keyword=...` where `keyword` is a complete
-/// kwarg name (preceded by `(`, `,`, or start of text).
-fn contains_keyword_with_value(text: &str, keyword: &str) -> bool {
-    let normalized = strip_whitespace(text);
-    !keyword_eq_positions(&normalized, keyword).is_empty()
-}
-
-/// Indices in `normalized` just after each `<keyword>=` whose keyword sits
-/// at a kwarg boundary (preceded by `(`, `,`, or start of text).
-fn keyword_eq_positions(normalized: &[u8], keyword: &str) -> Vec<usize> {
-    let kw_eq: Vec<u8> = keyword.bytes().chain(std::iter::once(b'=')).collect();
-    let mut hits = Vec::new();
-    for i in 0..normalized.len() {
-        if !normalized[i..].starts_with(&kw_eq) {
-            continue;
-        }
-        let prev = if i == 0 { b'(' } else { normalized[i - 1] };
-        if !matches!(prev, b'(' | b',') {
-            continue;
-        }
-        hits.push(i + kw_eq.len());
-    }
-    hits
-}
-
-fn strip_whitespace(text: &str) -> Vec<u8> {
-    text.bytes().filter(|b| !b.is_ascii_whitespace()).collect()
+    children.into_iter()
 }
 
 /// Parse a `# zdm: ignore RXXX[, RYYY]` comment into its rule-ID set,
@@ -104,27 +130,22 @@ impl<'a> MigrationExtractor<'a> {
 
     /// Extract a complete Migration from the parsed file.
     pub fn extract(&self, path: &Path) -> Result<Migration> {
-        let operations = self.extract_operations();
+        let (operations, wrapped_database_ops) = self.extract_operations();
         let imports = self.extract_imports();
         let is_non_atomic = self.parsed.is_non_atomic();
         let line_ignores = self.extract_line_ignores();
-
-        // Track created models for exemption
-        let created_models: Vec<String> = operations
-            .iter()
-            .filter(|op| op.op_type == OperationType::CreateModel)
-            .filter_map(|op| match &op.data {
-                OperationData::Model(m) => Some(m.name.clone()),
-                _ => None,
-            })
-            .collect();
+        let class_span = self
+            .parsed
+            .find_migration_class()
+            .map(|n| Span::from_node(&n));
 
         Ok(Migration {
             path: path.to_path_buf(),
             is_non_atomic,
             operations,
             imports,
-            created_models,
+            wrapped_database_ops,
+            class_span,
             line_ignores,
         })
     }
@@ -141,22 +162,61 @@ impl<'a> MigrationExtractor<'a> {
         map
     }
 
-    /// Extract all operations from the migration.
-    fn extract_operations(&self) -> Vec<Operation> {
+    /// Extract the migration's top-level operations and, alongside them,
+    /// any operations wrapped in
+    /// `SeparateDatabaseAndState(database_operations=[...])`. State-side
+    /// wrapped ops are intentionally NOT surfaced: they're metadata-only
+    /// and rules that scan for schema-locking patterns should ignore
+    /// them.
+    fn extract_operations(&self) -> (Vec<Operation>, Vec<Operation>) {
+        let mut top_level: Vec<Operation> = Vec::new();
+        let mut wrapped_database: Vec<Operation> = Vec::new();
+
         let Some(ops_list) = self.parsed.find_operations_list() else {
-            return vec![];
+            return (top_level, wrapped_database);
         };
 
-        let mut operations = Vec::new();
-
         for child in ops_list.children(&mut ops_list.walk()) {
+            if child.kind() != "call" {
+                continue;
+            }
+            let Some(op) = self.extract_operation(child) else {
+                continue;
+            };
+            if let OperationData::SeparateDatabaseAndState(data) = &op.data {
+                for wrapped in &data.database_operations {
+                    wrapped_database.push(wrapped.clone());
+                }
+            }
+            top_level.push(op);
+        }
+
+        (top_level, wrapped_database)
+    }
+
+    /// Iterate a `list` syntax node and extract any `call` children as
+    /// operations. Shared by the top-level walk and the
+    /// SeparateDatabaseAndState descent so the same extraction rules
+    /// (e.g. unknown operation types) apply uniformly. Non-`list` value
+    /// nodes (e.g. `database_operations=None`, a comprehension, an
+    /// identifier referring to a module-level list) yield an empty
+    /// vector — we only descend into a literal list. A nested
+    /// `SeparateDatabaseAndState` inside `database_operations` is
+    /// surfaced as a single op; we deliberately do not recurse, since
+    /// the doubly-nested form has no real-world use and recursion would
+    /// hide it from rules that want to flag it.
+    fn extract_operations_from_list(&self, list: Node<'_>) -> Vec<Operation> {
+        let mut operations = Vec::new();
+        if list.kind() != "list" {
+            return operations;
+        }
+        for child in list.children(&mut list.walk()) {
             if child.kind() == "call" {
                 if let Some(op) = self.extract_operation(child) {
                     operations.push(op);
                 }
             }
         }
-
         operations
     }
 
@@ -187,7 +247,7 @@ impl<'a> MigrationExtractor<'a> {
             | OperationType::AddIndexConcurrently
             | OperationType::RemoveIndex
             | OperationType::RemoveIndexConcurrently => {
-                OperationData::Index(self.extract_index_operation(args))
+                OperationData::Index(self.extract_index_operation(op_type, args))
             }
             OperationType::CreateModel => {
                 OperationData::Model(self.extract_create_model_operation(args))
@@ -213,14 +273,83 @@ impl<'a> MigrationExtractor<'a> {
     }
 
     /// Extract index operation data.
-    fn extract_index_operation(&self, args: Node) -> IndexOperation {
+    ///
+    /// Add forms (`AddIndex`/`AddIndexConcurrently`) carry their index
+    /// definition nested in an `index=models.Index(...)` call, so we
+    /// drill into that to recover the index name and column list.
+    /// Remove forms (`RemoveIndex`/`RemoveIndexConcurrently`) just
+    /// reference the index by its top-level `name=` kwarg and carry no
+    /// column info.
+    fn extract_index_operation(&self, op_type: OperationType, args: Node<'a>) -> IndexOperation {
         let model_name = self.get_keyword_arg_string(args, "model_name");
-        // Index name would be nested inside the index argument
+
+        let (index_name, columns) = match op_type {
+            OperationType::AddIndex | OperationType::AddIndexConcurrently => {
+                self.extract_inner_index_call(args)
+            }
+            OperationType::RemoveIndex | OperationType::RemoveIndexConcurrently => {
+                (self.get_keyword_arg_string(args, "name"), Vec::new())
+            }
+            _ => (None, Vec::new()),
+        };
 
         IndexOperation {
             model_name: model_name.unwrap_or_default(),
-            index_name: None,
+            index_name,
+            columns,
         }
+    }
+
+    /// Drill into the `index=models.Index(...)` argument of an Add
+    /// form and pull out the inner call's `name=` and `fields=[...]`.
+    /// Returns `(None, Vec::new())` if the argument is missing, isn't a
+    /// call node, or has no recognisable inner kwargs. The kwarg form
+    /// is preferred but the positional form (`AddIndex('model', index)`
+    /// — Django's signature is `(model_name, index)`) is also accepted.
+    /// Non-literal `fields` values (an identifier, a comprehension)
+    /// yield an empty column vec — we deliberately don't try to
+    /// resolve them.
+    fn extract_inner_index_call(&self, args: Node<'a>) -> (Option<String>, Vec<String>) {
+        let index_value = self
+            .get_keyword_arg_value(args, "index")
+            .or_else(|| self.get_nth_positional_value(args, 1));
+        let Some(index_value) = index_value else {
+            return (None, Vec::new());
+        };
+        if index_value.kind() != "call" {
+            return (None, Vec::new());
+        }
+        let Some(inner_args) = index_value.child_by_field_name("arguments") else {
+            return (None, Vec::new());
+        };
+        let inner_name = self.get_keyword_arg_string(inner_args, "name");
+        let columns = self
+            .get_keyword_arg_value(inner_args, "fields")
+            .map(|node| self.extract_string_list(node))
+            .unwrap_or_default();
+        (inner_name, columns)
+    }
+
+    /// Extract the string elements of a Python `list` literal. Returns
+    /// an empty vec for any non-`list` node and silently skips
+    /// non-string children (e.g. an `F('expr')` mixed into a fields
+    /// list) so we don't fabricate column names.
+    fn extract_string_list(&self, node: Node<'_>) -> Vec<String> {
+        let mut out = Vec::new();
+        if node.kind() != "list" {
+            return out;
+        }
+        for child in node.named_children(&mut node.walk()) {
+            // Accept `string` and `concatenated_string` (Python's
+            // implicit-concatenation form `"a" "b"`); the latter
+            // is rare in migrations but tree-sitter wraps it in a
+            // distinct node so the bare `string` filter would
+            // otherwise silently drop adjacent literals.
+            if matches!(child.kind(), "string" | "concatenated_string") {
+                out.push(self.extract_string_value(child));
+            }
+        }
+        out
     }
 
     /// Extract CreateModel operation data.
@@ -230,9 +359,6 @@ impl<'a> MigrationExtractor<'a> {
         ModelOperation {
             name: name.unwrap_or_default(),
             old_name: None,
-            // Field extraction not implemented: no current rules need CreateModel field details.
-            // The CreateModel exemption logic uses model name matching, not field inspection.
-            fields: vec![],
         }
     }
 
@@ -256,51 +382,20 @@ impl<'a> MigrationExtractor<'a> {
     }
 
     /// Extract field info from a field argument.
+    ///
+    /// The shape is `migrations.AddField(field=models.CharField(...))`
+    /// (or `ForeignKey`, `IntegerField`, etc.). We find the
+    /// `field=` kwarg, then descend the `models.<Type>(...)`
+    /// call to read its `null=` and `default=` kwargs from the
+    /// AST directly — no raw-text scanning, no keyword-boundary
+    /// gymnastics on a normalised byte buffer.
     fn extract_field_info(&self, args: Node) -> Option<FieldInfo> {
-        for child in args.children(&mut args.walk()) {
-            if child.kind() == "keyword_argument" {
-                if let Some(name) = child.child_by_field_name("name") {
-                    if self.node_text(name) == "field" {
-                        if let Some(value) = child.child_by_field_name("value") {
-                            let raw_text = self.node_text(value).to_string();
-
-                            // Determine field type
-                            let field_type = if raw_text.contains("ForeignKey") {
-                                "ForeignKey".to_string()
-                            } else if raw_text.contains("CharField") {
-                                "CharField".to_string()
-                            } else if raw_text.contains("IntegerField") {
-                                "IntegerField".to_string()
-                            } else if raw_text.contains("BooleanField") {
-                                "BooleanField".to_string()
-                            } else if raw_text.contains("TextField") {
-                                "TextField".to_string()
-                            } else {
-                                "Unknown".to_string()
-                            };
-
-                            // Check nullable (handles whitespace: null=True, null = True)
-                            let is_nullable =
-                                contains_keyword_assignment(&raw_text, "null", "True");
-
-                            // Check default (handles whitespace: default=, default =)
-                            let has_default = contains_keyword_with_value(&raw_text, "default");
-
-                            return Some(FieldInfo {
-                                field_type,
-                                is_nullable,
-                                has_default,
-                                // FK target extraction not implemented: R006 only needs to know
-                                // a field is a ForeignKey, not which model it references.
-                                references: None,
-                                raw_text,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        None
+        let value = self.get_keyword_arg_value(args, "field")?;
+        Some(FieldInfo {
+            field_type: classify_field_call(value, self).to_string(),
+            is_nullable: field_kwarg_equals(self, value, "null", "True"),
+            has_default: field_has_kwarg(self, value, "default"),
+        })
     }
 
     /// Extract constraint operation data.
@@ -366,9 +461,13 @@ impl<'a> MigrationExtractor<'a> {
 
     /// Extract RunPython operation data.
     fn extract_run_python_operation(&self, args: Node) -> RunPythonOperation {
+        let nth_positional_text = |n: usize| {
+            self.get_nth_positional_value(args, n)
+                .map(|node| self.node_text(node).to_string())
+        };
         let code = self
             .get_keyword_arg_string(args, "code")
-            .or_else(|| self.get_nth_positional_arg(args, 0))
+            .or_else(|| nth_positional_text(0))
             .unwrap_or_default();
         // Treat an explicit Python `None` (`RunPython(forward, None)` or
         // `reverse_code=None`) as no reverse. Django itself flags that
@@ -377,7 +476,7 @@ impl<'a> MigrationExtractor<'a> {
         // it for a real callable name.
         let reverse_code = self
             .get_keyword_arg_string(args, "reverse_code")
-            .or_else(|| self.get_nth_positional_arg(args, 1))
+            .or_else(|| nth_positional_text(1))
             .filter(|s| s != "None");
 
         RunPythonOperation { code, reverse_code }
@@ -385,25 +484,48 @@ impl<'a> MigrationExtractor<'a> {
 
     /// Extract SeparateDatabaseAndState operation data.
     fn extract_separate_db_state_operation(&self, args: Node) -> SeparateDatabaseAndStateOperation {
-        let mut has_state_operations = false;
-        let mut has_database_operations = false;
+        let database_operations_node = self
+            .get_keyword_arg_value(args, "database_operations")
+            .or_else(|| self.get_nth_positional_value(args, 0));
+        let state_operations_node = self
+            .get_keyword_arg_value(args, "state_operations")
+            .or_else(|| self.get_nth_positional_value(args, 1));
 
-        for child in args.children(&mut args.walk()) {
-            if child.kind() == "keyword_argument" {
-                if let Some(name) = child.child_by_field_name("name") {
-                    let name_text = self.node_text(name);
-                    if name_text == "state_operations" {
-                        has_state_operations = true;
-                    } else if name_text == "database_operations" {
-                        has_database_operations = true;
-                    }
-                }
-            }
-        }
+        let database_operations = database_operations_node
+            .map(|node| self.extract_operations_from_list(node))
+            .unwrap_or_default();
+        let state_operations = state_operations_node
+            .map(|node| self.extract_operations_from_list(node))
+            .unwrap_or_default();
+        let has_database_operations =
+            self.sdas_arm_has_meaningful_operations(database_operations_node, &database_operations);
+        let has_state_operations =
+            self.sdas_arm_has_meaningful_operations(state_operations_node, &state_operations);
 
         SeparateDatabaseAndStateOperation {
             has_state_operations,
             has_database_operations,
+            database_operations,
+        }
+    }
+
+    fn sdas_arm_has_meaningful_operations(
+        &self,
+        arm: Option<Node<'_>>,
+        extracted_operations: &[Operation],
+    ) -> bool {
+        let Some(arm) = arm else {
+            return false;
+        };
+        match arm.kind() {
+            "none" => false,
+            "list" => {
+                !extracted_operations.is_empty()
+                    || arm
+                        .named_children(&mut arm.walk())
+                        .any(|child| child.kind() != "comment")
+            }
+            _ => true,
         }
     }
 
@@ -536,13 +658,64 @@ impl<'a> MigrationExtractor<'a> {
     /// treat raw node text as the value.
     fn resolve_string_value(&self, node: Node<'_>) -> Option<String> {
         match node.kind() {
-            "string" => Some(self.extract_string_value(node)),
+            "string" | "concatenated_string" => Some(self.extract_string_value(node)),
+            "list" | "tuple" => self.resolve_sql_sequence_value(node),
             "identifier" => {
                 let name = self.node_text(node).to_string();
                 self.resolve_module_string_binding(&name)
             }
+            "attribute" => self.is_run_sql_noop(node).then(String::new),
             _ => None,
         }
+    }
+
+    fn resolve_sql_sequence_value(&self, node: Node<'_>) -> Option<String> {
+        let mut parts = Vec::new();
+        for child in node.named_children(&mut node.walk()) {
+            match child.kind() {
+                "string" | "concatenated_string" => {
+                    parts.push(Self::trim_sequence_statement(
+                        self.extract_string_value(child),
+                    ));
+                }
+                "list" | "tuple" => {
+                    parts.push(self.resolve_parameterized_sql_statement(child)?);
+                }
+                "comment" => {}
+                _ => return None,
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            // Django treats a sequence as separate SQL statements. Preserve
+            // that boundary so statement-level rules do not let CONCURRENTLY
+            // in one element exempt a blocking CREATE INDEX in another.
+            Some(parts.join(";\n"))
+        }
+    }
+
+    fn resolve_parameterized_sql_statement(&self, node: Node<'_>) -> Option<String> {
+        let first = node
+            .named_children(&mut node.walk())
+            .find(|child| child.kind() != "comment")?;
+        match first.kind() {
+            "string" | "concatenated_string" => Some(Self::trim_sequence_statement(
+                self.extract_string_value(first),
+            )),
+            _ => None,
+        }
+    }
+
+    fn trim_sequence_statement(statement: String) -> String {
+        statement.trim_end_matches(';').to_string()
+    }
+
+    fn is_run_sql_noop(&self, node: Node<'_>) -> bool {
+        matches!(
+            self.node_text(node),
+            "migrations.RunSQL.noop" | "RunSQL.noop"
+        )
     }
 
     /// Find a module-level `name = "string-literal"` assignment and return
@@ -570,41 +743,79 @@ impl<'a> MigrationExtractor<'a> {
             let Some(right) = assignment.child_by_field_name("right") else {
                 continue;
             };
-            if right.kind() == "string" {
+            if matches!(right.kind(), "string" | "concatenated_string") {
                 return Some(self.extract_string_value(right));
             }
         }
         None
     }
 
-    /// Get the textual source of the Nth positional argument, regardless
-    /// of expression shape. Skips `keyword_argument` and `comment` named
-    /// children so that e.g. `RunPython(forward, reverse_code=rev)`
-    /// returns `forward` for `n == 0` and yields nothing for `n == 1`,
-    /// and `RunPython(forward, # note\n backward)` returns `backward` for
-    /// `n == 1`. The returned string is the raw node text (e.g.
-    /// `migrations.RunPython.noop`, `helpers.fwd`, `(forward)`, or
-    /// `make_forward()`); callers that need a specific shape should
-    /// inspect it further.
-    fn get_nth_positional_arg(&self, args: Node, n: usize) -> Option<String> {
-        let mut count = 0;
-        for child in args.named_children(&mut args.walk()) {
-            if matches!(child.kind(), "keyword_argument" | "comment") {
-                continue;
-            }
-            if count == n {
-                return Some(self.node_text(child).to_string());
-            }
-            count += 1;
-        }
-        None
-    }
-
-    /// Extract the actual string value (removing quotes).
+    /// Extract the actual string content from a tree-sitter `string`
+    /// node, concatenating every `string_content` child.
+    ///
+    /// The previous implementation called `trim_matches(|c| c == '"'
+    /// || c == '\'')` on the raw node text. That mis-handled:
+    ///   - Mixed-quote literals like `"'foo"` (would strip the inner
+    ///     `'` and return `foo` instead of `'foo`).
+    ///   - String prefixes like `r"foo"` (left an `r` glued to the
+    ///     opening quote in the trimmed result).
+    ///   - Triple-quoted strings happen to work because
+    ///     `trim_matches` strips a class of characters greedily, but
+    ///     the correctness was coincidental.
+    ///
+    /// Tree-sitter-python decomposes a `string` node into
+    /// `string_start` (opening delimiter + prefix), one or more
+    /// `string_content` chunks (the literal text), and `string_end`.
+    /// Concatenating just the `string_content` children gives us the
+    /// content verbatim regardless of quoting or prefix. Escape
+    /// sequences inside the content are preserved as written, which
+    /// matches the previous behaviour for any non-pathological
+    /// identifier (column/index/model names don't normally contain
+    /// `\` anyway).
+    ///
+    /// F-strings: if any child is an `interpolation` node we return
+    /// an empty string rather than concatenate the surrounding
+    /// `string_content` chunks. `f"prefix_{x}_suffix"` decomposes
+    /// into `"prefix_"` + interpolation + `"_suffix"`; concatenating
+    /// the literal parts yields the plausible-but-wrong identifier
+    /// `prefix__suffix` and an extracted column/model name like that
+    /// would silently mismatch every catalog lookup. Returning empty
+    /// keeps the call site's existing "not found" semantics.
+    ///
+    /// Concatenated strings (`"a" "b"` — Python implicit
+    /// concatenation): tree-sitter wraps these in a
+    /// `concatenated_string` parent containing two `string` children.
+    /// Recurse into the children so callers see the joined content.
     fn extract_string_value(&self, node: Node) -> String {
-        let text = self.node_text(node);
-        // Remove surrounding quotes
-        text.trim_matches(|c| c == '"' || c == '\'').to_string()
+        match node.kind() {
+            "string" => {
+                let mut out = String::new();
+                for child in node.children(&mut node.walk()) {
+                    match child.kind() {
+                        "string_content" => out.push_str(self.node_text(child)),
+                        "interpolation" => return String::new(),
+                        _ => {}
+                    }
+                }
+                out
+            }
+            "concatenated_string" => {
+                let mut out = String::new();
+                for child in node.children(&mut node.walk()) {
+                    if child.kind() == "string" {
+                        out.push_str(&self.extract_string_value(child));
+                    }
+                }
+                out
+            }
+            _ => {
+                // Fallback for non-string nodes (callers occasionally
+                // pass through identifiers in error paths). Returning
+                // raw text preserves the prior best-effort behaviour
+                // without panicking.
+                self.node_text(node).to_string()
+            }
+        }
     }
 
     /// Get the text of a node.
@@ -691,19 +902,6 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn test_extract_created_models() {
-        let parsed = ParsedMigration::parse(MULTI_OPERATION_MIGRATION).unwrap();
-        let extractor = MigrationExtractor::new(&parsed);
-        let migration = extractor.extract(Path::new("test.py")).unwrap();
-
-        assert_eq!(migration.created_models.len(), 1);
-        assert_eq!(migration.created_models[0], "Product");
-        assert!(migration.is_model_created("product")); // Case-insensitive
-        assert!(migration.is_model_created("Product"));
-        assert!(!migration.is_model_created("Order"));
-    }
-
-    #[test]
     fn test_extract_index_operation() {
         let parsed = ParsedMigration::parse(MULTI_OPERATION_MIGRATION).unwrap();
         let extractor = MigrationExtractor::new(&parsed);
@@ -714,6 +912,9 @@ class Migration(migrations.Migration):
 
         if let OperationData::Index(data) = &add_index.data {
             assert_eq!(data.model_name, "product");
+            // The fixture has `index=models.Index(fields=['name'], name='product_name_idx')`.
+            assert_eq!(data.index_name.as_deref(), Some("product_name_idx"));
+            assert_eq!(data.columns, vec!["name".to_string()]);
         } else {
             panic!("Expected Index data");
         }
@@ -814,6 +1015,46 @@ class Migration(migrations.Migration):
         } else {
             panic!("Expected RunSQL data");
         }
+    }
+
+    const RUN_SQL_LITERAL_SHAPES: &str = r#"
+from django.db import migrations
+
+
+CREATE_SQL = "CREATE " "INDEX idx_a ON tbl (a);"
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL(sql=CREATE_SQL),
+        migrations.RunSQL(sql=["DROP INDEX idx_a;", "DROP INDEX idx_b;"]),
+        migrations.RunSQL(("CREATE INDEX idx_c ON tbl (c);", "DROP INDEX idx_c;")),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_run_sql_concatenated_and_sequence_literals() {
+        let parsed = ParsedMigration::parse(RUN_SQL_LITERAL_SHAPES).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let sql: Vec<_> = migration
+            .operations
+            .iter()
+            .map(|op| match &op.data {
+                OperationData::RunSQL(data) => data.sql.as_str(),
+                _ => panic!("Expected RunSQL data"),
+            })
+            .collect();
+        assert_eq!(
+            sql,
+            vec![
+                "CREATE INDEX idx_a ON tbl (a);",
+                "DROP INDEX idx_a;\nDROP INDEX idx_b",
+                "CREATE INDEX idx_c ON tbl (c);\nDROP INDEX idx_c",
+            ],
+        );
     }
 
     const RUN_SQL_UNRESOLVABLE: &str = r#"
@@ -992,174 +1233,6 @@ class Migration(migrations.Migration):
         }
     }
 
-    const MULTIPLE_CREATE_MODEL: &str = r#"
-from django.db import migrations, models
-
-
-class Migration(migrations.Migration):
-
-    operations = [
-        migrations.CreateModel(
-            name='User',
-            fields=[],
-        ),
-        migrations.CreateModel(
-            name='Profile',
-            fields=[],
-        ),
-        migrations.AddField(
-            model_name='profile',
-            name='user',
-            field=models.ForeignKey(on_delete=models.CASCADE, to='app.user'),
-        ),
-    ]
-"#;
-
-    #[test]
-    fn test_multiple_create_model_exemption() {
-        let parsed = ParsedMigration::parse(MULTIPLE_CREATE_MODEL).unwrap();
-        let extractor = MigrationExtractor::new(&parsed);
-        let migration = extractor.extract(Path::new("test.py")).unwrap();
-
-        assert_eq!(migration.created_models.len(), 2);
-        assert!(migration.is_model_created("User"));
-        assert!(migration.is_model_created("Profile"));
-        assert!(migration.is_model_created("user")); // Case insensitive
-        assert!(migration.is_model_created("PROFILE")); // Case insensitive
-    }
-
-    const ADDFIELD_EXISTING_MODEL: &str = r#"
-from django.db import migrations, models
-
-
-class Migration(migrations.Migration):
-
-    operations = [
-        migrations.AddField(
-            model_name='existingmodel',
-            name='new_field',
-            field=models.CharField(max_length=255),
-        ),
-    ]
-"#;
-
-    #[test]
-    fn test_addfield_on_existing_model_not_exempt() {
-        let parsed = ParsedMigration::parse(ADDFIELD_EXISTING_MODEL).unwrap();
-        let extractor = MigrationExtractor::new(&parsed);
-        let migration = extractor.extract(Path::new("test.py")).unwrap();
-
-        assert!(migration.created_models.is_empty());
-        assert!(!migration.is_model_created("existingmodel"));
-    }
-
-    const MIXED_OPERATIONS: &str = r#"
-from django.db import migrations, models
-
-
-class Migration(migrations.Migration):
-
-    operations = [
-        migrations.CreateModel(
-            name='NewModel',
-            fields=[
-                ('id', models.BigAutoField(primary_key=True)),
-            ],
-        ),
-        migrations.AddField(
-            model_name='newmodel',
-            name='status',
-            field=models.CharField(max_length=50),
-        ),
-        migrations.AddField(
-            model_name='oldmodel',
-            name='reference',
-            field=models.ForeignKey(on_delete=models.CASCADE, to='app.newmodel'),
-        ),
-    ]
-"#;
-
-    #[test]
-    fn test_exemption_applies_selectively() {
-        let parsed = ParsedMigration::parse(MIXED_OPERATIONS).unwrap();
-        let extractor = MigrationExtractor::new(&parsed);
-        let migration = extractor.extract(Path::new("test.py")).unwrap();
-
-        // NewModel was created in this migration
-        assert!(migration.is_model_created("NewModel"));
-        assert!(migration.is_model_created("newmodel"));
-
-        // OldModel was not created in this migration
-        assert!(!migration.is_model_created("OldModel"));
-        assert!(!migration.is_model_created("oldmodel"));
-    }
-
-    #[test]
-    fn test_contains_keyword_assignment() {
-        // Whitespace variants of the positive case.
-        assert!(contains_keyword_assignment("null=True", "null", "True"));
-        assert!(contains_keyword_assignment("null = True", "null", "True"));
-        assert!(contains_keyword_assignment("null  =  True", "null", "True"));
-        assert!(contains_keyword_assignment(
-            "field(null = True)",
-            "null",
-            "True"
-        ));
-
-        // Wrong value.
-        assert!(!contains_keyword_assignment("null=False", "null", "True"));
-
-        // Lookalike keywords. The old substring-only implementation matched
-        // these because, after stripping whitespace, "nullable=True" /
-        // "not_null=True" each contain the substring "null=True".
-        assert!(!contains_keyword_assignment(
-            "nullable=True",
-            "null",
-            "True"
-        ));
-        assert!(!contains_keyword_assignment(
-            "models.CharField(not_null=True)",
-            "null",
-            "True"
-        ));
-
-        // Lookalike values: "True" appearing as a prefix of "Truthy".
-        assert!(!contains_keyword_assignment(
-            "models.CharField(null=Truthy)",
-            "null",
-            "True"
-        ));
-
-        // Real usage with surrounding kwargs.
-        assert!(contains_keyword_assignment(
-            "models.CharField(max_length=50, null=True, default='x')",
-            "null",
-            "True"
-        ));
-    }
-
-    #[test]
-    fn test_contains_keyword_with_value() {
-        assert!(contains_keyword_with_value("default='foo'", "default"));
-        assert!(contains_keyword_with_value("default = 'foo'", "default"));
-        assert!(contains_keyword_with_value("default=None", "default"));
-        assert!(!contains_keyword_with_value("no_default_here", "default"));
-
-        // Lookalike keyword: "my_default=5" should not match the keyword
-        // "default" because `default` is not at a kwarg boundary.
-        assert!(!contains_keyword_with_value("my_default=5", "default"));
-        assert!(!contains_keyword_with_value(
-            "models.CharField(my_default=5)",
-            "default"
-        ));
-
-        // Real usage.
-        assert!(contains_keyword_with_value(
-            "models.CharField(max_length=50, default='x')",
-            "default"
-        ));
-    }
-
     const FIELD_WITH_WHITESPACE_NULLABLE: &str = r#"
 from django.db import migrations, models
 
@@ -1191,5 +1264,690 @@ class Migration(migrations.Migration):
         } else {
             panic!("Expected Field data");
         }
+    }
+
+    const CUSTOM_FOREIGN_KEY_FIELD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddField(
+            model_name='product',
+            name='external_id',
+            field=fields.CustomForeignKeyField(null=True),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_custom_field_name_containing_foreign_key_is_unknown() {
+        let parsed = ParsedMigration::parse(CUSTOM_FOREIGN_KEY_FIELD).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Field(data) = &migration.operations[0].data else {
+            panic!("Expected Field data");
+        };
+        assert_eq!(
+            data.field.as_ref().map(|field| field.field_type.as_str()),
+            Some("Unknown"),
+        );
+    }
+
+    const SEPARATE_DB_AND_STATE_MIGRATION: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.RunSQL(
+                    sql='ALTER TABLE app_order DROP COLUMN legacy_id;',
+                    reverse_sql='ALTER TABLE app_order ADD COLUMN legacy_id integer;',
+                ),
+                migrations.AddIndex(
+                    model_name='order',
+                    index=models.Index(fields=['status'], name='order_status_idx'),
+                ),
+            ],
+            state_operations=[
+                migrations.RemoveField(model_name='order', name='legacy_id'),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_wrapped_database_ops_are_extracted() {
+        let parsed = ParsedMigration::parse(SEPARATE_DB_AND_STATE_MIGRATION).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        // Top-level operations are unchanged: the SeparateDatabaseAndState
+        // wrapper itself is still surfaced.
+        assert_eq!(migration.operations.len(), 1);
+        assert_eq!(
+            migration.operations[0].op_type,
+            OperationType::SeparateDatabaseAndState
+        );
+
+        // database_operations are extracted into the parallel collection.
+        let kinds: Vec<_> = migration
+            .wrapped_database_ops
+            .iter()
+            .map(|op| op.op_type)
+            .collect();
+        assert_eq!(kinds, vec![OperationType::RunSQL, OperationType::AddIndex]);
+    }
+
+    #[test]
+    fn test_state_operations_are_not_surfaced() {
+        // state_operations are metadata-only — schema-locking rules must
+        // not see them, so we deliberately drop them on the floor.
+        let parsed = ParsedMigration::parse(SEPARATE_DB_AND_STATE_MIGRATION).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        assert!(
+            migration
+                .wrapped_database_ops
+                .iter()
+                .all(|op| op.op_type != OperationType::RemoveField),
+            "RemoveField is in state_operations only and must not appear in wrapped_database_ops"
+        );
+    }
+
+    const SDAS_WITHOUT_DB_OPS: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            state_operations=[
+                migrations.RemoveField(model_name='order', name='legacy_id'),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_sdas_without_database_operations_kwarg_yields_empty() {
+        let parsed = ParsedMigration::parse(SDAS_WITHOUT_DB_OPS).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        assert_eq!(migration.operations.len(), 1);
+        assert!(migration.wrapped_database_ops.is_empty());
+    }
+
+    const SDAS_DB_OPS_POSITIONAL: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            [
+                migrations.RunSQL(sql='ALTER TABLE app_order DROP COLUMN legacy_id;'),
+            ],
+            [
+                migrations.RemoveField(model_name='order', name='legacy_id'),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_sdas_positional_database_operations_are_extracted() {
+        // Django's signature is
+        // `SeparateDatabaseAndState(database_operations=None, state_operations=None)`
+        // and the positional form is valid Python that real migrations
+        // sometimes use.
+        let parsed = ParsedMigration::parse(SDAS_DB_OPS_POSITIONAL).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        assert_eq!(migration.operations.len(), 1);
+        let kinds: Vec<_> = migration
+            .wrapped_database_ops
+            .iter()
+            .map(|op| op.op_type)
+            .collect();
+        assert_eq!(kinds, vec![OperationType::RunSQL]);
+    }
+
+    const SDAS_DB_OPS_NONE: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=None,
+            state_operations=[
+                migrations.RemoveField(model_name='order', name='legacy_id'),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_sdas_database_operations_none_yields_empty() {
+        // `database_operations=None` is valid Django; the kind-check in
+        // `extract_operations_from_list` should reject it without panic.
+        let parsed = ParsedMigration::parse(SDAS_DB_OPS_NONE).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        assert_eq!(migration.operations.len(), 1);
+        assert!(migration.wrapped_database_ops.is_empty());
+    }
+
+    const SDAS_DB_OPS_EMPTY_LIST: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[],
+            state_operations=[],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_sdas_empty_database_operations_yields_empty() {
+        let parsed = ParsedMigration::parse(SDAS_DB_OPS_EMPTY_LIST).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        assert_eq!(migration.operations.len(), 1);
+        assert!(migration.wrapped_database_ops.is_empty());
+        let OperationData::SeparateDatabaseAndState(data) = &migration.operations[0].data else {
+            panic!("Expected SeparateDatabaseAndState data");
+        };
+        assert!(!data.has_database_operations);
+        assert!(!data.has_state_operations);
+    }
+
+    const SDAS_NON_LITERAL_ARMS: &str = r#"
+from django.db import migrations
+
+
+DB_OPS = [
+    migrations.RunSQL(sql='ALTER TABLE app_order DROP COLUMN legacy_id;'),
+]
+STATE_OPS = [
+    migrations.RemoveField(model_name='order', name='legacy_id'),
+]
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=DB_OPS,
+            state_operations=STATE_OPS,
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_sdas_non_literal_arms_count_as_present_but_are_not_expanded() {
+        let parsed = ParsedMigration::parse(SDAS_NON_LITERAL_ARMS).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        assert_eq!(migration.operations.len(), 1);
+        assert!(migration.wrapped_database_ops.is_empty());
+        let OperationData::SeparateDatabaseAndState(data) = &migration.operations[0].data else {
+            panic!("Expected SeparateDatabaseAndState data");
+        };
+        assert!(data.has_database_operations);
+        assert!(data.has_state_operations);
+        assert!(data.database_operations.is_empty());
+    }
+
+    const SDAS_NON_EMPTY_UNEXPANDED_LIST_ARMS: &str = r#"
+from django.db import migrations
+
+
+DB_OP = migrations.RunSQL(sql='ALTER TABLE app_order DROP COLUMN legacy_id;')
+STATE_OPS = [
+    migrations.RemoveField(model_name='order', name='legacy_id'),
+]
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[DB_OP],
+            state_operations=[*STATE_OPS],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_sdas_non_empty_unexpanded_list_arms_count_as_present() {
+        let parsed = ParsedMigration::parse(SDAS_NON_EMPTY_UNEXPANDED_LIST_ARMS).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        assert_eq!(migration.operations.len(), 1);
+        assert!(migration.wrapped_database_ops.is_empty());
+        let OperationData::SeparateDatabaseAndState(data) = &migration.operations[0].data else {
+            panic!("Expected SeparateDatabaseAndState data");
+        };
+        assert!(data.has_database_operations);
+        assert!(data.has_state_operations);
+        assert!(data.database_operations.is_empty());
+    }
+
+    const SDAS_NESTED: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.SeparateDatabaseAndState(
+                    database_operations=[
+                        migrations.RunSQL(sql='SELECT 1;'),
+                    ],
+                ),
+            ],
+        ),
+    ]
+"#;
+
+    const ADD_INDEX_MULTI_COLUMN: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='order',
+            index=models.Index(fields=['customer', 'status'], name='order_customer_status_idx'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_index_multi_column() {
+        let parsed = ParsedMigration::parse(ADD_INDEX_MULTI_COLUMN).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(data.model_name, "order");
+        assert_eq!(
+            data.index_name.as_deref(),
+            Some("order_customer_status_idx")
+        );
+        assert_eq!(
+            data.columns,
+            vec!["customer".to_string(), "status".to_string()]
+        );
+    }
+
+    const ADD_INDEX_CONCURRENTLY: &str = r#"
+from django.db import models
+from django.contrib.postgres.operations import AddIndexConcurrently
+
+
+class Migration(migrations.Migration):
+    atomic = False
+
+    operations = [
+        AddIndexConcurrently(
+            model_name='product',
+            index=models.Index(fields=['sku'], name='product_sku_idx'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_add_index_concurrently_captures_columns() {
+        let parsed = ParsedMigration::parse(ADD_INDEX_CONCURRENTLY).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(data.columns, vec!["sku".to_string()]);
+        assert_eq!(data.index_name.as_deref(), Some("product_sku_idx"));
+    }
+
+    const REMOVE_INDEX_BY_NAME: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RemoveIndex(model_name='product', name='product_legacy_idx'),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_remove_index_captures_name_no_columns() {
+        let parsed = ParsedMigration::parse(REMOVE_INDEX_BY_NAME).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(data.model_name, "product");
+        assert_eq!(data.index_name.as_deref(), Some("product_legacy_idx"));
+        // RemoveIndex carries no column info.
+        assert!(data.columns.is_empty());
+    }
+
+    const ADD_INDEX_POSITIONAL: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            'product',
+            models.Index(fields=['name'], name='product_name_idx'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_index_positional_args() {
+        // Django's signature is `AddIndex(model_name, index)` so the
+        // positional form is valid Python and a shape developers
+        // actually write.
+        let parsed = ParsedMigration::parse(ADD_INDEX_POSITIONAL).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        // model_name kwarg parsing remains kwarg-only, so we don't
+        // assert it here — the column extraction is what this commit
+        // is about.
+        assert_eq!(data.index_name.as_deref(), Some("product_name_idx"));
+        assert_eq!(data.columns, vec!["name".to_string()]);
+    }
+
+    const ADD_INDEX_BARE_NAME: &str = r#"
+from django.db import migrations
+from django.db.models import Index
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=Index(fields=['name'], name='product_name_idx'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_index_bare_name_call() {
+        // `index=Index(...)` (no `models.` prefix) still parses as a
+        // `call` node, so the descent should work the same.
+        let parsed = ParsedMigration::parse(ADD_INDEX_BARE_NAME).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(data.columns, vec!["name".to_string()]);
+        assert_eq!(data.index_name.as_deref(), Some("product_name_idx"));
+    }
+
+    const ADD_INDEX_VALUE_NOT_A_CALL: &str = r#"
+from django.db import migrations
+
+
+PREBUILT = None
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=PREBUILT,
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_index_value_not_a_call_yields_empty() {
+        // `index=` value is an identifier, not a call. Extraction
+        // should degrade gracefully (no column info, no panic).
+        let parsed = ParsedMigration::parse(ADD_INDEX_VALUE_NOT_A_CALL).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(data.index_name, None);
+        assert!(data.columns.is_empty());
+    }
+
+    const ADD_INDEX_FIELDS_KWARG_MISSING: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(name='product_legacy_idx'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_index_missing_fields_kwarg_yields_empty_columns() {
+        // No `fields=` kwarg at all — extraction should still surface
+        // the index name and return empty columns.
+        let parsed = ParsedMigration::parse(ADD_INDEX_FIELDS_KWARG_MISSING).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(data.index_name.as_deref(), Some("product_legacy_idx"));
+        assert!(data.columns.is_empty());
+    }
+
+    const ADD_INDEX_NON_LITERAL_FIELDS: &str = r#"
+from django.db import migrations, models
+
+
+FIELDS = ['name']
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(fields=FIELDS, name='product_name_idx'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_index_non_literal_fields_yields_empty_columns() {
+        // `fields=FIELDS` (an identifier) is not a literal list. We
+        // deliberately don't resolve it; the extractor returns an
+        // empty column vec so downstream rules know they can't make
+        // column-aware decisions.
+        let parsed = ParsedMigration::parse(ADD_INDEX_NON_LITERAL_FIELDS).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(data.index_name.as_deref(), Some("product_name_idx"));
+        assert!(data.columns.is_empty());
+    }
+
+    #[test]
+    fn test_sdas_nested_does_not_recurse() {
+        // Doubly-nested SDaS is exotic enough that we deliberately do
+        // not recurse: the outer call surfaces the inner SDaS as one op
+        // in `wrapped_database_ops`, but the inner call's own
+        // `database_operations` are not hoisted further. A rule that
+        // wants to flag nested SDaS can inspect the surfaced op.
+        let parsed = ParsedMigration::parse(SDAS_NESTED).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        assert_eq!(migration.operations.len(), 1);
+        let kinds: Vec<_> = migration
+            .wrapped_database_ops
+            .iter()
+            .map(|op| op.op_type)
+            .collect();
+        assert_eq!(kinds, vec![OperationType::SeparateDatabaseAndState]);
+    }
+
+    const STRING_QUOTING_VARIANTS: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(
+                fields=["name", 'category', r"raw_name", """triple"""],
+                name='product_multi_idx',
+            ),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_string_handles_quoting_variants() {
+        // The previous `trim_matches` implementation mis-handled
+        // prefixed strings (`r"raw_name"` → returned `r` glued to
+        // the value) and could collapse mixed-quote contents. Pin
+        // that every supported form yields the bare content.
+        let parsed = ParsedMigration::parse(STRING_QUOTING_VARIANTS).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(
+            data.columns,
+            vec![
+                "name".to_string(),
+                "category".to_string(),
+                "raw_name".to_string(),
+                "triple".to_string(),
+            ],
+        );
+    }
+
+    const FSTRING_AND_CONCATENATED_SOURCE: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(
+                fields=[f"prefix_{var}_suffix", "split" "joined", f"static_no_interp"],
+                name='odd_idx',
+            ),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_string_handles_fstring_and_concatenated() {
+        // F-strings contain an `interpolation` child whose value is
+        // unknown at lint time. Concatenating the surrounding
+        // `string_content` chunks would fabricate a plausible-but-
+        // wrong identifier (`prefix__suffix`), which would silently
+        // mismatch every catalog lookup downstream. The new
+        // extractor returns an empty string for any f-string with
+        // an interpolation.
+        //
+        // Concatenated string literals (`"a" "b"` — Python's
+        // implicit-concatenation) live under a `concatenated_string`
+        // parent in tree-sitter-python; the extractor now recurses
+        // into the children so callers see "ab" rather than the raw
+        // source span.
+        let parsed = ParsedMigration::parse(FSTRING_AND_CONCATENATED_SOURCE).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(
+            data.columns,
+            vec![
+                // f-string with interpolation → empty
+                "".to_string(),
+                // adjacent literals → joined
+                "splitjoined".to_string(),
+                // f-string with NO interpolation → bare content
+                // (equivalent to the non-f-string spelling). Pinning
+                // this guards against an over-broad "any f-string is
+                // empty" rewrite of the extractor.
+                "static_no_interp".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_extract_without_migration_class_returns_empty_migration() {
+        // A Python file that has no `class Migration` (or has only a
+        // nested one) must not error — `extract` returns a Migration
+        // with empty operations. The rule engine then has nothing to
+        // flag, which is the correct outcome for a non-migration
+        // file accidentally caught by the discovery walk.
+        let source = "# not a migration\nx = 1\n";
+        let parsed = ParsedMigration::parse(source).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("not_a_migration.py")).unwrap();
+        assert!(migration.operations.is_empty());
+        assert!(migration.class_span.is_none());
     }
 }

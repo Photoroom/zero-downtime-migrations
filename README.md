@@ -56,6 +56,9 @@ zdm --ignore R008 .
 # Show explanation for a rule
 zdm rule R001
 
+# List every rule the binary recognises
+zdm --list-rules
+
 # Treat warnings as errors
 zdm --warnings-as-errors .
 ```
@@ -65,6 +68,32 @@ zdm --warnings-as-errors .
 - `0` — no issues found
 - `1` — lint violations found (errors). Warnings alone do NOT cause exit code 1 unless `--warnings-as-errors` is set.
 - `2` — tool error (bad arguments, config parse failure, invalid file path)
+
+### JSON Output Schema
+
+`zdm --output-format json` writes a single JSON object to stdout:
+
+```json
+{
+  "diagnostics": [
+    {
+      "rule_id":   "R001",
+      "rule_name": "non-concurrent-add-index",
+      "severity":  "error",
+      "message":   "Use AddIndexConcurrently instead of AddIndex …",
+      "path":      "app/migrations/0001_bad.py",
+      "line":      8,
+      "column":    9,
+      "help":      "Replace migrations.AddIndex with …"
+    }
+  ],
+  "summary": { "total": 1, "errors": 1, "warnings": 0 }
+}
+```
+
+`severity` is `"error"` or `"warning"`. `help` is `null` when the
+rule has no help text. The schema is pinned by the integration
+test suite — every field above is guaranteed on every diagnostic.
 
 ## Rules
 
@@ -83,13 +112,13 @@ zdm --warnings-as-errors .
 | R012 | irreversible-run-python | Warning | `RunPython` should have a reverse function |
 | R013 | irreversible-run-sql | Warning | `RunSQL` should have a reverse SQL |
 | R014 | model-imports | Error | Don't import models in `RunPython` |
-| R015 | alter-field-not-null | Error | Changing field to NOT NULL validates all rows |
+| R015 | alter-field-not-null | Warning | `AlterField` whose result is NOT NULL may scan every row |
 | R016 | non-concurrent-remove-index | Error | Use `RemoveIndexConcurrently` instead of `RemoveIndex` |
-| R017 | non-concurrent-add-constraint | Error | Adding a CHECK constraint validates all rows |
+| R017 | non-concurrent-add-constraint | Error | CHECK constraint validates all rows; EXCLUDE constraint builds an index non-concurrently |
 
 ### CreateModel Exemption
 
-Several rules (R001, R002, R006, R010, R017) automatically exempt operations that target models created in the same migration. This is because operations on newly created (empty) tables don't cause the locking issues these rules detect.
+Several rules (R001, R002, R006, R010, R016, R017) automatically exempt operations that target models created in the same migration. This is because operations on newly created (empty) tables don't cause the locking issues these rules detect. The exemption is order-aware — a `CreateModel` that runs *after* the flagged op cannot retroactively exempt it.
 
 > **Note:** R007 (`fk-without-concurrent-index`) was merged into R006 and retired. Its concern — that an FK on an existing table should be preceded by `AddIndexConcurrently` — is now part of R006's check, including the order-aware exemption (a concurrent index later in the same migration does not protect the FK).
 
@@ -111,7 +140,7 @@ class Migration(migrations.Migration):
 
 ### R015 Limitation
 
-R015 (alter-field-not-null) cannot determine whether a field was previously nullable. It flags ALL `AlterField` operations where the resulting field is NOT NULL, which may produce false positives when the field was already NOT NULL. This is a fundamental limitation of static analysis without schema history. Use `# zdm: ignore R015` inline comments for legitimate `AlterField` operations that don't change nullability.
+R015 (alter-field-not-null) cannot tell, from a single `AlterField` operation, whether the column was previously nullable. It flags any `AlterField` whose resulting field is NOT NULL, which catches a genuine nullable→NOT NULL transition (the dangerous case) alongside benign re-stipulations of an already-NOT-NULL column. Because static analysis has no schema history, the rule emits `Warning` rather than `Error` — surfaced for review without breaking CI. Add `# zdm: ignore R015` on operations you have verified are safe.
 
 ### Inline Suppression
 
@@ -152,11 +181,13 @@ exclude = ["**/test_migrations/**"]
 Settings are applied in this order (highest to lowest priority):
 
 1. **CLI flags** (`--select`, `--ignore`, `--warnings-as-errors`)
-2. **`zero-downtime-migrations.toml`** in the current directory
-3. **`pyproject.toml`** `[tool.zdm]` section
+2. **`zero-downtime-migrations.toml`** found in the current directory or a trusted repo ancestor
+3. **`pyproject.toml`** `[tool.zdm]` section in the same directory
 4. **Default values**
 
-CLI flags always override config file settings. If both `zero-downtime-migrations.toml` and `pyproject.toml` exist, the standalone file takes precedence.
+The config search starts in the current working directory. If zdm is running inside a trusted git repository, it walks upward within that repository and stops at the first directory that contains `zero-downtime-migrations.toml` or a `pyproject.toml` with `[tool.zdm]`. A pyproject for another tool is ignored, so running `zdm` from `repo/apps/myapp/migrations/` still picks up `repo/zero-downtime-migrations.toml`. Without a `.git` ancestor, only the current directory is checked; parent configs in shared build or temp directories are intentionally ignored.
+
+CLI flags always override config file settings. If both `zero-downtime-migrations.toml` and `pyproject.toml` exist in the same directory, the standalone file takes precedence; multi-level merging is not performed.
 
 ## Pre-commit Integration
 
@@ -165,7 +196,7 @@ Add to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/Photoroom/zero-downtime-migrations
-    rev: v0.3.2
+    rev: <latest release tag>
     hooks:
       - id: zdm
 ```
@@ -175,7 +206,7 @@ Or use diff mode to only check changed migrations:
 ```yaml
 repos:
   - repo: https://github.com/Photoroom/zero-downtime-migrations
-    rev: v0.3.2
+    rev: <latest release tag>
     hooks:
       - id: zdm-diff
 ```
@@ -200,7 +231,8 @@ pre-commit is validating, rather than the previous `HEAD` commit.
 | **Requires Django installed** | No | Yes | Yes |
 | **Requires project setup** | No | Yes (settings.py) | Yes (full environment) |
 | **Checks for missing migrations** | No | No | Yes |
-| **Checks for unsafe operations** | Yes (16 rules) | Yes (~8 rules) | No |
+| **Checks for unsafe operations** | Yes (16 active rules; `zdm --list-rules`) | Yes (~8 rules) | No |
+| **Configurable via `pyproject.toml`** | Yes (walks up within trusted repos) | Yes | N/A |
 | **Can run without database** | Yes | Yes | No |
 | **Language** | Rust | Python | Python |
 

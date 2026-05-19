@@ -1,14 +1,17 @@
-//! R002: Unique constraint without concurrent index
+//! R002: Unique constraint locks the table
 //!
-//! Detects AddConstraint with UniqueConstraint that doesn't have a corresponding
-//! concurrent index already created. Adding a unique constraint directly
-//! requires scanning the entire table with a lock.
+//! Detects `migrations.AddConstraint(UniqueConstraint(...))` on an existing
+//! table. Django's `AddConstraint` always builds the constraint's index from
+//! scratch — it does not accept an existing concurrent index as a parameter.
+//! The result is a `CREATE UNIQUE INDEX` (non-concurrent) that locks the
+//! table for the duration of the scan.
 
 use crate::ast::{ConstraintType, Migration, OperationData, OperationType};
 use crate::diagnostics::{Diagnostic, Severity};
-use crate::rules::{Rule, RuleContext};
+use crate::rules::{walk_with_created_models, Rule, RuleContext};
 
-/// Rule that detects unique constraints without pre-built concurrent indexes.
+/// Rule that detects `AddConstraint(UniqueConstraint)` on existing tables,
+/// where Django builds the index non-concurrently under a table lock.
 pub struct R002UniqueConstraintWithoutIndex;
 
 impl Rule for R002UniqueConstraintWithoutIndex {
@@ -21,8 +24,11 @@ impl Rule for R002UniqueConstraintWithoutIndex {
     }
 
     fn description(&self) -> &'static str {
-        "Adding a UniqueConstraint directly requires a full table scan with locks. \
-         First create a unique index concurrently, then add the constraint using that index."
+        "AddConstraint with a UniqueConstraint builds the constraint's index \
+         non-concurrently, locking the table for the duration of the scan. \
+         Django's AddConstraint cannot reuse a pre-built index — issue the \
+         constraint via RunSQL instead so it can attach to a concurrently \
+         created index."
     }
 
     fn severity(&self) -> Severity {
@@ -31,32 +37,32 @@ impl Rule for R002UniqueConstraintWithoutIndex {
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
-
-        for op in migration.operations_of_type(OperationType::AddConstraint) {
-            if let OperationData::Constraint(data) = &op.data {
-                // Skip if model was created in same migration - no existing rows to lock
-                if migration.is_model_created(&data.model_name) {
-                    continue;
-                }
-
-                if data.constraint_type == ConstraintType::Unique {
-                    diagnostics.push(Diagnostic {
-                        rule_id: self.id(),
-                        rule_name: self.name(),
-                        message: "UniqueConstraint added without pre-built concurrent index"
-                            .to_string(),
-                        severity: self.severity(),
-                        path: ctx.path.to_path_buf(),
-                        span: op.span,
-                        help: Some(
-                            "First create the unique index using AddIndexConcurrently, \
-                             then add the constraint referencing that index"
-                                .to_string(),
-                        ),
-                    });
-                }
+        walk_with_created_models(migration, |op, created| {
+            if op.op_type != OperationType::AddConstraint {
+                return;
             }
-        }
+            let OperationData::Constraint(data) = &op.data else {
+                return;
+            };
+            if data.constraint_type != ConstraintType::Unique {
+                return;
+            }
+            if created.contains(&data.model_name) {
+                return;
+            }
+
+            diagnostics.push(Diagnostic {
+                rule_id: self.id(),
+                rule_name: self.name(),
+                message:
+                    "AddConstraint with UniqueConstraint locks the table while it builds the index"
+                        .to_string(),
+                severity: self.severity(),
+                path: ctx.path.to_path_buf(),
+                span: op.span,
+                help: Some(include_str!("help/r002_unique_constraint.txt").to_string()),
+            });
+        });
 
         diagnostics
     }
@@ -65,10 +71,6 @@ impl Rule for R002UniqueConstraintWithoutIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::extractor::MigrationExtractor;
-    use crate::config::Config;
-    use crate::parser::ParsedMigration;
-    use std::path::Path;
 
     const UNIQUE_CONSTRAINT_BAD: &str = r#"
 from django.db import migrations, models
@@ -120,19 +122,11 @@ class Migration(migrations.Migration):
 "#;
 
     fn check_migration(source: &str) -> Vec<Diagnostic> {
-        let parsed = ParsedMigration::parse(source).unwrap();
-        let extractor = MigrationExtractor::new(&parsed);
-        let migration = extractor.extract(Path::new("test.py")).unwrap();
-        let config = Config::default();
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("test.py"),
-        };
-        R002UniqueConstraintWithoutIndex.check(&migration, &ctx)
+        crate::rules::test_support::check_rule(&R002UniqueConstraintWithoutIndex, source)
     }
 
     #[test]
-    fn test_unique_constraint_bad() {
+    fn test_addconstraint_unique_on_existing_model_is_flagged() {
         let diagnostics = check_migration(UNIQUE_CONSTRAINT_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R002");
@@ -149,5 +143,87 @@ class Migration(migrations.Migration):
         // UniqueConstraint on a model created in same migration should be exempt
         let diagnostics = check_migration(CREATE_MODEL_WITH_UNIQUE_CONSTRAINT);
         assert!(diagnostics.is_empty());
+    }
+
+    const ADDCONSTRAINT_BEFORE_CREATEMODEL_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddConstraint(
+            model_name='product',
+            constraint=models.UniqueConstraint(fields=['sku'], name='unique_sku'),
+        ),
+        migrations.CreateModel(
+            name='Product',
+            fields=[
+                ('id', models.AutoField(primary_key=True)),
+                ('sku', models.CharField(max_length=50)),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_addconstraint_before_createmodel_is_not_exempted() {
+        // The previous order-blind `is_model_created` exemption silently
+        // passed this migration even though the AddConstraint executes
+        // *before* the CreateModel and therefore can't be exempted by a
+        // model that doesn't yet exist (or — if the model did exist in a
+        // prior migration — locks it with rows in it).
+        let diagnostics = check_migration(ADDCONSTRAINT_BEFORE_CREATEMODEL_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R002");
+    }
+
+    #[test]
+    fn test_help_text_recommends_separate_database_and_state_wrap() {
+        // The original help told users to swap the AddConstraint for
+        // two raw RunSQL operations — which gets the lock-avoidance
+        // right but leaves Django's model state ignorant of the
+        // constraint. The next `makemigrations` then regenerates the
+        // AddConstraint and re-introduces the very pattern R002
+        // exists to flag. The fix recommends wrapping the RunSQLs in
+        // SeparateDatabaseAndState with the original AddConstraint
+        // in `state_operations`. Pin both pieces so a future help-
+        // text rewrite can't silently lose either half.
+        let diagnostics = check_migration(UNIQUE_CONSTRAINT_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        let help = diagnostics[0].help.as_ref().expect("R002 emits help");
+        assert!(
+            help.contains("SeparateDatabaseAndState"),
+            "help should recommend the SDaS wrapper, got:\n{help}",
+        );
+        assert!(
+            help.contains("state_operations") && help.contains("database_operations"),
+            "help should show both halves of the SDaS wrap, got:\n{help}",
+        );
+    }
+
+    const UNIQUE_CONSTRAINT_IN_WRAPPED_DATABASE_OPS_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.AddConstraint(
+                    model_name='product',
+                    constraint=models.UniqueConstraint(fields=['sku'], name='unique_sku'),
+                ),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_wrapped_database_unique_constraint_is_flagged() {
+        let diagnostics = check_migration(UNIQUE_CONSTRAINT_IN_WRAPPED_DATABASE_OPS_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R002");
     }
 }

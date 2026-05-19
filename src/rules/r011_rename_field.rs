@@ -31,7 +31,7 @@ impl Rule for R011RenameField {
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        for op in migration.operations_of_type(OperationType::RenameField) {
+        for op in migration.top_level_operations_of_type(OperationType::RenameField) {
             diagnostics.push(Diagnostic {
                 rule_id: self.id(),
                 rule_name: self.name(),
@@ -54,10 +54,6 @@ impl Rule for R011RenameField {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::extractor::MigrationExtractor;
-    use crate::config::Config;
-    use crate::parser::ParsedMigration;
-    use std::path::Path;
 
     const RENAME_FIELD_BAD: &str = r#"
 from django.db import migrations
@@ -75,19 +71,11 @@ class Migration(migrations.Migration):
 "#;
 
     fn check_migration(source: &str) -> Vec<Diagnostic> {
-        let parsed = ParsedMigration::parse(source).unwrap();
-        let extractor = MigrationExtractor::new(&parsed);
-        let migration = extractor.extract(Path::new("test.py")).unwrap();
-        let config = Config::default();
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("test.py"),
-        };
-        R011RenameField.check(&migration, &ctx)
+        crate::rules::test_support::check_rule(&R011RenameField, source)
     }
 
     #[test]
-    fn test_rename_field_warns() {
+    fn test_renamefield_is_flagged() {
         let diagnostics = check_migration(RENAME_FIELD_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R011");

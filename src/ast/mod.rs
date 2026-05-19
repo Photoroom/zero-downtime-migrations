@@ -3,12 +3,17 @@
 //! This module provides typed Rust representations of Django migration
 //! operations extracted from tree-sitter Python AST nodes.
 
-pub mod extractor;
+pub(crate) mod extractor;
 mod operations;
 
-pub use extractor::MigrationExtractor;
+pub(crate) use extractor::MigrationExtractor;
 pub(crate) use operations::strip_sql_noise;
-pub use operations::*;
+pub(crate) use operations::FieldInfo;
+pub use operations::{
+    ConstraintOperation, ConstraintType, FieldOperation, IndexOperation, ModelOperation, Operation,
+    OperationData, OperationType, RunPythonOperation, RunSQLOperation,
+    SeparateDatabaseAndStateOperation,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -16,7 +21,11 @@ use std::path::PathBuf;
 use crate::diagnostics::Span;
 
 /// A parsed Django migration file with extracted operations.
+///
+/// `#[non_exhaustive]` so future fields (new spans, new metadata)
+/// are additive — out-of-tree code must destructure with `..`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Migration {
     /// The file path of the migration.
     pub path: PathBuf,
@@ -26,8 +35,18 @@ pub struct Migration {
     pub operations: Vec<Operation>,
     /// Import statements that may be relevant for linting.
     pub imports: Vec<Import>,
-    /// Model names created in this migration (for exemption tracking).
-    pub created_models: Vec<String>,
+    /// Operations extracted from
+    /// `SeparateDatabaseAndState(database_operations=[...])` arms in this
+    /// migration. Kept as a compatibility projection; new rule code should
+    /// prefer [`Self::database_effective_operations`] so wrapped operations
+    /// are traversed in database execution order while retaining their
+    /// original operation spans.
+    pub wrapped_database_ops: Vec<Operation>,
+    /// Span of the `class Migration(...)` definition, when present. Used
+    /// as the anchor for class-level diagnostics (e.g. R004's missing
+    /// `atomic = False`) so a `# zdm: ignore` on or above the class line
+    /// suppresses the diagnostic correctly.
+    pub class_span: Option<Span>,
     /// For each source line that carried a `# zdm: ignore RXXX[, RYYY]`
     /// comment, the set of rule IDs the user asked to suppress at that
     /// line. Lines are 1-indexed.
@@ -35,18 +54,90 @@ pub struct Migration {
 }
 
 impl Migration {
-    /// Get all operations of a specific type.
-    pub fn operations_of_type(&self, op_type: OperationType) -> impl Iterator<Item = &Operation> {
+    /// Load and extract a migration from a file on disk. Enforces
+    /// the size cap, parses with tree-sitter, surfaces syntax
+    /// errors with line/column, and returns the typed
+    /// `Migration`. This is the one-stop entry point for
+    /// programmatic consumers; out-of-tree rule authors writing
+    /// tests should reach for this rather than the lower-level
+    /// `ParsedMigration` / extractor pipeline.
+    pub fn from_path(path: &std::path::Path) -> crate::error::Result<Self> {
+        let parsed = crate::parser::ParsedMigration::parse_file(path)?;
+        MigrationExtractor::new(&parsed)
+            .extract(path)
+            .map_err(|e| crate::error::Error::parse(path.to_path_buf(), e.to_string()))
+    }
+
+    /// Extract a migration from in-memory source. Same pipeline
+    /// as [`Self::from_path`], minus the disk read — useful for
+    /// linting staged-but-uncommitted content (where we read the
+    /// git index blob) and for unit-testing custom rules with a
+    /// string literal.
+    pub fn from_source(path: &std::path::Path, source: &str) -> crate::error::Result<Self> {
+        crate::parser::check_size(path, source.len() as u64)?;
+        let parsed = crate::parser::ParsedMigration::parse(source)
+            .map_err(|e| crate::error::Error::parse(path.to_path_buf(), e.to_string()))?;
+        if parsed.has_errors() {
+            return Err(crate::error::Error::parse(
+                path.to_path_buf(),
+                "syntax error in migration file".to_string(),
+            ));
+        }
+        MigrationExtractor::new(&parsed)
+            .extract(path)
+            .map_err(|e| crate::error::Error::parse(path.to_path_buf(), e.to_string()))
+    }
+
+    /// Get top-level operations of a specific type.
+    pub fn top_level_operations_of_type(
+        &self,
+        op_type: OperationType,
+    ) -> impl Iterator<Item = &Operation> {
         self.operations
             .iter()
             .filter(move |op| op.op_type == op_type)
     }
 
-    /// Check if a model was created in this migration.
-    pub fn is_model_created(&self, model_name: &str) -> bool {
-        self.created_models
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(model_name))
+    /// Get top-level operations of a specific type.
+    ///
+    /// Prefer [`Self::top_level_operations_of_type`] when the distinction
+    /// matters. This compatibility shim preserves the pre-existing public
+    /// API and intentionally keeps its top-level semantics.
+    pub fn operations_of_type(&self, op_type: OperationType) -> impl Iterator<Item = &Operation> {
+        self.top_level_operations_of_type(op_type)
+    }
+
+    /// Get database-effective operations in execution order.
+    ///
+    /// Top-level `SeparateDatabaseAndState` wrappers are expanded in place to
+    /// their literal `database_operations` arm. Wrapped operations retain their
+    /// original spans. State-side operations are metadata-only and are
+    /// deliberately omitted.
+    pub fn database_effective_operations(&self) -> impl Iterator<Item = &Operation> {
+        let mut top_level = self.operations.iter();
+        let mut wrapped = [].iter();
+
+        std::iter::from_fn(move || loop {
+            if let Some(op) = wrapped.next() {
+                return Some(op);
+            }
+            let op = top_level.next()?;
+            match &op.data {
+                OperationData::SeparateDatabaseAndState(data) => {
+                    wrapped = data.database_operations.iter();
+                }
+                _ => return Some(op),
+            }
+        })
+    }
+
+    /// Get database-effective operations of a specific type in execution order.
+    pub fn database_effective_operations_of_type(
+        &self,
+        op_type: OperationType,
+    ) -> impl Iterator<Item = &Operation> {
+        self.database_effective_operations()
+            .filter(move |op| op.op_type == op_type)
     }
 
     /// Whether the given rule ID is suppressed for a diagnostic whose
@@ -68,6 +159,7 @@ impl Migration {
 
 /// An import statement in the migration file.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Import {
     /// For `from X import ...`, the module path `X`. `None` for plain
     /// `import X` statements (the matcher `is_direct_model_import`

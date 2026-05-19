@@ -1,11 +1,24 @@
 //! R017: Non-concurrent AddConstraint
 //!
-//! Detects AddConstraint operations that add constraints requiring full table scans.
-//! Consider adding constraints with NOT VALID then validating separately.
+//! Detects `AddConstraint` operations that hold a table lock while
+//! building or validating the constraint:
+//!
+//!   - `CheckConstraint` — validating the predicate against every
+//!     existing row, blocking writes for the duration.
+//!   - `ExclusionConstraint` — building its enforcement index
+//!     non-concurrently, blocking writes for the build.
+//!
+//! `UniqueConstraint` has the same problem (the index it builds is
+//! non-concurrent), but R002 already flags it with specific guidance
+//! about `USING INDEX`, so we leave it to R002 to avoid double-firing.
+//!
+//! `ConstraintType::Unknown` (a constraint class we couldn't classify
+//! from the source) is silently skipped to avoid false positives on
+//! unrecognised classes.
 
 use crate::ast::{ConstraintType, Migration, OperationData, OperationType};
 use crate::diagnostics::{Diagnostic, Severity};
-use crate::rules::{Rule, RuleContext};
+use crate::rules::{walk_with_created_models, Rule, RuleContext};
 
 /// Rule that detects constraints that may cause table locks.
 pub struct R017NonConcurrentAddConstraint;
@@ -20,9 +33,10 @@ impl Rule for R017NonConcurrentAddConstraint {
     }
 
     fn description(&self) -> &'static str {
-        "AddConstraint with a CHECK constraint validates every existing row, \
-         which locks the table. Add the constraint with NOT VALID, then \
-         VALIDATE in a separate migration."
+        "AddConstraint with a CHECK or EXCLUDE constraint locks the table — CHECK \
+         validates every row, EXCLUDE builds its enforcement index non-concurrently. \
+         Migrate CHECK via NOT VALID + VALIDATE. EXCLUDE has no fully-online path \
+         in stock PostgreSQL — defer it to a low-traffic window."
     }
 
     fn severity(&self) -> Severity {
@@ -31,37 +45,43 @@ impl Rule for R017NonConcurrentAddConstraint {
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
-
-        for op in migration.operations_of_type(OperationType::AddConstraint) {
-            if let OperationData::Constraint(data) = &op.data {
-                // Skip if model was created in same migration - no existing rows to validate
-                if migration.is_model_created(&data.model_name) {
-                    continue;
-                }
-
-                // CHECK constraints require a full table scan when added without NOT VALID.
-                // (Foreign keys are added via AddField, not AddConstraint, so they are
-                // covered by R006 rather than here.)
-                if data.constraint_type == ConstraintType::Check {
-                    diagnostics.push(Diagnostic {
-                        rule_id: self.id(),
-                        rule_name: self.name(),
-                        message: "AddConstraint with a CHECK constraint validates all rows"
-                            .to_string(),
-                        severity: self.severity(),
-                        path: ctx.path.to_path_buf(),
-                        span: op.span,
-                        help: Some(
-                            "Consider using RunSQL to add the constraint with NOT VALID, \
-                             then validate in a separate migration: \
-                             ALTER TABLE ADD CONSTRAINT ... NOT VALID; then \
-                             ALTER TABLE VALIDATE CONSTRAINT ..."
-                                .to_string(),
-                        ),
-                    });
-                }
+        walk_with_created_models(migration, |op, created| {
+            if op.op_type != OperationType::AddConstraint {
+                return;
             }
-        }
+            let OperationData::Constraint(data) = &op.data else {
+                return;
+            };
+            if created.contains(&data.model_name) {
+                return;
+            }
+
+            // FKs go through AddField (covered by R006); UniqueConstraint
+            // is covered by R002 with USING INDEX guidance.
+            let (message, help) = match data.constraint_type {
+                ConstraintType::Check => (
+                    "AddConstraint with a CHECK constraint validates all rows".to_string(),
+                    include_str!("help/r017_check_constraint.txt").to_string(),
+                ),
+                ConstraintType::Exclusion => (
+                    "AddConstraint with an EXCLUDE constraint builds its index \
+                     non-concurrently, locking the table"
+                        .to_string(),
+                    include_str!("help/r017_exclusion_constraint.txt").to_string(),
+                ),
+                _ => return,
+            };
+
+            diagnostics.push(Diagnostic {
+                rule_id: self.id(),
+                rule_name: self.name(),
+                message,
+                severity: self.severity(),
+                path: ctx.path.to_path_buf(),
+                span: op.span,
+                help: Some(help),
+            });
+        });
 
         diagnostics
     }
@@ -70,10 +90,6 @@ impl Rule for R017NonConcurrentAddConstraint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::extractor::MigrationExtractor;
-    use crate::config::Config;
-    use crate::parser::ParsedMigration;
-    use std::path::Path;
 
     const CHECK_CONSTRAINT_BAD: &str = r#"
 from django.db import migrations, models
@@ -89,7 +105,7 @@ class Migration(migrations.Migration):
     ]
 "#;
 
-    const EXCLUSION_CONSTRAINT_GOOD: &str = r#"
+    const EXCLUSION_CONSTRAINT_BAD: &str = r#"
 from django.db import migrations
 from django.contrib.postgres.constraints import ExclusionConstraint
 
@@ -97,6 +113,31 @@ from django.contrib.postgres.constraints import ExclusionConstraint
 class Migration(migrations.Migration):
 
     operations = [
+        migrations.AddConstraint(
+            model_name='booking',
+            constraint=ExclusionConstraint(
+                name='exclude_overlapping',
+                expressions=[('daterange', '&&')],
+            ),
+        ),
+    ]
+"#;
+
+    const EXCLUSION_CONSTRAINT_ON_FRESH_MODEL_GOOD: &str = r#"
+from django.db import migrations, models
+from django.contrib.postgres.constraints import ExclusionConstraint
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.CreateModel(
+            name='Booking',
+            fields=[
+                ('id', models.BigAutoField(primary_key=True)),
+                ('daterange', models.DateRangeField()),
+            ],
+        ),
         migrations.AddConstraint(
             model_name='booking',
             constraint=ExclusionConstraint(
@@ -129,15 +170,7 @@ class Migration(migrations.Migration):
 "#;
 
     fn check_migration(source: &str) -> Vec<Diagnostic> {
-        let parsed = ParsedMigration::parse(source).unwrap();
-        let extractor = MigrationExtractor::new(&parsed);
-        let migration = extractor.extract(Path::new("test.py")).unwrap();
-        let config = Config::default();
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("test.py"),
-        };
-        R017NonConcurrentAddConstraint.check(&migration, &ctx)
+        crate::rules::test_support::check_rule(&R017NonConcurrentAddConstraint, source)
     }
 
     #[test]
@@ -148,10 +181,31 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn test_exclusion_constraint_good() {
-        // Exclusion constraints don't require full table validation
-        let diagnostics = check_migration(EXCLUSION_CONSTRAINT_GOOD);
-        assert!(diagnostics.is_empty());
+    fn test_exclusion_constraint_bad() {
+        // The previous test asserted no diagnostic with the comment
+        // "Exclusion constraints don't require full table validation".
+        // That's wrong: ExclusionConstraint builds its enforcement
+        // index non-concurrently, which holds an ACCESS EXCLUSIVE lock
+        // for the duration of the build. R017 must flag it.
+        let diagnostics = check_migration(EXCLUSION_CONSTRAINT_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R017");
+        assert!(
+            diagnostics[0].message.contains("EXCLUDE"),
+            "message should mention EXCLUDE, got: {}",
+            diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn test_exclusion_constraint_on_fresh_model_is_exempt() {
+        // Same CreateModel exemption as CheckConstraint: a freshly
+        // created table has no rows yet, so the lock is harmless.
+        let diagnostics = check_migration(EXCLUSION_CONSTRAINT_ON_FRESH_MODEL_GOOD);
+        assert!(
+            diagnostics.is_empty(),
+            "expected no diagnostics, got: {diagnostics:?}",
+        );
     }
 
     #[test]
@@ -159,5 +213,66 @@ class Migration(migrations.Migration):
         // CheckConstraint on a model created in same migration should be exempt
         let diagnostics = check_migration(CREATE_MODEL_WITH_CHECK_CONSTRAINT);
         assert!(diagnostics.is_empty());
+    }
+
+    const ADDCONSTRAINT_BEFORE_CREATEMODEL_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddConstraint(
+            model_name='product',
+            constraint=models.CheckConstraint(check=models.Q(price__gte=0), name='positive_price'),
+        ),
+        migrations.CreateModel(
+            name='Product',
+            fields=[
+                ('id', models.AutoField(primary_key=True)),
+                ('price', models.DecimalField()),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_addconstraint_before_createmodel_is_not_exempted() {
+        // Order-aware exemption: a CreateModel that runs *after* the
+        // AddConstraint cannot retroactively make the AddConstraint
+        // safe. The previous `is_model_created` lookup was
+        // order-blind and silently exempted this — the same false
+        // negative R002 and R016 fixed earlier in this PR.
+        let diagnostics = check_migration(ADDCONSTRAINT_BEFORE_CREATEMODEL_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R017");
+    }
+
+    const WRAPPED_CHECK_CONSTRAINT_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.AddConstraint(
+                    model_name='product',
+                    constraint=models.CheckConstraint(
+                        check=models.Q(price__gte=0),
+                        name='positive_price',
+                    ),
+                ),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_wrapped_database_check_constraint_is_flagged() {
+        let diagnostics = check_migration(WRAPPED_CHECK_CONSTRAINT_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R017");
     }
 }

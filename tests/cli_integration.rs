@@ -15,9 +15,16 @@ fn zdm() -> Command {
     cargo_bin_cmd!("zdm")
 }
 
-/// Helper to create a temp directory with migration files
+/// Helper to create a temp directory with migration files.
+///
+/// Plants an empty `.git` directory at the temp root so the config
+/// loader's walk-up doesn't escape into the actual project's
+/// pyproject.toml (which would silently change `[tool.zdm]` settings
+/// under the tests). The walk-up is guarded by a `.git` ancestor
+/// requirement, and the sentinel keeps it scoped to our temp root.
 fn setup_migrations(migrations: &[(&str, &str)]) -> TempDir {
     let temp_dir = TempDir::new().unwrap();
+    fs::create_dir_all(temp_dir.path().join(".git")).unwrap();
     let migrations_dir = temp_dir.path().join("app").join("migrations");
     fs::create_dir_all(&migrations_dir).unwrap();
 
@@ -68,6 +75,24 @@ fn git_stage(path: &std::path::Path, file: &str) {
         .current_dir(path)
         .output()
         .expect("Failed to stage file");
+}
+
+fn set_base_to_head(path: &std::path::Path) {
+    StdCommand::new("git")
+        .args(["branch", "-f", "origin/main", "HEAD"])
+        .current_dir(path)
+        .output()
+        .expect("Failed to update base branch");
+}
+
+fn parse_json_output(output: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(output).expect("output must be valid JSON")
+}
+
+fn diagnostics(json: &serde_json::Value) -> &Vec<serde_json::Value> {
+    json.get("diagnostics")
+        .and_then(|v| v.as_array())
+        .expect("JSON output must include a `diagnostics` array")
 }
 
 const CLEAN_MIGRATION: &str = r#"
@@ -127,13 +152,33 @@ class Migration(migrations.Migration):
 
     #[test]
     fn exit_0_when_only_warnings() {
+        // Exit-0 alone is self-confirming: if every rule silently
+        // stopped emitting diagnostics (so `WARNING_ONLY_MIGRATION`
+        // produced nothing), the test would still pass and we'd
+        // never notice. Pin two facts: the binary exits 0, AND R012
+        // (the irreversible-RunPython warning targeted by the
+        // fixture) actually surfaces in stdout.
         let temp = setup_migrations(&[("0001_warning.py", WARNING_ONLY_MIGRATION)]);
 
-        zdm().arg(temp.path()).assert().success().code(0);
+        zdm()
+            .arg(temp.path())
+            .assert()
+            .success()
+            .code(0)
+            .stdout(predicate::str::contains("R012"))
+            .stdout(predicate::str::contains("warning"));
     }
 
     #[test]
     fn exit_1_when_warnings_as_errors() {
+        // Pin R012 in stdout so the test catches "warnings-as-
+        // errors promoted SOMETHING to error" rather than just
+        // "some error fired." Without this, a future bug that
+        // makes the fixture trip a different rule (e.g. R001 on
+        // an unrelated change) would still pass `.code(1)`
+        // without proving the warning-promotion path itself
+        // works. Mirrors `exit_0_when_only_warnings` which
+        // already pins R012.
         let temp = setup_migrations(&[("0001_warning.py", WARNING_ONLY_MIGRATION)]);
 
         zdm()
@@ -141,7 +186,8 @@ class Migration(migrations.Migration):
             .arg("--warnings-as-errors")
             .assert()
             .failure()
-            .code(1);
+            .code(1)
+            .stdout(predicate::str::contains("R012"));
     }
 
     #[test]
@@ -155,9 +201,21 @@ class Migration(migrations.Migration):
 
     #[test]
     fn exit_0_when_no_migrations_found() {
+        // Plant `.git` so the config walk-up doesn't escape into
+        // the host's pyproject (the test would still pass either
+        // way because zero migrations always exits 0, but pinning
+        // the boundary matches every other CLI test in this file).
         let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join(".git")).unwrap();
 
-        zdm().arg(temp.path()).assert().success().code(0);
+        // Pin "no migrations" produces empty stdout — a future
+        // change that surfaces an "scanned 0 files" line would
+        // change observable behaviour and should fail this test.
+        zdm()
+            .arg(temp.path())
+            .assert()
+            .success()
+            .stdout(predicate::str::is_empty());
     }
 }
 
@@ -214,15 +272,30 @@ mod diff_mode {
 
     #[test]
     fn diff_staged_reads_index_content_not_worktree_content() {
+        // The original test was self-confirming: a bare
+        // `.success().code(0)` would pass if the diff-staged
+        // pipeline went dark (no files extracted, no rules run,
+        // no diagnostics emitted). Stage TWO files: one whose
+        // index-content is CLEAN but worktree-content is BAD
+        // (the subject — proves we read the index, not the
+        // worktree, so no diagnostic), and one whose
+        // index-content is BAD (the control — proves the
+        // pipeline is alive and would surface a real index
+        // violation). If the diff-staged plumbing silently
+        // emitted nothing, the control assertion would fail.
         let temp = setup_git_repo();
-        let migration_path = temp
-            .path()
-            .join("app")
-            .join("migrations")
-            .join("0001_initial.py");
-        fs::write(&migration_path, CLEAN_MIGRATION).unwrap();
+        let migrations_dir = temp.path().join("app").join("migrations");
+
+        // Subject: index = clean, worktree = bad. No diagnostic.
+        let subject_path = migrations_dir.join("0001_initial.py");
+        fs::write(&subject_path, CLEAN_MIGRATION).unwrap();
         git_stage(temp.path(), "app/migrations/0001_initial.py");
-        fs::write(&migration_path, BAD_MIGRATION_NON_CONCURRENT_INDEX).unwrap();
+        fs::write(&subject_path, BAD_MIGRATION_NON_CONCURRENT_INDEX).unwrap();
+
+        // Control: index = bad, worktree = bad (same file). Diagnostic.
+        let control_path = migrations_dir.join("0002_control_bad.py");
+        fs::write(&control_path, BAD_MIGRATION_NON_CONCURRENT_INDEX).unwrap();
+        git_stage(temp.path(), "app/migrations/0002_control_bad.py");
 
         zdm()
             .current_dir(temp.path())
@@ -230,9 +303,16 @@ mod diff_mode {
             .arg("origin/main")
             .arg("--select")
             .arg("R001")
+            .arg("--output-format")
+            .arg("compact")
             .assert()
-            .success()
-            .code(0);
+            .failure()
+            .code(1)
+            // The control fires: the diff plumbing is alive.
+            .stdout(predicate::str::contains("0002_control_bad.py"))
+            // The subject does not fire: we read the index, not
+            // the worktree, so the clean staged content wins.
+            .stdout(predicate::str::contains("0001_initial.py").not());
     }
 
     #[test]
@@ -246,14 +326,10 @@ mod diff_mode {
         .unwrap();
         git_commit_all(temp.path(), "Add config");
 
-        StdCommand::new("git")
-            .args(["branch", "-f", "origin/main", "HEAD"])
-            .current_dir(temp.path())
-            .output()
-            .expect("Failed to update base branch");
+        set_base_to_head(temp.path());
 
-        // A staged migration that lives under an excluded path. Without the
-        // exclude filter being applied to staged discovery, R001 would fire.
+        // Staged migration A lives under the excluded path; without
+        // the exclude filter R001 would fire on it.
         let excluded_dir = temp
             .path()
             .join("app")
@@ -268,19 +344,212 @@ mod diff_mode {
         .unwrap();
         git_stage(temp.path(), "app/test_migrations");
 
-        zdm()
+        // The exclude-only assertion was self-confirming: if the diff
+        // machinery silently missed staged files, the test would
+        // still pass with exit 0. Stage a CONTROL migration in a
+        // NON-excluded path with the same bad content — that file
+        // must fire R001, proving the exclude is what suppressed the
+        // first one rather than the discovery layer ignoring
+        // everything.
+        let control_dir = temp.path().join("app").join("migrations");
+        fs::write(
+            control_dir.join("0002_control_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        git_stage(temp.path(), "app/migrations/0002_control_bad.py");
+
+        let output = zdm()
             .current_dir(temp.path())
             .arg("--diff-staged")
             .arg("origin/main")
             .arg("--select")
             .arg("R001")
+            .arg("--output-format")
+            .arg("json")
             .assert()
-            .success()
-            .code(0);
+            .failure()
+            .code(1)
+            .get_output()
+            .stdout
+            .clone();
+        let json = parse_json_output(&output);
+        let diags = diagnostics(&json);
+        // Exactly one diagnostic: the control. The excluded file
+        // contributes nothing.
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected only the control file to fire, got: {diags:#?}",
+        );
+        let path = diags[0]["path"].as_str().unwrap();
+        assert!(
+            path.ends_with("0002_control_bad.py"),
+            "the surviving diagnostic must be the control, got path: {path}",
+        );
+        assert!(
+            !path.contains("test_migrations"),
+            "an excluded-path diagnostic should not surface, got: {path}",
+        );
+    }
+
+    #[test]
+    fn diff_mode_respects_positional_path_scope() {
+        let temp = setup_git_repo();
+
+        let scoped_dir = temp.path().join("app").join("migrations");
+        fs::write(
+            scoped_dir.join("0001_scoped_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+
+        let other_dir = temp.path().join("other_app").join("migrations");
+        fs::create_dir_all(&other_dir).unwrap();
+        fs::write(other_dir.join("__init__.py"), "").unwrap();
+        fs::write(
+            other_dir.join("0001_outside_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Add scoped and outside migrations");
+
+        zdm()
+            .current_dir(temp.path())
+            .arg("app")
+            .arg("--diff")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R001")
+            .arg("--output-format")
+            .arg("compact")
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("0001_scoped_bad.py"))
+            .stdout(predicate::str::contains("0001_outside_bad.py").not());
+    }
+
+    #[test]
+    fn diff_mode_rejects_invalid_positional_path_scope() {
+        let temp = setup_git_repo();
+        fs::write(
+            temp.path().join("app/migrations/0001_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Add migration");
+
+        zdm()
+            .current_dir(temp.path())
+            .arg("missing_app")
+            .arg("--diff")
+            .arg("origin/main")
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains("Invalid path"))
+            .stderr(predicate::str::contains("missing_app"));
+    }
+
+    #[test]
+    fn diff_mode_rejects_existing_path_scope_outside_repo() {
+        let temp = setup_git_repo();
+        let outside = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("app/migrations/0001_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Add migration");
+
+        zdm()
+            .current_dir(temp.path())
+            .arg(outside.path())
+            .arg("--diff")
+            .arg("origin/main")
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains("Invalid path"))
+            .stderr(predicate::str::contains(
+                outside.path().to_string_lossy().as_ref(),
+            ));
+    }
+
+    #[test]
+    fn diff_mode_normalizes_positional_path_scope() {
+        let temp = setup_git_repo();
+        let app_dir = temp.path().join("app");
+        fs::write(
+            app_dir.join("migrations/0001_scoped_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Add scoped migration");
+
+        zdm()
+            .current_dir(temp.path().join("app/migrations"))
+            .arg("../..//app")
+            .arg("--diff")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R001")
+            .arg("--output-format")
+            .arg("compact")
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("0001_scoped_bad.py"));
+    }
+
+    #[test]
+    fn diff_mode_scopes_non_migration_files_for_r008() {
+        let temp = setup_git_repo();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"allowed-file-patterns = []"#,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Add config");
+        set_base_to_head(temp.path());
+
+        fs::write(
+            temp.path().join("app/migrations/0001_scoped.py"),
+            CLEAN_MIGRATION,
+        )
+        .unwrap();
+        fs::write(temp.path().join("app/views.py"), "# scoped view").unwrap();
+        let other_dir = temp.path().join("other_app");
+        fs::create_dir_all(&other_dir).unwrap();
+        fs::write(other_dir.join("views.py"), "# outside view").unwrap();
+        git_commit_all(temp.path(), "Add scoped migration and mixed app changes");
+
+        zdm()
+            .current_dir(temp.path())
+            .arg("app")
+            .arg("--diff")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R008")
+            .arg("--output-format")
+            .arg("compact")
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("R008"))
+            .stdout(predicate::str::contains("app/views.py"))
+            .stdout(predicate::str::contains("other_app/views.py").not());
     }
 
     #[test]
     fn r008_allows_basename_patterns() {
+        // This is currently the ONLY R008 coverage outside unit
+        // tests, and the bare `.success().code(0)` would pass if
+        // R008 silently stopped firing in diff mode entirely.
+        // Add a second changed file (`views.py`) that does NOT
+        // match the allowed-file-patterns — R008 must fire on it,
+        // proving the rule is alive on this branch.
         let temp = setup_git_repo();
 
         fs::write(
@@ -290,11 +559,7 @@ mod diff_mode {
         .unwrap();
         git_commit_all(temp.path(), "Add config");
 
-        StdCommand::new("git")
-            .args(["branch", "-f", "origin/main", "HEAD"])
-            .current_dir(temp.path())
-            .output()
-            .expect("Failed to update base branch");
+        set_base_to_head(temp.path());
 
         let migration_path = temp
             .path()
@@ -305,9 +570,12 @@ mod diff_mode {
 
         let model_dir = temp.path().join("backend").join("media");
         fs::create_dir_all(&model_dir).unwrap();
+        // Allowed: matches the `models.py` basename pattern.
         fs::write(model_dir.join("models.py"), "# model").unwrap();
+        // Not allowed: matches no pattern. R008 should fire on this.
+        fs::write(model_dir.join("views.py"), "# view").unwrap();
 
-        git_commit_all(temp.path(), "Add migration and model");
+        git_commit_all(temp.path(), "Add migration, model, and view");
 
         zdm()
             .current_dir(temp.path())
@@ -316,8 +584,13 @@ mod diff_mode {
             .arg("--select")
             .arg("R008")
             .assert()
-            .success()
-            .code(0);
+            .failure()
+            .code(1)
+            // The not-allowed file fires.
+            .stdout(predicate::str::contains("R008"))
+            .stdout(predicate::str::contains("views.py"))
+            // The allowed-basename file does not.
+            .stdout(predicate::str::contains("models.py").not());
     }
 }
 
@@ -328,22 +601,9 @@ mod diff_mode {
 mod output_format {
     use super::*;
 
-    const BAD_MIGRATION: &str = r#"
-from django.db import migrations, models
-
-class Migration(migrations.Migration):
-    dependencies = []
-    operations = [
-        migrations.AddIndex(
-            model_name='product',
-            index=models.Index(fields=['name'], name='product_name_idx'),
-        ),
-    ]
-"#;
-
     #[test]
     fn default_output_shows_filename_and_rule() {
-        let temp = setup_migrations(&[("0001_bad.py", BAD_MIGRATION)]);
+        let temp = setup_migrations(&[("0001_bad.py", BAD_MIGRATION_NON_CONCURRENT_INDEX)]);
 
         zdm()
             .arg(temp.path())
@@ -354,8 +614,8 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn json_output_is_valid_json() {
-        let temp = setup_migrations(&[("0001_bad.py", BAD_MIGRATION)]);
+    fn json_output_contains_required_fields() {
+        let temp = setup_migrations(&[("0001_bad.py", BAD_MIGRATION_NON_CONCURRENT_INDEX)]);
 
         let output = zdm()
             .arg(temp.path())
@@ -367,49 +627,146 @@ class Migration(migrations.Migration):
             .stdout
             .clone();
 
-        let json_str = String::from_utf8(output).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let parsed = parse_json_output(&output);
 
-        assert!(parsed.is_object() || parsed.is_array());
+        // Parse structurally rather than grepping the raw text: an
+        // accidental rename of `path` to `pathname` (or moving fields
+        // into a nested object) would otherwise still pass the old
+        // substring check.
+        let diagnostics = diagnostics(&parsed);
+        assert!(
+            !diagnostics.is_empty(),
+            "expected at least one diagnostic in the JSON output"
+        );
+        let diag = diagnostics[0]
+            .as_object()
+            .expect("each diagnostic must be a JSON object");
+        // The full documented per-diagnostic shape: a rename or
+        // accidental drop of any of these would otherwise slip
+        // through the substring grep that preceded this commit.
+        for field in [
+            "rule_id",
+            "rule_name",
+            "message",
+            "path",
+            "severity",
+            "line",
+            "column",
+            "help",
+        ] {
+            assert!(
+                diag.contains_key(field),
+                "diagnostic is missing required field `{field}`, got: {diag:?}",
+            );
+        }
+        assert_eq!(diag["rule_id"].as_str(), Some("R001"));
+        assert_eq!(diag["severity"].as_str(), Some("error"));
+        assert!(
+            diag["path"]
+                .as_str()
+                .is_some_and(|s| s.ends_with("0001_bad.py")),
+            "path should end with the fixture filename, got: {:?}",
+            diag["path"],
+        );
+
+        // The documented JSON shape also carries a `summary` object.
+        let summary = parsed
+            .get("summary")
+            .and_then(|v| v.as_object())
+            .expect("top-level JSON must include a `summary` object");
+        assert_eq!(summary["total"].as_u64(), Some(diagnostics.len() as u64));
+        assert!(summary["errors"].as_u64().unwrap() >= 1);
+        assert!(
+            summary.contains_key("warnings"),
+            "summary must carry a `warnings` count even when zero"
+        );
     }
 
     #[test]
-    fn json_output_contains_required_fields() {
-        let temp = setup_migrations(&[("0001_bad.py", BAD_MIGRATION)]);
+    fn json_output_for_clean_run_contains_empty_summary() {
+        let temp = setup_migrations(&[("0001_clean.py", CLEAN_MIGRATION)]);
 
         let output = zdm()
             .arg(temp.path())
             .arg("--output-format")
             .arg("json")
             .assert()
-            .failure()
+            .success()
             .get_output()
             .stdout
             .clone();
 
-        let json_str = String::from_utf8(output).unwrap();
-
-        // Should contain rule_id, message, path, severity
-        assert!(json_str.contains("\"rule_id\""));
-        assert!(json_str.contains("\"message\""));
-        assert!(json_str.contains("\"path\""));
-        assert!(json_str.contains("\"severity\""));
+        let parsed = parse_json_output(&output);
+        assert_eq!(parsed["diagnostics"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["summary"]["total"].as_u64(), Some(0));
+        assert_eq!(parsed["summary"]["errors"].as_u64(), Some(0));
+        assert_eq!(parsed["summary"]["warnings"].as_u64(), Some(0));
     }
 
     #[test]
     fn compact_output_one_line_per_diagnostic() {
-        let temp = setup_migrations(&[("0001_bad.py", BAD_MIGRATION)]);
+        let temp = setup_migrations(&[("0001_bad.py", BAD_MIGRATION_NON_CONCURRENT_INDEX)]);
 
-        zdm()
+        let output = zdm()
             .arg(temp.path())
             .arg("--output-format")
             .arg("compact")
             .assert()
             .failure()
-            // Compact format: `path:line: SEV: [RULE_ID rule-name] message`.
-            .stdout(predicate::str::contains(
-                "E: [R001 non-concurrent-add-index]",
-            ));
+            .get_output()
+            .stdout
+            .clone();
+        let text = String::from_utf8(output).unwrap();
+
+        // Compact format prints one `path:line: SEV: [RULE_ID
+        // rule-name] message` line per diagnostic, plus an indented
+        // `  help: ...` continuation line when the rule supplies help
+        // text. R001 supplies help, so we expect a diagnostic line +
+        // a help line — but no third line.
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected exactly two compact-format lines (diag + help), got {lines:#?}",
+        );
+        let diag_line = lines[0];
+        assert!(
+            diag_line.contains("0001_bad.py"),
+            "compact line should start with the path, got: {diag_line}",
+        );
+        assert!(
+            diag_line.contains("E: [R001 non-concurrent-add-index]"),
+            "compact line should carry SEV: [RULE rulename], got: {diag_line}",
+        );
+        // The compact line shape is
+        //   <path>:<line>:<col>: <SEV>: [<RULE> <name>] <msg>
+        // and we want to assert <line> is a number. On Windows the
+        // path itself contains a colon (drive letter, e.g.
+        // `C:\Users\...`), so a naive `diag_line.find(':')` lands
+        // on the drive-letter colon and the next field is the
+        // rest of the path. Find the path/line boundary by
+        // searching for `.py:` instead — every migration fixture
+        // is a `.py` file, so that anchor is unambiguous.
+        let py_marker = ".py:";
+        let py_idx = diag_line
+            .find(py_marker)
+            .expect("compact line must contain a .py path followed by :");
+        let after_path = &diag_line[py_idx + py_marker.len()..];
+        let next_colon = after_path
+            .find(':')
+            .expect("compact line must have a `:line:` after the path");
+        let line_field = &after_path[..next_colon];
+        assert!(
+            line_field.parse::<usize>().is_ok(),
+            "expected a line-number field after the path, got: {line_field:?}",
+        );
+
+        // Help continuation is two-space indented and starts with `help:`.
+        assert!(
+            lines[1].starts_with("  help:"),
+            "help continuation must start with `  help:`, got: {}",
+            lines[1],
+        );
     }
 }
 
@@ -444,15 +801,30 @@ class Migration(migrations.Migration):
     fn select_only_runs_specified_rules() {
         let temp = setup_migrations(&[("0001_multi.py", MIGRATION_WITH_MULTIPLE_ISSUES)]);
 
-        // With --select R001, should only see R001, not R016
-        zdm()
+        // With --select R001, the JSON output should contain exactly
+        // one diagnostic (the R001 hit). The previous substring-only
+        // check would have missed a regression that added a third
+        // rule's diagnostic (e.g. R005) since "R016" is the only
+        // negative check.
+        let output = zdm()
             .arg(temp.path())
             .arg("--select")
             .arg("R001")
+            .arg("--output-format")
+            .arg("json")
             .assert()
             .failure()
-            .stdout(predicate::str::contains("R001"))
-            .stdout(predicate::str::contains("R016").not());
+            .get_output()
+            .stdout
+            .clone();
+        let json = parse_json_output(&output);
+        let diags = diagnostics(&json);
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected exactly one diagnostic with --select R001, got: {diags:#?}",
+        );
+        assert_eq!(diags[0]["rule_id"].as_str(), Some("R001"));
     }
 
     #[test]
@@ -474,14 +846,31 @@ class Migration(migrations.Migration):
     fn select_multiple_rules() {
         let temp = setup_migrations(&[("0001_multi.py", MIGRATION_WITH_MULTIPLE_ISSUES)]);
 
-        zdm()
+        // Substring-only assertions would silently pass if a
+        // third rule erroneously fired alongside R001 and R016;
+        // pin the count via JSON.
+        let output = zdm()
             .arg(temp.path())
             .arg("--select")
             .arg("R001,R016")
+            .arg("--output-format")
+            .arg("json")
             .assert()
             .failure()
-            .stdout(predicate::str::contains("R001"))
-            .stdout(predicate::str::contains("R016"));
+            .get_output()
+            .stdout
+            .clone();
+        let json = parse_json_output(&output);
+        let ids: Vec<&str> = diagnostics(&json)
+            .iter()
+            .map(|d| d["rule_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"R001"));
+        assert!(ids.contains(&"R016"));
+        assert!(
+            ids.iter().all(|id| matches!(*id, "R001" | "R016")),
+            "no rule other than R001/R016 should fire, got {ids:?}",
+        );
     }
 
     #[test]
@@ -493,8 +882,7 @@ class Migration(migrations.Migration):
             .arg("--ignore")
             .arg("R001,R016")
             .assert()
-            .success()
-            .code(0);
+            .success();
     }
 
     #[test]
@@ -655,7 +1043,18 @@ mod rule_command {
             .assert()
             .failure()
             .code(2)
-            .stderr(predicate::str::contains("Unknown rule"));
+            .stderr(predicate::str::contains("Unknown rule"))
+            // Pin the no-duplicate behaviour: the previous implementation
+            // printed "error: Unknown rule: R999" twice (once via an
+            // explicit `eprintln!` in `run_rule_command`, once via
+            // `main()`'s error sink).
+            .stderr(predicate::function(|s: &str| {
+                s.matches("Unknown rule").count() == 1
+            }))
+            // The error now lists the available rule IDs so the user
+            // gets actionable feedback (e.g. "did you mean R001?").
+            .stderr(predicate::str::contains("available rules:"))
+            .stderr(predicate::str::contains("R001"));
     }
 }
 
@@ -666,32 +1065,11 @@ mod rule_command {
 mod multiple_files {
     use super::*;
 
-    const CLEAN_MIGRATION: &str = r#"
-from django.db import migrations
-
-class Migration(migrations.Migration):
-    dependencies = []
-    operations = []
-"#;
-
-    const BAD_MIGRATION: &str = r#"
-from django.db import migrations, models
-
-class Migration(migrations.Migration):
-    dependencies = []
-    operations = [
-        migrations.AddIndex(
-            model_name='product',
-            index=models.Index(fields=['name'], name='product_name_idx'),
-        ),
-    ]
-"#;
-
     #[test]
     fn lint_multiple_files_in_directory() {
         let temp = setup_migrations(&[
             ("0001_initial.py", CLEAN_MIGRATION),
-            ("0002_bad.py", BAD_MIGRATION),
+            ("0002_bad.py", BAD_MIGRATION_NON_CONCURRENT_INDEX),
         ]);
 
         zdm()
@@ -703,10 +1081,10 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn lint_specific_file() {
+    fn lint_explicit_file_arguments() {
         let temp = setup_migrations(&[
             ("0001_initial.py", CLEAN_MIGRATION),
-            ("0002_bad.py", BAD_MIGRATION),
+            ("0002_bad.py", BAD_MIGRATION_NON_CONCURRENT_INDEX),
         ]);
 
         let migrations_dir = temp.path().join("app").join("migrations");
@@ -715,8 +1093,7 @@ class Migration(migrations.Migration):
         zdm()
             .arg(migrations_dir.join("0001_initial.py"))
             .assert()
-            .success()
-            .code(0);
+            .success();
 
         // Only lint the bad file
         zdm()
@@ -724,16 +1101,6 @@ class Migration(migrations.Migration):
             .assert()
             .failure()
             .code(1);
-    }
-
-    #[test]
-    fn lint_multiple_specific_files() {
-        let temp = setup_migrations(&[
-            ("0001_initial.py", CLEAN_MIGRATION),
-            ("0002_bad.py", BAD_MIGRATION),
-        ]);
-
-        let migrations_dir = temp.path().join("app").join("migrations");
 
         zdm()
             .arg(migrations_dir.join("0001_initial.py"))
@@ -769,5 +1136,167 @@ mod version_help {
             .stdout(predicate::str::contains(
                 "PostgreSQL migration safety linter",
             ));
+    }
+}
+
+mod list_rules {
+    use super::*;
+
+    #[test]
+    fn list_rules_prints_known_rules_and_exits_zero() {
+        // `--list-rules` should short-circuit before config load
+        // (so it works even outside a configured project) and print
+        // every rule the binary knows about. The output uses each
+        // rule's ID, severity, and name.
+        zdm()
+            .arg("--list-rules")
+            .assert()
+            .success()
+            .code(0)
+            .stdout(predicate::str::contains("R001"))
+            .stdout(predicate::str::contains("non-concurrent-add-index"))
+            .stdout(predicate::str::contains("R017"))
+            // R015 was downgraded to Warning in this PR; the listing
+            // should reflect the current severity.
+            .stdout(predicate::str::contains("R015"))
+            .stdout(predicate::str::contains("Warning"));
+    }
+
+    #[test]
+    fn list_rules_includes_every_documented_rule() {
+        let expected_ids = [
+            "R001", "R002", "R003", "R004", "R005", "R006", "R008", "R009", "R010", "R011", "R012",
+            "R013", "R014", "R015", "R016", "R017",
+        ];
+        let readme = fs::read_to_string("README.md").expect("README should be readable");
+        let documented_ids: Vec<String> = readme
+            .lines()
+            .filter_map(|line| {
+                let mut cells = line.split('|').map(str::trim);
+                cells.next();
+                let id = cells.next()?;
+                (id.len() == 4
+                    && id.starts_with('R')
+                    && id[1..].chars().all(|c| c.is_ascii_digit()))
+                .then(|| id.to_string())
+            })
+            .collect();
+        assert_eq!(
+            documented_ids,
+            expected_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>(),
+            "README rule table is out of sync with expected active rules",
+        );
+
+        let output = zdm().arg("--list-rules").output().expect("zdm should run");
+        assert!(
+            output.status.success(),
+            "--list-rules should exit 0, got status {:?}",
+            output.status,
+        );
+        let stdout = String::from_utf8(output.stdout).expect("--list-rules output is UTF-8");
+        for id in expected_ids {
+            assert!(
+                stdout.contains(id),
+                "--list-rules output is missing rule {id}; got:\n{stdout}",
+            );
+        }
+
+        // Counter-assertion: each expected ID should appear on
+        // exactly one line. Catches both the "extras" case
+        // (a stale R007 line still printed) and any future
+        // double-listing. Using `contains("Rxxx ")` (id +
+        // trailing space) instead of the previous hand-rolled
+        // `R\d{3}\s` regex keeps the assertion stable across
+        // format changes (e.g. an ANSI-colour prefix or
+        // indented continuation line).
+        for id in expected_ids {
+            let needle = format!("{id} ");
+            let occurrences = stdout.lines().filter(|l| l.contains(&needle)).count();
+            assert_eq!(
+                occurrences, 1,
+                "expected exactly one line mentioning {id}, got {occurrences}\noutput:\n{stdout}",
+            );
+        }
+
+        let actual_ids: Vec<String> = stdout
+            .lines()
+            .filter_map(|line| {
+                line.split_whitespace().find_map(|token| {
+                    let id: String = token
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric())
+                        .collect();
+                    (id.len() == 4
+                        && id.starts_with('R')
+                        && id[1..].chars().all(|c| c.is_ascii_digit()))
+                    .then_some(id)
+                })
+            })
+            .collect();
+        assert_eq!(
+            actual_ids,
+            expected_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>(),
+            "--list-rules printed unexpected rule rows:\n{stdout}",
+        );
+    }
+
+    #[test]
+    fn list_rules_rejects_linting_flags() {
+        zdm()
+            .arg("--list-rules")
+            .arg("--select")
+            .arg("R001")
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "--list-rules cannot be combined with paths or linting flags",
+            ))
+            .stderr(predicate::str::contains("Git error").not());
+    }
+
+    #[test]
+    fn public_compatibility_shims_remain_available() {
+        use zero_downtime_migrations::ast::{Migration, OperationType};
+        use zero_downtime_migrations::parser::MAX_FILE_SIZE;
+
+        let migration = Migration::from_source(
+            std::path::Path::new("test.py"),
+            r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL("SELECT 1"),
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.RunSQL("SELECT 2"),
+            ],
+        ),
+    ]
+"#,
+        )
+        .unwrap();
+
+        let max_file_size = std::hint::black_box(MAX_FILE_SIZE);
+        assert!(max_file_size > 0);
+        assert_eq!(
+            migration.operations_of_type(OperationType::RunSQL).count(),
+            1,
+        );
+        assert_eq!(
+            migration
+                .database_effective_operations_of_type(OperationType::RunSQL)
+                .count(),
+            2,
+        );
     }
 }

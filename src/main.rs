@@ -8,14 +8,12 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 
-use zero_downtime_migrations::ast::extractor::MigrationExtractor;
 use zero_downtime_migrations::ast::Migration;
 use zero_downtime_migrations::config::Config;
 use zero_downtime_migrations::diagnostics::{Diagnostic, Severity};
 use zero_downtime_migrations::discovery;
 use zero_downtime_migrations::error::{Error, Result};
-use zero_downtime_migrations::git::GitRepo;
-use zero_downtime_migrations::parser::{self, ParsedMigration};
+use zero_downtime_migrations::git::{ChangedKind, DiffSource, GitRepo};
 use zero_downtime_migrations::rules::{ChangesetRuleRegistry, RuleRegistry};
 
 /// Zero-Downtime Migrations - A PostgreSQL migration safety linter for Django
@@ -53,6 +51,10 @@ struct Cli {
     /// Treat warnings as errors
     #[arg(long)]
     warnings_as_errors: bool,
+
+    /// List every rule the binary recognises and exit
+    #[arg(long)]
+    list_rules: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, Default)]
@@ -79,7 +81,16 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(exit_code) => exit_code,
         Err(e) => {
-            eprintln!("{}: {}", "error".red().bold(), e);
+            // Use the single-line sanitizer because the error chain
+            // can embed a hostile filename (e.g. via
+            // `git_error_msg(format!("File '{}'...", path.display()))`)
+            // and a `\n` in the path would otherwise inject fake
+            // error lines on stderr.
+            eprintln!(
+                "{}: {}",
+                "error".red().bold(),
+                sanitize_text(&e.to_string(), SanitizePolicy::SingleLine)
+            );
             ExitCode::from(2)
         }
     }
@@ -91,6 +102,24 @@ fn run(cli: Cli) -> Result<ExitCode> {
         return match command {
             Commands::Rule { rule_id } => run_rule_command(&rule_id),
         };
+    }
+
+    // `--list-rules` short-circuits before anything else: no config
+    // load, no file discovery, just print the catalogue and exit.
+    if cli.list_rules {
+        if cli.paths != [PathBuf::from(".")]
+            || cli.diff.is_some()
+            || cli.diff_staged.is_some()
+            || !matches!(cli.output_format, OutputFormat::Default)
+            || cli.select.is_some()
+            || cli.ignore.is_some()
+            || cli.warnings_as_errors
+        {
+            return Err(Error::cli_usage(
+                "--list-rules cannot be combined with paths or linting flags",
+            ));
+        }
+        return list_rules();
     }
 
     // Build config from CLI args. `apply_cli_overrides` treats `--ignore`
@@ -127,7 +156,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 migrations.push(migration);
             }
             Err(e) => {
-                eprintln!("{}: {} - {}", "error".red().bold(), path.display(), e);
+                eprintln!(
+                    "{}: {} - {}",
+                    "error".red().bold(),
+                    sanitize_path(path),
+                    sanitize_text(&e.to_string(), SanitizePolicy::SingleLine)
+                );
                 has_parse_errors = true;
             }
         }
@@ -135,7 +169,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
     // Run changeset rules if in diff mode
     if let Some(diff_mode) = diff_mode {
-        let other_files = discover_non_migration_files(diff_mode)?;
+        let other_files = discover_non_migration_files(diff_mode, &cli.paths)?;
         let changeset_registry = ChangesetRuleRegistry::new();
         let migration_refs: Vec<&Migration> = migrations.iter().collect();
         let other_file_refs: Vec<&Path> = other_files.iter().map(|p| p.as_path()).collect();
@@ -178,32 +212,84 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
-fn run_rule_command(rule_id: &str) -> Result<ExitCode> {
+/// Every (id, name, severity, description) tuple across both
+/// registries. Deduplicated and sorted by ID so the rule
+/// catalogue is stable across invocations. Used by both
+/// `--list-rules` and `rule <id>` (and the latter's "unknown
+/// rule: did you mean…" suggestion list), so the three call
+/// sites can't drift apart.
+fn all_rule_metadata() -> Vec<(String, String, Severity, String)> {
     let registry = RuleRegistry::new();
     let changeset_registry = ChangesetRuleRegistry::new();
+    let mut rows: Vec<(String, String, Severity, String)> = registry
+        .rules()
+        .iter()
+        .map(|r| {
+            (
+                r.id().to_string(),
+                r.name().to_string(),
+                r.severity(),
+                r.description().to_string(),
+            )
+        })
+        .chain(changeset_registry.rules().iter().map(|r| {
+            (
+                r.id().to_string(),
+                r.name().to_string(),
+                r.severity(),
+                r.description().to_string(),
+            )
+        }))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows.dedup_by(|a, b| a.0 == b.0);
+    rows
+}
 
-    // Check per-file rules
-    if let Some(rule) = registry.get(rule_id) {
-        println!("{}", rule_id.bold().cyan());
-        println!("{}: {}", "Name".bold(), rule.name());
-        println!("{}: {:?}", "Severity".bold(), rule.severity());
+/// Print every rule the binary recognises, sorted by ID, with
+/// its name and severity. One row per rule.
+fn list_rules() -> Result<ExitCode> {
+    let rows = all_rule_metadata();
+    let id_width = rows.iter().map(|(id, ..)| id.len()).max().unwrap_or(4);
+    let sev_width = rows
+        .iter()
+        .map(|(_, _, sev, _)| format!("{sev:?}").len())
+        .max()
+        .unwrap_or(7);
+
+    for (id, name, sev, _) in &rows {
+        println!(
+            "{:<id_width$}  {:<sev_width$}  {}",
+            id.bold().cyan(),
+            format!("{sev:?}"),
+            name,
+            id_width = id_width,
+            sev_width = sev_width,
+        );
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_rule_command(rule_id: &str) -> Result<ExitCode> {
+    let rows = all_rule_metadata();
+    if let Some((id, name, severity, description)) = rows.iter().find(|(id, ..)| id == rule_id) {
+        println!("{}", id.bold().cyan());
+        println!("{}: {}", "Name".bold(), name);
+        println!("{}: {:?}", "Severity".bold(), severity);
         println!();
-        println!("{}", rule.description());
+        println!("{}", description);
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Check changeset rules
-    if let Some(rule) = changeset_registry.get(rule_id) {
-        println!("{}", rule_id.bold().cyan());
-        println!("{}: {}", "Name".bold(), rule.name());
-        println!("{}: {:?}", "Severity".bold(), rule.severity());
-        println!();
-        println!("{}", rule.description());
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    eprintln!("{}: Unknown rule: {}", "error".red().bold(), rule_id);
-    Err(Error::unknown_rule(rule_id))
+    // No `eprintln!` here: returning the error propagates to `main()`,
+    // which renders it through the standard sanitized error path. The
+    // previous explicit print produced a duplicate "error: Unknown
+    // rule: X" line. The error carries the sorted list of valid rule
+    // IDs so the user gets actionable feedback instead of having to
+    // grep the docs.
+    let available: Vec<String> = rows.into_iter().map(|(id, ..)| id).collect();
+    Err(Error::unknown_rule(rule_id, available))
 }
 
 fn load_config() -> Result<Config> {
@@ -227,18 +313,21 @@ fn discover_migrations(
         // In diff mode, get changed migrations from git
         let repo = GitRepo::open(Path::new("."))?;
         let migrations = match diff_mode {
-            DiffMode::Head { base_ref } => repo.changed_migration_paths(base_ref)?,
-            DiffMode::Staged { base_ref } => repo.changed_staged_migration_paths(base_ref)?,
+            DiffMode::Head { base_ref } => {
+                repo.changed_paths(base_ref, DiffSource::Head, ChangedKind::Migrations)?
+            }
+            DiffMode::Staged { base_ref } => {
+                repo.changed_paths(base_ref, DiffSource::Index, ChangedKind::Migrations)?
+            }
         };
+        let root = repo.root()?;
+        let migrations = filter_paths_by_cli_scope(migrations, paths, &root)?;
 
         // Apply exclude patterns to diff mode as well
         if exclude_patterns.is_empty() {
             Ok(migrations)
         } else {
-            let patterns: Vec<glob::Pattern> = exclude_patterns
-                .iter()
-                .filter_map(|p| glob::Pattern::new(p).ok())
-                .collect();
+            let patterns = compile_glob_patterns(exclude_patterns)?;
             Ok(migrations
                 .into_iter()
                 .filter(|p| {
@@ -253,18 +342,24 @@ fn discover_migrations(
         // For directories, use the migration pattern discovery
         let mut all_migrations = Vec::new();
 
-        // Compile exclude patterns once
-        let patterns: Vec<glob::Pattern> = exclude_patterns
-            .iter()
-            .filter_map(|p| glob::Pattern::new(p).ok())
-            .collect();
+        let patterns = compile_glob_patterns(exclude_patterns)?;
 
         for path in paths {
             if !path.exists() {
                 return Err(Error::path_not_found(path.clone()));
             }
 
-            if path.is_file() {
+            // `path.is_file()` follows symlinks, so an
+            // explicitly-passed symlink to e.g. `/etc/passwd`
+            // would otherwise reach the parser. Use
+            // `symlink_metadata` to stat the link itself — the
+            // CLI's symlink-rejection policy is uniform across
+            // the discovery walk, the explicit-path branch
+            // here, and the parser's size check.
+            let file_type = std::fs::symlink_metadata(path).map(|m| m.file_type());
+            let is_regular_file = file_type.as_ref().map(|t| t.is_file()).unwrap_or(false);
+            let is_directory = file_type.as_ref().map(|t| t.is_dir()).unwrap_or(false);
+            if is_regular_file {
                 // Accept any .py file passed explicitly
                 if path.extension().is_some_and(|ext| ext == "py") {
                     // Check against exclude patterns
@@ -273,13 +368,15 @@ fn discover_migrations(
                         all_migrations.push(path.clone());
                     }
                 }
-            } else {
+            } else if is_directory {
                 // For directories, use pattern-based discovery with exclude
                 let migrations = discovery::discover_migrations_with_exclude(
                     std::slice::from_ref(path),
                     exclude_patterns,
                 )?;
                 all_migrations.extend(migrations);
+            } else {
+                return Err(Error::path_not_found(path.clone()));
             }
         }
 
@@ -287,18 +384,121 @@ fn discover_migrations(
     }
 }
 
+fn filter_paths_by_cli_scope(
+    paths: Vec<PathBuf>,
+    scopes: &[PathBuf],
+    repo_root: &Path,
+) -> Result<Vec<PathBuf>> {
+    if scopes == [PathBuf::from(".")] {
+        return Ok(paths);
+    }
+    let current_dir = normalize_existing_path(
+        &std::env::current_dir().map_err(|e| Error::io(e, PathBuf::from(".")))?,
+    )?;
+    let original_repo_root = repo_root.to_path_buf();
+    let normalized_repo_root = normalize_existing_path(repo_root)?;
+    let absolute_scopes: Vec<PathBuf> = scopes
+        .iter()
+        .map(|scope| {
+            let path = if scope.is_absolute() {
+                scope.clone()
+            } else {
+                current_dir.join(scope)
+            };
+            if !path.exists() {
+                return Err(Error::path_not_found(scope.clone()));
+            }
+            let normalized_scope = normalize_existing_path(&path)?;
+            if !path_is_in_scope(&normalized_scope, &normalized_repo_root) {
+                return Err(Error::path_not_found(scope.clone()));
+            }
+            Ok(normalized_scope)
+        })
+        .collect::<Result<_>>()?;
+    Ok(paths
+        .into_iter()
+        .filter(|path| {
+            let normalized_path =
+                normalize_changed_path_for_scope(path, &original_repo_root, &normalized_repo_root);
+            absolute_scopes
+                .iter()
+                .any(|scope| path_is_in_scope(&normalized_path, scope))
+        })
+        .collect())
+}
+
+fn path_is_in_scope(path: &Path, scope: &Path) -> bool {
+    if scope == Path::new(".") {
+        return true;
+    }
+    path == scope || path.starts_with(scope)
+}
+
+fn normalize_existing_path(path: &Path) -> Result<PathBuf> {
+    path.canonicalize()
+        .map_err(|e| Error::io(e, path.to_path_buf()))
+}
+
+fn normalize_changed_path_for_scope(
+    path: &Path,
+    original_repo_root: &Path,
+    normalized_repo_root: &Path,
+) -> PathBuf {
+    if let Ok(normalized) = normalize_existing_path(path) {
+        return normalized;
+    }
+    if path.is_absolute() {
+        if let Ok(relative) = path.strip_prefix(original_repo_root) {
+            return normalized_repo_root.join(relative);
+        }
+        path.to_path_buf()
+    } else {
+        normalized_repo_root.join(path)
+    }
+}
+
+fn compile_glob_patterns(patterns: &[String]) -> Result<Vec<glob::Pattern>> {
+    patterns
+        .iter()
+        .map(|p| {
+            glob::Pattern::new(p).map_err(|e| Error::InvalidGlobPattern {
+                pattern: p.clone(),
+                message: e.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Returns repo-relative paths so changeset rules can match without
 /// touching the filesystem.
-fn discover_non_migration_files(diff_mode: DiffMode<'_>) -> Result<Vec<PathBuf>> {
+fn discover_non_migration_files(
+    diff_mode: DiffMode<'_>,
+    paths: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
     let repo = GitRepo::open(Path::new("."))?;
     let root = repo.root()?;
     let absolute = match diff_mode {
-        DiffMode::Head { base_ref } => repo.changed_non_migration_paths(base_ref)?,
-        DiffMode::Staged { base_ref } => repo.changed_staged_non_migration_paths(base_ref)?,
+        DiffMode::Head { base_ref } => {
+            repo.changed_paths(base_ref, DiffSource::Head, ChangedKind::NonMigrations)?
+        }
+        DiffMode::Staged { base_ref } => {
+            repo.changed_paths(base_ref, DiffSource::Index, ChangedKind::NonMigrations)?
+        }
     };
+    let absolute = filter_paths_by_cli_scope(absolute, paths, &root)?;
+    let normalized_root = normalize_existing_path(&root)?;
     Ok(absolute
         .into_iter()
-        .map(|p| p.strip_prefix(&root).map(|r| r.to_path_buf()).unwrap_or(p))
+        .map(|p| {
+            p.strip_prefix(&root)
+                .map(|r| r.to_path_buf())
+                .or_else(|_| {
+                    normalize_changed_path_for_scope(&p, &root, &normalized_root)
+                        .strip_prefix(&normalized_root)
+                        .map(|r| r.to_path_buf())
+                })
+                .unwrap_or(p)
+        })
         .collect())
 }
 
@@ -308,34 +508,19 @@ fn parse_and_check_file(
     config: &Config,
     diff_mode: Option<DiffMode<'_>>,
 ) -> Result<(Migration, Vec<Diagnostic>)> {
-    // Both paths enforce a size cap (parser::MAX_FILE_SIZE) to bound memory
-    // and parse time on untrusted input. The regular path uses parse_file,
-    // which also reports syntax errors with line/column. The staged path
-    // emits a less precise error on syntax failure; aligning the two would
-    // mean exposing parse_file's internals as a source-string variant —
-    // tracked as a follow-up.
-    let parsed = match diff_mode {
+    // Migration::from_source / from_path bundle size check +
+    // parse + extract, returning a path-bearing error on syntax
+    // failure either way. Staged content comes from the git
+    // index blob (which has its own MAX_FILE_SIZE enforced by
+    // GitRepo); disk content goes through parse_file.
+    let migration = match diff_mode {
         Some(DiffMode::Staged { .. }) => {
             let repo = GitRepo::open(Path::new("."))?;
             let source = repo.read_staged_file(path)?;
-            parser::check_size(path, source.len() as u64)?;
-            let parsed = ParsedMigration::parse(&source)
-                .map_err(|e| Error::parse(path.to_path_buf(), e.to_string()))?;
-            if parsed.has_errors() {
-                return Err(Error::parse(
-                    path.to_path_buf(),
-                    "syntax error in migration file".to_string(),
-                ));
-            }
-            parsed
+            Migration::from_source(path, &source)?
         }
-        _ => ParsedMigration::parse_file(path)?,
+        _ => Migration::from_path(path)?,
     };
-
-    let extractor = MigrationExtractor::new(&parsed);
-    let migration = extractor
-        .extract(path)
-        .map_err(|e| Error::parse(path.to_path_buf(), e.to_string()))?;
 
     // Run rules
     let diagnostics = rule_registry.check(&migration, config);
@@ -345,6 +530,9 @@ fn parse_and_check_file(
 
 fn output_diagnostics(diagnostics: &[Diagnostic], format: &OutputFormat) {
     if diagnostics.is_empty() {
+        if matches!(format, OutputFormat::Json) {
+            output_json(diagnostics);
+        }
         return;
     }
 
@@ -353,6 +541,32 @@ fn output_diagnostics(diagnostics: &[Diagnostic], format: &OutputFormat) {
         OutputFormat::Json => output_json(diagnostics),
         OutputFormat::Compact => output_compact(diagnostics),
     }
+}
+
+/// Controls whether literal newlines are preserved while escaping
+/// terminal control characters for human-readable output.
+#[derive(Debug, Clone, Copy)]
+enum SanitizePolicy {
+    Multiline,
+    SingleLine,
+}
+
+fn sanitize_text(s: &str, policy: SanitizePolicy) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch == '\n' && matches!(policy, SanitizePolicy::Multiline) {
+            out.push(ch);
+        } else if (ch as u32) < 0x20 || ch == '\x7f' {
+            out.push_str(&format!("\\x{:02x}", ch as u32));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn sanitize_path(path: &std::path::Path) -> String {
+    sanitize_text(&path.display().to_string(), SanitizePolicy::SingleLine)
 }
 
 fn output_default(diagnostics: &[Diagnostic]) {
@@ -365,19 +579,23 @@ fn output_default(diagnostics: &[Diagnostic]) {
         println!(
             "{}: {} [{} {}]",
             severity_str,
-            diag.message,
+            sanitize_text(&diag.message, SanitizePolicy::SingleLine),
             diag.rule_id.cyan(),
             diag.rule_name.cyan(),
         );
         println!(
             "  {} {}:{}",
             "-->".blue(),
-            diag.path.display(),
+            sanitize_path(&diag.path),
             diag.span.start_line
         );
 
         if let Some(ref help) = diag.help {
-            println!("  {} {}", "help:".green(), help);
+            println!(
+                "  {} {}",
+                "help:".green(),
+                sanitize_text(help, SanitizePolicy::Multiline)
+            );
         }
 
         println!();
@@ -396,48 +614,49 @@ fn output_default(diagnostics: &[Diagnostic]) {
     if error_count > 0 || warning_count > 0 {
         let mut parts = Vec::new();
         if error_count > 0 {
-            parts.push(
-                format!(
-                    "{} {}",
-                    error_count,
-                    if error_count == 1 { "error" } else { "errors" }
-                )
-                .red()
-                .to_string(),
-            );
+            parts.push(pluralize(error_count, "error", "errors").red().to_string());
         }
         if warning_count > 0 {
             parts.push(
-                format!(
-                    "{} {}",
-                    warning_count,
-                    if warning_count == 1 {
-                        "warning"
-                    } else {
-                        "warnings"
-                    }
-                )
-                .yellow()
-                .to_string(),
+                pluralize(warning_count, "warning", "warnings")
+                    .yellow()
+                    .to_string(),
             );
         }
         println!("{}", parts.join(", "));
     }
 }
 
-fn output_json(diagnostics: &[Diagnostic]) {
-    #[derive(serde::Serialize)]
-    struct JsonDiagnostic {
-        rule_id: String,
-        rule_name: String,
-        message: String,
-        severity: String,
-        path: String,
-        line: usize,
-        column: usize,
-        help: Option<String>,
-    }
+fn pluralize(n: usize, one: &str, many: &str) -> String {
+    format!("{} {}", n, if n == 1 { one } else { many })
+}
 
+#[derive(serde::Serialize)]
+struct JsonDiagnostic {
+    rule_id: String,
+    rule_name: String,
+    message: String,
+    severity: String,
+    path: String,
+    line: usize,
+    column: usize,
+    help: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct JsonOutput {
+    diagnostics: Vec<JsonDiagnostic>,
+    summary: JsonSummary,
+}
+
+#[derive(serde::Serialize)]
+struct JsonSummary {
+    total: usize,
+    errors: usize,
+    warnings: usize,
+}
+
+fn output_json(diagnostics: &[Diagnostic]) {
     let json_diagnostics: Vec<JsonDiagnostic> = diagnostics
         .iter()
         .map(|d| JsonDiagnostic {
@@ -451,19 +670,6 @@ fn output_json(diagnostics: &[Diagnostic]) {
             help: d.help.clone(),
         })
         .collect();
-
-    #[derive(serde::Serialize)]
-    struct JsonOutput {
-        diagnostics: Vec<JsonDiagnostic>,
-        summary: JsonSummary,
-    }
-
-    #[derive(serde::Serialize)]
-    struct JsonSummary {
-        total: usize,
-        errors: usize,
-        warnings: usize,
-    }
 
     let output = JsonOutput {
         diagnostics: json_diagnostics,
@@ -498,15 +704,68 @@ fn output_compact(diagnostics: &[Diagnostic]) {
         };
         println!(
             "{}:{}: {}: [{} {}] {}",
-            diag.path.display(),
+            sanitize_path(&diag.path),
             diag.span.start_line,
             severity_char,
             diag.rule_id,
             diag.rule_name,
-            diag.message,
+            sanitize_text(&diag.message, SanitizePolicy::SingleLine),
         );
         if let Some(help) = &diag.help {
-            println!("  help: {}", help);
+            println!("  help: {}", sanitize_text(help, SanitizePolicy::Multiline));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_changed_path_for_scope, sanitize_text, SanitizePolicy};
+    use std::path::Path;
+
+    #[test]
+    fn sanitize_multiline_preserves_newlines_and_escapes_controls() {
+        let cases = [
+            ("hello world", "hello world"),
+            ("a\nb\tc", "a\nb\\x09c"),
+            ("evil\x1b[31mRED\x1b[0m", "evil\\x1b[31mRED\\x1b[0m"),
+            ("\rfoo", "\\x0dfoo"),
+            ("bar\x07", "bar\\x07"),
+            ("a\x7fb", "a\\x7fb"),
+            ("café — naïve", "café — naïve"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(sanitize_text(input, SanitizePolicy::Multiline), expected);
+        }
+    }
+
+    #[test]
+    fn sanitize_single_line_escapes_newlines_and_carriage_returns() {
+        let cases = [
+            (
+                "foo\n  --> /etc/passwd:1\nbar",
+                "foo\\x0a  --> /etc/passwd:1\\x0abar",
+            ),
+            ("a\rb", "a\\x0db"),
+            (
+                "/repo/app/migrations/0001.py",
+                "/repo/app/migrations/0001.py",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(sanitize_text(input, SanitizePolicy::SingleLine), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_changed_path_rebuilds_missing_repo_relative_absolute_path_from_normalized_root() {
+        let original_root = Path::new("/tmp/project");
+        let normalized_root = Path::new("/private/tmp/project");
+        let staged_only_path = Path::new("/tmp/project/app/migrations/0001.py");
+
+        assert_eq!(
+            normalize_changed_path_for_scope(staged_only_path, original_root, normalized_root),
+            Path::new("/private/tmp/project/app/migrations/0001.py"),
+        );
     }
 }

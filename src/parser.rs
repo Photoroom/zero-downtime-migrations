@@ -11,14 +11,15 @@ use tree_sitter::{Language, Node, Parser, Tree};
 
 use crate::error::{Error, Result};
 
-/// Maximum file size for migration files (10 MB).
-/// This bounds memory use and parse time when processing untrusted input.
+/// Maximum size (in bytes) of a single migration file the
+/// parser will accept. Bounds memory use and parse time when
+/// processing untrusted input. Currently a hard-coded 10 MiB.
 pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Returns `Err(Error::FileTooLarge)` if the given byte count exceeds
 /// `MAX_FILE_SIZE`. Callers that already hold a source string should pass
 /// `source.len() as u64`; callers reading from disk can stat the file first.
-pub fn check_size(path: &Path, size: u64) -> Result<()> {
+pub(crate) fn check_size(path: &Path, size: u64) -> Result<()> {
     if size > MAX_FILE_SIZE {
         return Err(Error::file_too_large(path, size, MAX_FILE_SIZE));
     }
@@ -32,7 +33,7 @@ static PYTHON_LANGUAGE: Lazy<Language> = Lazy::new(|| tree_sitter_python::LANGUA
 #[derive(Debug)]
 pub struct ParsedMigration {
     /// The source code.
-    pub source: String,
+    pub(crate) source: String,
     /// The tree-sitter parse tree.
     tree: Tree,
 }
@@ -48,7 +49,7 @@ impl ParsedMigration {
 
         let tree = parser
             .parse(&source, None)
-            .ok_or_else(|| Error::parse_error("<source>", "tree-sitter failed to parse"))?;
+            .ok_or_else(|| Error::parse("<source>", "tree-sitter failed to parse"))?;
 
         Ok(Self { source, tree })
     }
@@ -56,7 +57,27 @@ impl ParsedMigration {
     /// Parse a migration file from a path.
     pub fn parse_file(path: &Path) -> Result<Self> {
         // Cap on-disk size before reading to bound memory.
-        let metadata = std::fs::metadata(path).map_err(|e| Error::file_read(path, e))?;
+        //
+        // `std::fs::metadata` follows symlinks, so a symlink to
+        // `/dev/zero` or `/dev/random` would report length 0 here,
+        // skip `check_size`, then OOM the process at
+        // `read_to_string`. Use `symlink_metadata` to stat the link
+        // itself, then reject any non-regular file outright — the
+        // size cap only meaningfully applies to regular files. A
+        // legitimate symlink-to-regular-file gets rejected too,
+        // mirroring the discovery walk's symlink policy (see
+        // src/discovery.rs:75) and giving the binary a single,
+        // consistent answer to "we don't open links".
+        let metadata = std::fs::symlink_metadata(path).map_err(|e| Error::file_read(path, e))?;
+        if !metadata.file_type().is_file() {
+            return Err(Error::file_read(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing to read non-regular file (symlink, fifo, device, etc.)",
+                ),
+            ));
+        }
         check_size(path, metadata.len())?;
 
         let source = std::fs::read_to_string(path).map_err(|e| Error::file_read(path, e))?;
@@ -68,7 +89,7 @@ impl ParsedMigration {
 
         let tree = parser
             .parse(&source, None)
-            .ok_or_else(|| Error::parse_error(path, "tree-sitter failed to parse"))?;
+            .ok_or_else(|| Error::parse(path, "tree-sitter failed to parse"))?;
 
         // Check for parse errors
         if tree.root_node().has_error() {
@@ -86,12 +107,12 @@ impl ParsedMigration {
     }
 
     /// Get the root node of the parse tree.
-    pub fn root_node(&self) -> Node<'_> {
+    pub(crate) fn root_node(&self) -> Node<'_> {
         self.tree.root_node()
     }
 
     /// Get the source code as bytes.
-    pub fn source_bytes(&self) -> &[u8] {
+    pub(crate) fn source_bytes(&self) -> &[u8] {
         self.source.as_bytes()
     }
 
@@ -118,7 +139,7 @@ impl ParsedMigration {
     }
 
     /// Find the operations list node, if present.
-    pub fn find_operations_list(&self) -> Option<Node<'_>> {
+    pub(crate) fn find_operations_list(&self) -> Option<Node<'_>> {
         let class_node = self.find_migration_class()?;
         let source = self.source_bytes();
 
@@ -208,7 +229,7 @@ impl ParsedMigration {
     }
 
     /// Get all import statements in the file.
-    pub fn get_imports(&self) -> Vec<Node<'_>> {
+    pub(crate) fn get_imports(&self) -> Vec<Node<'_>> {
         let root = self.root_node();
         let mut imports = Vec::new();
 
@@ -222,7 +243,7 @@ impl ParsedMigration {
     }
 
     /// Get the text of a node.
-    pub fn node_text(&self, node: Node<'_>) -> &str {
+    pub(crate) fn node_text(&self, node: Node<'_>) -> &str {
         node.utf8_text(self.source_bytes()).unwrap_or("")
     }
 }
@@ -428,6 +449,41 @@ class Migration:
     }
 
     #[test]
+    fn test_parse_file_surfaces_parse_error_with_location() {
+        // `parse()` only flags errors via `has_errors()`; `parse_file`
+        // additionally raises them as `Error::ParseErrorWithLocation`
+        // so the CLI can render an actionable diagnostic. This path
+        // was previously untested — a refactor that silently swallowed
+        // the error would have shipped.
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(INVALID_PYTHON.as_bytes()).unwrap();
+        let path = file.path().to_path_buf();
+
+        let err = ParsedMigration::parse_file(&path).unwrap_err();
+        let (err_path, line) = match err {
+            Error::ParseErrorWithLocation { path, line, .. } => (path, line),
+            other => panic!("expected ParseErrorWithLocation, got: {other:?}"),
+        };
+        assert_eq!(err_path, path, "error should reference the file we parsed");
+        // INVALID_PYTHON starts with a leading newline, then 3 lines
+        // of valid code, then the `class Migration(... )` line that
+        // is missing its colon (line 4 of the literal string, which
+        // means the error node starts somewhere on or after line 4).
+        // The broken class header is line 4 of INVALID_PYTHON
+        // (1: empty leading newline, 2: import, 3: blank, 4: class
+        // header missing its colon). Tree-sitter's recovery anchors
+        // at the error node, which can't predate the broken header
+        // because lines 1-3 parse cleanly. Accepting line 3 (blank
+        // line, valid) or earlier would mean the location wasn't
+        // extracted from the error node at all.
+        assert!(
+            (4..=INVALID_PYTHON.lines().count() + 1).contains(&line),
+            "error line {line} should fall on or after the broken class header (line 4)",
+        );
+    }
+
+    #[test]
     fn test_node_text() {
         let parsed = ParsedMigration::parse(SIMPLE_MIGRATION).unwrap();
         let class_node = parsed.find_migration_class().unwrap();
@@ -473,5 +529,144 @@ class Migration:
             }
             other => panic!("expected FileTooLarge, got {other:?}"),
         }
+    }
+
+    // Module-boundary edge cases for `find_migration_class`. Each test
+    // pins the chosen behaviour so a refactor of the AST walk can't
+    // silently change which class (if any) the rule engine ends up
+    // analysing. Without these pins, a "look at the second class" or
+    // "recurse into nested classes" change would slip through every
+    // existing rule test (which assumes a well-formed single-Migration
+    // file).
+
+    #[test]
+    fn test_find_migration_class_returns_none_for_empty_source() {
+        let parsed = ParsedMigration::parse("").unwrap();
+        assert!(parsed.find_migration_class().is_none());
+    }
+
+    #[test]
+    fn test_find_migration_class_returns_none_for_comments_only() {
+        let parsed = ParsedMigration::parse("# just a comment\n# and another\n").unwrap();
+        assert!(parsed.find_migration_class().is_none());
+    }
+
+    #[test]
+    fn test_find_migration_class_returns_none_when_no_migration_class() {
+        // Other top-level classes exist but none named `Migration`.
+        let source = r#"
+from django.db import migrations
+
+
+class NotAMigration:
+    operations = []
+
+
+class HelperClass:
+    pass
+"#;
+        let parsed = ParsedMigration::parse(source).unwrap();
+        assert!(parsed.find_migration_class().is_none());
+    }
+
+    #[test]
+    fn test_find_migration_class_returns_first_when_multiple() {
+        // Pathological but legal Python: two top-level `class Migration`
+        // definitions. The second shadows the first at runtime, but
+        // Django itself doesn't allow this — `makemigrations` writes
+        // exactly one. Pin that the parser returns the FIRST so a
+        // refactor that switches to "last" surfaces the change.
+        let source = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+    operations = ['FIRST']
+
+
+class Migration(migrations.Migration):  # noqa: F811
+    operations = ['SECOND']
+"#;
+        let parsed = ParsedMigration::parse(source).unwrap();
+        let class_node = parsed.find_migration_class().expect("class found");
+        let class_text = &source[class_node.byte_range()];
+        assert!(
+            class_text.contains("'FIRST'"),
+            "find_migration_class should return the first definition, got:\n{class_text}",
+        );
+    }
+
+    #[test]
+    fn test_find_migration_class_ignores_nested_migration_class() {
+        // A `class Migration:` nested inside another class is not the
+        // Django Migration — `find_migration_class` only walks
+        // top-level children of the module root.
+        let source = r#"
+class Container:
+    class Migration:
+        operations = []
+"#;
+        let parsed = ParsedMigration::parse(source).unwrap();
+        assert!(parsed.find_migration_class().is_none());
+    }
+
+    #[test]
+    fn test_find_migration_class_skips_shebang() {
+        // A leading shebang line (rare but legal in Python source)
+        // should not prevent the parser from finding the class.
+        let source = "#!/usr/bin/env python\n\nclass Migration:\n    operations = []\n";
+        let parsed = ParsedMigration::parse(source).unwrap();
+        assert!(parsed.find_migration_class().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_file_rejects_symlink_target() {
+        // `std::fs::metadata` follows symlinks, so a symlink to
+        // `/dev/zero` would report length 0 and skip the size cap,
+        // then OOM at `read_to_string`. The fix uses
+        // `symlink_metadata` and rejects any non-regular file
+        // outright. Pin both: the rejection fires, AND the error
+        // is the InvalidInput we constructed (so a future refactor
+        // that swaps the rejection out for a silent file-read
+        // surfaces here).
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::TempDir::new().unwrap();
+        let target = temp.path().join("real.py");
+        std::fs::write(&target, "class Migration:\n    operations = []\n").unwrap();
+        let link = temp.path().join("link.py");
+        symlink(&target, &link).unwrap();
+
+        let result = ParsedMigration::parse_file(&link);
+        match result {
+            Err(Error::FileRead { source, .. }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(
+                    source.to_string().contains("non-regular file"),
+                    "expected non-regular-file rejection, got: {source}",
+                );
+            }
+            other => panic!("expected FileRead InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_file_accepts_real_file_next_to_symlink() {
+        // Symmetry pin: the target of the symlink is a perfectly
+        // valid regular file and must parse if accessed directly,
+        // so the rejection is specifically about the symlink
+        // itself — not about any path in the same dir.
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::TempDir::new().unwrap();
+        let target = temp.path().join("real.py");
+        std::fs::write(&target, "class Migration:\n    operations = []\n").unwrap();
+        let link = temp.path().join("link.py");
+        symlink(&target, &link).unwrap();
+
+        // The link is rejected.
+        assert!(ParsedMigration::parse_file(&link).is_err());
+        // The target is accepted.
+        assert!(ParsedMigration::parse_file(&target).is_ok());
     }
 }

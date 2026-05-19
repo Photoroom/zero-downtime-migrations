@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use crate::ast::{Migration, OperationData, OperationType};
+use crate::ast::{Migration, OperationData};
 use crate::diagnostics::{Diagnostic, Severity, Span};
 use crate::rules::{ChangesetRule, RuleContext};
 
@@ -46,14 +46,27 @@ impl ChangesetRule for R009SeparateDbStateSamePr {
         // a separate bundling concern, not what R009 is about.
         let mut diagnostics = Vec::new();
 
-        let has_state_step = migrations.iter().any(|m| is_state_only_separation(m));
-        let has_db_step = migrations.iter().any(|m| is_db_only_separation(m));
+        let kinds: Vec<Vec<SeparationKind>> =
+            migrations.iter().map(|m| separation_kinds(m)).collect();
+        let has_state_step = kinds
+            .iter()
+            .flatten()
+            .any(|kind| *kind == SeparationKind::StateOnly);
+        let has_db_step = kinds
+            .iter()
+            .flatten()
+            .any(|kind| *kind == SeparationKind::DatabaseOnly);
         if !(has_state_step && has_db_step) {
             return diagnostics;
         }
 
-        for migration in migrations {
-            if !(is_state_only_separation(migration) || is_db_only_separation(migration)) {
+        for (migration, kind) in migrations.iter().zip(&kinds) {
+            if !kind.iter().any(|kind| {
+                matches!(
+                    kind,
+                    SeparationKind::StateOnly | SeparationKind::DatabaseOnly
+                )
+            }) {
                 continue;
             }
             let Some(span) = separation_span(migration) else {
@@ -81,22 +94,36 @@ impl ChangesetRule for R009SeparateDbStateSamePr {
     }
 }
 
-fn is_state_only_separation(migration: &Migration) -> bool {
-    migration.operations.iter().any(|op| match &op.data {
-        OperationData::SeparateDatabaseAndState(d) => {
-            d.has_state_operations && !d.has_database_operations
-        }
-        _ => false,
-    })
+/// What kind of `SeparateDatabaseAndState` arm(s) a migration
+/// contains, if any. R009 fires only when one PR holds *both*
+/// `StateOnly` and `DatabaseOnly` migrations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeparationKind {
+    /// Has `state_operations` but no `database_operations`.
+    StateOnly,
+    /// Has `database_operations` but no `state_operations`.
+    DatabaseOnly,
+    /// Has both arms — i.e. the SDaS is self-contained, not a
+    /// two-step deployment. Not flagged.
+    Both,
 }
 
-fn is_db_only_separation(migration: &Migration) -> bool {
-    migration.operations.iter().any(|op| match &op.data {
-        OperationData::SeparateDatabaseAndState(d) => {
-            d.has_database_operations && !d.has_state_operations
-        }
-        _ => false,
-    })
+fn separation_kinds(migration: &Migration) -> Vec<SeparationKind> {
+    migration
+        .operations
+        .iter()
+        .filter_map(|op| match &op.data {
+            OperationData::SeparateDatabaseAndState(d) => {
+                match (d.has_state_operations, d.has_database_operations) {
+                    (true, false) => Some(SeparationKind::StateOnly),
+                    (false, true) => Some(SeparationKind::DatabaseOnly),
+                    (true, true) => Some(SeparationKind::Both),
+                    (false, false) => None,
+                }
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Span of the migration's `SeparateDatabaseAndState` operation, used to
@@ -106,14 +133,20 @@ fn separation_span(migration: &Migration) -> Option<Span> {
     migration
         .operations
         .iter()
-        .find(|op| op.op_type == OperationType::SeparateDatabaseAndState)
+        .find(|op| {
+            matches!(
+                &op.data,
+                OperationData::SeparateDatabaseAndState(d)
+                    if d.has_state_operations ^ d.has_database_operations
+            )
+        })
         .map(|op| op.span)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::extractor::MigrationExtractor;
+    use crate::ast::MigrationExtractor;
     use crate::config::Config;
     use crate::parser::ParsedMigration;
 
@@ -150,6 +183,45 @@ class Migration(migrations.Migration):
     ]
 "#;
 
+    const STATE_ONLY_NON_LITERAL_MIGRATION: &str = r#"
+from django.db import migrations
+
+
+STATE_OPS = [
+    migrations.RemoveField(
+        model_name='product',
+        name='deprecated_field',
+    ),
+]
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            state_operations=STATE_OPS,
+        ),
+    ]
+"#;
+
+    const DB_ONLY_NON_LITERAL_MIGRATION: &str = r#"
+from django.db import migrations
+
+
+DB_OPS = [
+    migrations.RunSQL('DROP COLUMN deprecated_field'),
+]
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=DB_OPS,
+        ),
+    ]
+"#;
+
     const OTHER_MIGRATION: &str = r#"
 from django.db import migrations, models
 
@@ -161,6 +233,32 @@ class Migration(migrations.Migration):
             model_name='product',
             name='new_field',
             field=models.CharField(max_length=50, null=True),
+        ),
+    ]
+"#;
+
+    const BOTH_THEN_STATE_MIGRATION: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            state_operations=[
+                migrations.AlterModelTable(name='product', table='store_product'),
+            ],
+            database_operations=[
+                migrations.RunSQL('ALTER TABLE product RENAME TO store_product'),
+            ],
+        ),
+        migrations.SeparateDatabaseAndState(
+            state_operations=[
+                migrations.RemoveField(
+                    model_name='product',
+                    name='deprecated_field',
+                ),
+            ],
         ),
     ]
 "#;
@@ -204,6 +302,18 @@ class Migration(migrations.Migration):
     }
 
     #[test]
+    fn test_non_literal_state_and_db_arms_still_count_as_present() {
+        let state_migration = parse_migration(STATE_ONLY_NON_LITERAL_MIGRATION, "0001_state.py");
+        let db_migration = parse_migration(DB_ONLY_NON_LITERAL_MIGRATION, "0002_db.py");
+        let migrations = vec![&state_migration, &db_migration];
+
+        let diagnostics = run(&migrations);
+
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics.iter().all(|d| d.rule_id == "R009"));
+    }
+
+    #[test]
     fn test_state_only_with_unrelated_migration_does_not_warn() {
         // R009 is about the state/db pair specifically. Bundling a
         // state-only migration with an unrelated AddField is a different
@@ -216,6 +326,21 @@ class Migration(migrations.Migration):
         let diagnostics = run(&migrations);
 
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_later_state_only_operation_is_classified() {
+        let state_migration = parse_migration(BOTH_THEN_STATE_MIGRATION, "0001_state.py");
+        let db_migration = parse_migration(DB_ONLY_MIGRATION, "0002_db.py");
+        let migrations = vec![&state_migration, &db_migration];
+
+        let diagnostics = run(&migrations);
+
+        assert_eq!(diagnostics.len(), 2);
+        let paths: std::collections::HashSet<_> =
+            diagnostics.iter().map(|d| d.path.clone()).collect();
+        assert!(paths.contains(&Path::new("0001_state.py").to_path_buf()));
+        assert!(paths.contains(&Path::new("0002_db.py").to_path_buf()));
     }
 
     #[test]

@@ -18,7 +18,12 @@ use crate::discovery::is_migration_file;
 use crate::error::{Error, Result};
 
 /// Status of a file in the git diff.
+///
+/// `#[non_exhaustive]`: libgit2 distinguishes Copied,
+/// Typechange, Unmodified, etc.; we surface only the four we
+/// currently act on, and reserve room to surface more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum FileStatus {
     Added,
     Modified,
@@ -28,9 +33,23 @@ pub enum FileStatus {
 
 /// Which subset of changed files a caller wants.
 #[derive(Debug, Clone, Copy)]
-enum ChangedKind {
+pub enum ChangedKind {
+    /// Files under `*/migrations/*.py` (the Django convention).
     Migrations,
+    /// Everything else — `models.py`, settings, fixtures, etc.
     NonMigrations,
+}
+
+/// Where to source the diff from. Two callers in the binary:
+/// `--diff <ref>` (tree-to-tree, [`DiffSource::Head`]) and
+/// `--diff-staged <ref>` (tree-to-index, [`DiffSource::Index`])
+/// for the pre-commit hook flow.
+#[derive(Debug, Clone, Copy)]
+pub enum DiffSource {
+    /// Diff between `base_ref` and the working tree's HEAD.
+    Head,
+    /// Diff between `base_ref` and the git index (staged-only).
+    Index,
 }
 
 /// A changed file in the git diff.
@@ -157,21 +176,34 @@ impl GitRepo {
     /// required `path` to exist on disk, which is wrong for a function
     /// whose purpose is to read content that may exist only in the
     /// index. The size cap from `parser::check_size` is applied against
-    /// the index entry's `file_size` *before* the blob is materialised,
-    /// so a 1 GB staged file can't force libgit2 to allocate a 1 GB
-    /// buffer just to be rejected afterwards.
+    /// the staged blob's object size before its content bytes are read.
     pub fn read_staged_file(&self, path: &Path) -> Result<String> {
         let root = self.root()?;
         let relative_path: PathBuf = if path.is_absolute() {
-            path.strip_prefix(&root)
-                .map_err(|_| {
-                    Error::git_error_msg(format!(
-                        "File '{}' is not inside repository '{}'",
-                        path.display(),
-                        root.display()
-                    ))
-                })?
-                .to_path_buf()
+            match path.strip_prefix(&root) {
+                Ok(relative) => relative.to_path_buf(),
+                Err(_) => {
+                    let canonical_root = root.canonicalize().map_err(|e| Error::io(e, &root))?;
+                    let canonical_path = path.canonicalize().map_err(|e| {
+                        Error::git_error_msg(format!(
+                            "File '{}' is not inside repository '{}': {}",
+                            path.display(),
+                            root.display(),
+                            e
+                        ))
+                    })?;
+                    canonical_path
+                        .strip_prefix(&canonical_root)
+                        .map_err(|_| {
+                            Error::git_error_msg(format!(
+                                "File '{}' is not inside repository '{}'",
+                                path.display(),
+                                root.display()
+                            ))
+                        })?
+                        .to_path_buf()
+                }
+            }
         } else {
             path.to_path_buf()
         };
@@ -186,13 +218,17 @@ impl GitRepo {
                 relative_path.display()
             ))
         })?;
-        // Reject oversized staged blobs before `find_blob` forces libgit2
-        // to inflate the object data.
-        crate::parser::check_size(path, u64::from(entry.file_size))?;
+        if entry.mode & 0o170000 != 0o100000 {
+            return Err(Error::git_error_msg(format!(
+                "Refusing to read non-regular staged file '{}' from git index",
+                relative_path.display()
+            )));
+        }
         let blob = self
             .repo
             .find_blob(entry.id)
             .map_err(|e| Error::git_error_msg(format!("Failed to read staged file: {}", e)))?;
+        crate::parser::check_size(path, blob.size() as u64)?;
 
         std::str::from_utf8(blob.content())
             .map(|s| s.to_string())
@@ -205,31 +241,44 @@ impl GitRepo {
             })
     }
 
-    /// Get paths of all changed migration files (absolute paths under
-    /// the repo root).
+    /// Project the diff against `base_ref` into absolute file
+    /// paths under the repo root, filtered by `source` (HEAD vs
+    /// index) and `kind` (migrations vs non-migrations). The
+    /// four call sites in `main.rs` cover every (source, kind)
+    /// combination, so the previous four wrapper methods
+    /// (`changed_migration_paths`, `changed_staged_migration_paths`,
+    /// etc.) collapsed into this single entry point.
+    pub fn changed_paths(
+        &self,
+        base_ref: &str,
+        source: DiffSource,
+        kind: ChangedKind,
+    ) -> Result<Vec<PathBuf>> {
+        let files = match source {
+            DiffSource::Head => self.changed_files(base_ref)?,
+            DiffSource::Index => self.changed_staged_files(base_ref)?,
+        };
+        self.paths_from(files, kind)
+    }
+
+    /// Compatibility shim for callers that want changed migration files in HEAD.
     pub fn changed_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
-        self.paths_from(self.changed_files(base_ref)?, ChangedKind::Migrations)
+        self.changed_paths(base_ref, DiffSource::Head, ChangedKind::Migrations)
     }
 
-    /// Get paths of all staged changed migration files.
+    /// Compatibility shim for callers that want changed migration files in the index.
     pub fn changed_staged_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
-        self.paths_from(
-            self.changed_staged_files(base_ref)?,
-            ChangedKind::Migrations,
-        )
+        self.changed_paths(base_ref, DiffSource::Index, ChangedKind::Migrations)
     }
 
-    /// Get paths of all non-migration files changed in the diff.
+    /// Compatibility shim for callers that want changed non-migration files in HEAD.
     pub fn changed_non_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
-        self.paths_from(self.changed_files(base_ref)?, ChangedKind::NonMigrations)
+        self.changed_paths(base_ref, DiffSource::Head, ChangedKind::NonMigrations)
     }
 
-    /// Get paths of all staged non-migration files changed in the diff.
+    /// Compatibility shim for callers that want changed non-migration files in the index.
     pub fn changed_staged_non_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
-        self.paths_from(
-            self.changed_staged_files(base_ref)?,
-            ChangedKind::NonMigrations,
-        )
+        self.changed_paths(base_ref, DiffSource::Index, ChangedKind::NonMigrations)
     }
 
     /// Project a list of `ChangedFile`s into absolute paths, filtering
@@ -369,9 +418,25 @@ mod tests {
 
     #[test]
     fn test_not_a_repo() {
+        // `is_err()` alone is too weak: an unrelated future error
+        // (e.g. an InvalidPath, an IO failure) would still pass. Pin
+        // the variant so a regression that swaps the error type
+        // — say, returning ParseError because some refactor wired
+        // GitRepo::open through a different boundary — fails loudly.
         let temp = TempDir::new().unwrap();
-        let result = GitRepo::open(temp.path());
-        assert!(result.is_err());
+        // `unwrap_err()` requires `Ok` to be Debug, which `GitRepo`
+        // isn't; pattern-match instead.
+        let Err(err) = GitRepo::open(temp.path()) else {
+            panic!("expected GitRepo::open to fail outside a repo")
+        };
+        assert!(
+            matches!(err, crate::error::Error::GitError { .. }),
+            "expected Error::GitError, got: {err:?}",
+        );
+        assert!(
+            err.to_string().contains("Failed to find git repository"),
+            "the error message should explain *what* failed, got: {err}",
+        );
     }
 
     #[test]
@@ -442,7 +507,9 @@ mod tests {
 
         // The filter keeps the migration and drops __init__.py and the
         // regular models.py.
-        let migration_paths = repo.changed_migration_paths("HEAD~1").unwrap();
+        let migration_paths = repo
+            .changed_paths("HEAD~1", DiffSource::Head, ChangedKind::Migrations)
+            .unwrap();
         assert_eq!(migration_paths.len(), 1);
         assert!(migration_paths[0]
             .to_string_lossy()
@@ -463,7 +530,9 @@ mod tests {
         fs::write(migrations_dir.join("0001_test.py"), "# migration").unwrap();
         commit(&temp, "Add migration");
 
-        let paths = repo.changed_migration_paths("HEAD~1").unwrap();
+        let paths = repo
+            .changed_paths("HEAD~1", DiffSource::Head, ChangedKind::Migrations)
+            .unwrap();
         assert_eq!(paths.len(), 1);
         assert!(paths[0].ends_with("0001_test.py"));
         // Should be absolute path
@@ -486,7 +555,9 @@ mod tests {
         fs::write(temp.path().join("app").join("views.py"), "# views").unwrap();
         commit(&temp, "Add files");
 
-        let non_migrations = repo.changed_non_migration_paths("HEAD~1").unwrap();
+        let non_migrations = repo
+            .changed_paths("HEAD~1", DiffSource::Head, ChangedKind::NonMigrations)
+            .unwrap();
         assert_eq!(non_migrations.len(), 2);
         assert!(non_migrations.iter().any(|p| p.ends_with("models.py")));
         assert!(non_migrations.iter().any(|p| p.ends_with("views.py")));
@@ -571,15 +642,6 @@ mod tests {
         assert_eq!(content, "staged");
     }
 
-    // Note: a portable regression test for the old `canonicalize` path
-    // would require manufacturing a repo whose libgit2 workdir prefix
-    // differs from the path the caller hands in (the macOS
-    // `/tmp` ↔ `/private/tmp` case) AND the worktree copy being absent.
-    // That's hard to construct cross-platform; the relative-path test
-    // below covers the only branch that survives in the new code, and
-    // the absolute path under `repo.root()` is covered by
-    // `test_read_staged_file_ignores_unstaged_worktree_changes` above.
-
     #[test]
     fn test_read_staged_file_accepts_repo_relative_path() {
         // Relative paths skip `strip_prefix` entirely; this is the path
@@ -601,6 +663,57 @@ mod tests {
 
         let content = repo.read_staged_file(Path::new("file.py")).unwrap();
         assert_eq!(content, "v1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_staged_file_accepts_canonical_equivalent_absolute_path() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = create_test_repo();
+        let root = repo.root().unwrap();
+
+        fs::write(root.join("README.md"), "# Test").unwrap();
+        commit(&temp, "Initial");
+
+        fs::write(root.join("file.py"), "staged").unwrap();
+        Command::new("git")
+            .args(["add", "file.py"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let alias_parent = TempDir::new().unwrap();
+        let alias_root = alias_parent.path().join("repo-alias");
+        symlink(&root, &alias_root).unwrap();
+
+        let content = repo.read_staged_file(&alias_root.join("file.py")).unwrap();
+        assert_eq!(content, "staged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_staged_file_rejects_index_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = create_test_repo();
+        let root = repo.root().unwrap();
+
+        fs::write(root.join("README.md"), "# Test").unwrap();
+        commit(&temp, "Initial");
+
+        symlink("README.md", root.join("link.py")).unwrap();
+        Command::new("git")
+            .args(["add", "link.py"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let err = repo.read_staged_file(Path::new("link.py")).unwrap_err();
+        assert!(
+            err.to_string().contains("non-regular staged file"),
+            "expected staged symlink rejection, got: {err}",
+        );
     }
 
     #[test]

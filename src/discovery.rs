@@ -19,20 +19,33 @@ pub fn discover_migrations_with_exclude(
 ) -> Result<Vec<PathBuf>> {
     let mut migrations = Vec::new();
 
-    // Compile exclude patterns
+    // Compile exclude patterns here rather than assuming they came
+    // from `Config`: this is a public function and callers may pass
+    // patterns directly.
     let patterns: Vec<Pattern> = exclude_patterns
         .iter()
-        .filter_map(|p| Pattern::new(p).ok())
-        .collect();
+        .map(|p| {
+            Pattern::new(p).map_err(|e| Error::InvalidGlobPattern {
+                pattern: p.clone(),
+                message: e.to_string(),
+            })
+        })
+        .collect::<Result<_>>()?;
 
     for path in paths {
-        if path.is_file() {
+        // `path.is_file()` transparently follows symlinks, so an
+        // explicitly-passed symlink to `/etc/passwd` or `/dev/zero`
+        // would otherwise reach the parser. The discovery WALK
+        // already rejects symlinked entries via `symlink_metadata`
+        // (see `discover_in_directory` below); apply the same
+        // policy here so the explicit-path branch matches.
+        if is_regular_file(path) {
             if is_migration_file(path) && !is_excluded(path, &patterns) {
                 migrations.push(path.clone());
             }
-        } else if path.is_dir() {
+        } else if is_directory(path) {
             discover_in_directory(path, &mut migrations, &patterns)?;
-        } else if !path.exists() {
+        } else {
             return Err(Error::InvalidPath { path: path.clone() });
         }
     }
@@ -43,6 +56,23 @@ pub fn discover_migrations_with_exclude(
     migrations.dedup();
 
     Ok(migrations)
+}
+
+/// `true` iff `path` exists, is a regular file, and is not a
+/// symlink. `path.is_file()` from std follows links, which the
+/// CLI's symlink-rejection policy specifically forbids — use
+/// this helper everywhere a user-supplied path is being decided
+/// between "file" and "directory".
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false)
+}
+
+fn is_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false)
 }
 
 /// Check if a path matches any of the exclude patterns.
@@ -57,13 +87,22 @@ fn discover_in_directory(
     migrations: &mut Vec<PathBuf>,
     exclude_patterns: &[Pattern],
 ) -> Result<()> {
-    // Don't follow symlinks to avoid symlink attacks and infinite loops
+    // `follow_links(false)` stops WalkDir from traversing symlinks
+    // during the walk, but each yielded entry's `path` could itself
+    // be a symlink. `path.is_file()` then follows the link, so a
+    // hostile `0001.py -> /etc/passwd` symlink dropped inside a
+    // migrations directory would otherwise get read. `entry.file_type()`
+    // comes from a `symlink_metadata` call and reports the symlink as
+    // a symlink, not its target — so a real file check rejects it.
     for entry in WalkDir::new(dir).follow_links(false) {
         let entry = entry.map_err(|e| Error::directory_walk(dir, e))?;
 
         let path = entry.path();
 
-        if path.is_file() && is_migration_file(path) && !is_excluded(path, exclude_patterns) {
+        if entry.file_type().is_file()
+            && is_migration_file(path)
+            && !is_excluded(path, exclude_patterns)
+        {
             migrations.push(path.to_path_buf());
         }
     }
@@ -269,6 +308,90 @@ mod tests {
         for m in &migrations {
             assert!(!m.to_string_lossy().contains("app1"));
         }
+    }
+
+    #[test]
+    fn test_discover_invalid_exclude_pattern_errors() {
+        let temp = TempDir::new().unwrap();
+        let err =
+            discover_migrations_with_exclude(&[temp.path().to_path_buf()], &["[".to_string()])
+                .unwrap_err();
+
+        match err {
+            Error::InvalidGlobPattern { pattern, .. } => assert_eq!(pattern, "["),
+            other => panic!("expected InvalidGlobPattern, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_skips_symlinked_files() {
+        // A symlink dropped inside a migrations directory must not be
+        // followed during discovery, even when it ends in `.py` — a
+        // hostile `0001.py -> /etc/passwd` would otherwise have its
+        // target ingested. The protection comes from
+        // `entry.file_type().is_file()` (via `symlink_metadata`)
+        // returning false for symlinks, rather than `path.is_file()`
+        // which transparently follows them.
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create a real migration file as the symlink target.
+        let target_dir = root.join("real");
+        fs::create_dir_all(&target_dir).unwrap();
+        let target_file = target_dir.join("hidden.py");
+        fs::write(&target_file, "# target").unwrap();
+
+        // Create a migrations dir containing only a symlink pointing
+        // at the file above.
+        let migrations_dir = root.join("app/migrations");
+        fs::create_dir_all(&migrations_dir).unwrap();
+        let link_path = migrations_dir.join("0001_symlinked.py");
+        symlink(&target_file, &link_path).unwrap();
+
+        let migrations = discover_migrations_with_exclude(&[root.to_path_buf()], &[]).unwrap();
+
+        assert!(
+            migrations.is_empty(),
+            "symlinked migration entry should have been skipped, got: {migrations:?}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_skips_symlinked_files_inside_excluded_path() {
+        // Round-trip the symlink rejection with an exclude pattern
+        // also in play: even if a future refactor reordered the
+        // file_type check and the exclude check, the symlink should
+        // never be ingested. Without this pin, swapping the two
+        // checks would only break the unguarded variant above.
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        let target_dir = root.join("real");
+        fs::create_dir_all(&target_dir).unwrap();
+        let target_file = target_dir.join("hidden.py");
+        fs::write(&target_file, "# target").unwrap();
+
+        // Symlink lives in a `test_migrations/migrations` dir that
+        // the exclude pattern catches; the symlink-rejection must
+        // hold regardless of exclude interaction.
+        let migrations_dir = root.join("test_migrations/migrations");
+        fs::create_dir_all(&migrations_dir).unwrap();
+        let link_path = migrations_dir.join("0001_symlinked.py");
+        symlink(&target_file, &link_path).unwrap();
+
+        let exclude = vec!["**/test_migrations/**".to_string()];
+        let migrations = discover_migrations_with_exclude(&[root.to_path_buf()], &exclude).unwrap();
+
+        assert!(
+            migrations.is_empty(),
+            "symlink should be rejected even when an exclude pattern also matches, got: {migrations:?}",
+        );
     }
 
     #[test]

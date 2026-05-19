@@ -4,6 +4,7 @@ use crate::diagnostics::Span;
 
 /// A Django migration operation.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Operation {
     /// The type of operation.
     pub op_type: OperationType,
@@ -15,6 +16,7 @@ pub struct Operation {
 
 /// The type of a Django migration operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum OperationType {
     // Index operations
     AddIndex,
@@ -106,6 +108,7 @@ impl OperationType {
 
 /// Operation-specific data.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum OperationData {
     /// Index operation data.
     Index(IndexOperation),
@@ -127,41 +130,45 @@ pub enum OperationData {
 
 /// Data for index operations (AddIndex, RemoveIndex, etc.).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct IndexOperation {
     /// The model name (lowercase).
     pub model_name: String,
-    /// The index name, if specified.
+    /// The index name, if specified. Populated for both Add and Remove
+    /// forms: for `AddIndex`/`AddIndexConcurrently` it's the `name`
+    /// kwarg inside `models.Index(...)`, for `RemoveIndex` it's the
+    /// top-level `name=` kwarg.
     pub index_name: Option<String>,
+    /// Index column names, as written. Only populated for Add forms,
+    /// where the inner `models.Index(fields=[...])` lists them. Empty
+    /// for Remove forms (the rule has no column info — only the index
+    /// name) and for indexes whose `fields=...` value isn't a literal
+    /// list (e.g. an identifier referencing a module-level constant).
+    /// Order matches the source order, which is the index's column
+    /// order in Postgres.
+    ///
+    /// Casing: preserved verbatim from the source. Django writes
+    /// column names lowercase by default, so callers should compare
+    /// case-insensitively for the common path. Case-sensitive matching
+    /// is only correct when the caller knows the column came from a
+    /// `db_column='MixedCase'` (a quoted Postgres identifier) — that
+    /// information isn't carried in this struct.
+    pub columns: Vec<String>,
 }
 
 /// Data for model operations (CreateModel, DeleteModel, etc.).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ModelOperation {
     /// The model name.
     pub name: String,
     /// Old name (for RenameModel).
     pub old_name: Option<String>,
-    /// Fields (for CreateModel).
-    pub fields: Vec<FieldDefinition>,
-}
-
-/// A field definition in CreateModel.
-#[derive(Debug, Clone)]
-pub struct FieldDefinition {
-    /// The field name.
-    pub name: String,
-    /// The field type (e.g., "CharField", "ForeignKey").
-    pub field_type: String,
-    /// Whether the field is nullable.
-    pub is_nullable: bool,
-    /// Whether the field has a default value.
-    pub has_default: bool,
-    /// For ForeignKey, the referenced model.
-    pub references: Option<String>,
 }
 
 /// Data for field operations (AddField, RemoveField, etc.).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FieldOperation {
     /// The model name.
     pub model_name: String,
@@ -177,6 +184,7 @@ pub struct FieldOperation {
 
 /// Field information for AddField/AlterField.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FieldInfo {
     /// The field type (e.g., "CharField", "ForeignKey").
     pub field_type: String,
@@ -184,14 +192,11 @@ pub struct FieldInfo {
     pub is_nullable: bool,
     /// Whether the field has a default value.
     pub has_default: bool,
-    /// For ForeignKey, the referenced model.
-    pub references: Option<String>,
-    /// The raw field definition text.
-    pub raw_text: String,
 }
 
 /// Data for constraint operations.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConstraintOperation {
     /// The model name.
     pub model_name: String,
@@ -207,6 +212,7 @@ pub struct ConstraintOperation {
 /// `CheckConstraint`, `ExclusionConstraint`); foreign keys are added via
 /// `AddField`, not `AddConstraint`, so they don't appear here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConstraintType {
     Unique,
     Check,
@@ -216,6 +222,7 @@ pub enum ConstraintType {
 
 /// Data for RunSQL operations.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RunSQLOperation {
     /// The forward SQL statement.
     pub sql: String,
@@ -376,6 +383,7 @@ mod tests {
 
 /// Data for RunPython operations.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RunPythonOperation {
     /// The forward function name.
     pub code: String,
@@ -392,9 +400,22 @@ impl RunPythonOperation {
 
 /// Data for SeparateDatabaseAndState operations.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SeparateDatabaseAndStateOperation {
-    /// Whether state_operations is present.
+    /// Whether state_operations contains meaningful operations.
+    ///
+    /// Literal `[]` and `None` are treated as absent. Non-literal values
+    /// are treated as present because rules cannot prove they are empty.
     pub has_state_operations: bool,
-    /// Whether database_operations is present.
+    /// Whether database_operations contains meaningful operations.
+    ///
+    /// Literal `[]` and `None` are treated as absent. Non-literal values
+    /// are treated as present because rules cannot prove they are empty.
     pub has_database_operations: bool,
+    /// Operations inside the `database_operations=[...]` arm.
+    ///
+    /// These are database-effective operations and keep their original
+    /// operation spans for diagnostics and inline ignore directives.
+    /// State-side operations are metadata-only and are not retained here.
+    pub database_operations: Vec<Operation>,
 }

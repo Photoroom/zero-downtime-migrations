@@ -8,6 +8,9 @@
 //!
 //! Each rule implements either the `Rule` trait (per-file) or `ChangesetRule` trait.
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 mod r001_non_concurrent_add_index;
 mod r002_unique_constraint_without_index;
 mod r003_runsql_create_index;
@@ -42,18 +45,93 @@ pub use r015_alter_field_not_null::R015AlterFieldNotNull;
 pub use r016_non_concurrent_remove_index::R016NonConcurrentRemoveIndex;
 pub use r017_non_concurrent_add_constraint::R017NonConcurrentAddConstraint;
 
+use std::collections::HashSet;
 use std::path::Path;
 
-use crate::ast::Migration;
+use crate::ast::{Migration, ModelOperation, Operation, OperationData, OperationType};
 use crate::config::Config;
 use crate::diagnostics::{Diagnostic, Severity};
 
 /// Context passed to rules during linting.
+///
+/// `#[non_exhaustive]`: build via [`RuleContext::new`] so a
+/// future field addition doesn't break out-of-tree rule authors.
+#[non_exhaustive]
 pub struct RuleContext<'a> {
     /// The configuration.
     pub config: &'a Config,
     /// The file path being linted.
     pub path: &'a Path,
+}
+
+impl<'a> RuleContext<'a> {
+    /// Build a context for invoking a rule. Out-of-tree
+    /// consumers building custom rules call this in their tests.
+    pub fn new(config: &'a Config, path: &'a Path) -> Self {
+        Self { config, path }
+    }
+}
+
+/// Case-insensitive set of model names created so far during a
+/// `walk_with_created_models` traversal. `contains` lowercases
+/// on both sides so callers can pass `model_name` as-is.
+pub struct CreatedModels {
+    names: HashSet<String>,
+}
+
+impl CreatedModels {
+    fn new() -> Self {
+        Self {
+            names: HashSet::new(),
+        }
+    }
+
+    fn insert(&mut self, name: &str) {
+        self.names.insert(name.to_lowercase());
+    }
+
+    /// Is `name` in the set? Comparison is case-insensitive on
+    /// both sides — callers do not need to lowercase before
+    /// calling.
+    pub fn contains(&self, name: &str) -> bool {
+        self.names.contains(&name.to_lowercase())
+    }
+}
+
+/// Walk a migration's database-effective operations in source order,
+/// threading created-model state through each callback.
+///
+/// Wrapped `database_operations` are visited at the wrapper's source
+/// position. They inherit real top-level `CreateModel` operations that
+/// came before the wrapper, but state-side operations inside the wrapper
+/// remain metadata-only and do not mutate the created-model set.
+pub(crate) fn walk_with_created_models(
+    migration: &Migration,
+    mut handle: impl FnMut(&Operation, &CreatedModels),
+) {
+    let mut created = CreatedModels::new();
+    for op in &migration.operations {
+        match &op.data {
+            OperationData::SeparateDatabaseAndState(data) => {
+                for db_op in &data.database_operations {
+                    if db_op.op_type == OperationType::CreateModel {
+                        if let OperationData::Model(ModelOperation { name, .. }) = &db_op.data {
+                            created.insert(name);
+                        }
+                    }
+                    handle(db_op, &created);
+                }
+            }
+            _ => {
+                if op.op_type == OperationType::CreateModel {
+                    if let OperationData::Model(ModelOperation { name, .. }) = &op.data {
+                        created.insert(name);
+                    }
+                }
+                handle(op, &created);
+            }
+        }
+    }
 }
 
 /// A per-file rule that analyzes individual migration files.
@@ -141,6 +219,15 @@ impl RuleRegistry {
         self.rules.iter().find(|r| r.id() == id).map(|r| r.as_ref())
     }
 
+    /// Append a custom rule. Out-of-tree consumers building
+    /// custom rules call this after constructing the registry
+    /// with [`Self::new`] (which seeds the built-ins). Rules
+    /// run in registration order; suppression and
+    /// `warnings_as_errors` apply uniformly.
+    pub fn register(&mut self, rule: Box<dyn Rule>) {
+        self.rules.push(rule);
+    }
+
     /// Get enabled rules based on config.
     pub fn enabled_rules(&self, config: &Config) -> Vec<&dyn Rule> {
         self.rules
@@ -158,7 +245,6 @@ impl RuleRegistry {
         };
 
         let mut diagnostics = Vec::new();
-
         for rule in self.enabled_rules(config) {
             let mut rule_diagnostics = rule.check(migration, &ctx);
 
@@ -168,19 +254,27 @@ impl RuleRegistry {
                 !migration.is_rule_suppressed_at(d.rule_id, d.span.start_line, d.span.end_line)
             });
 
-            // Apply warnings_as_errors
-            if config.warnings_as_errors {
-                for diag in &mut rule_diagnostics {
-                    if diag.severity == Severity::Warning {
-                        diag.severity = Severity::Error;
-                    }
-                }
-            }
-
+            apply_warnings_as_errors(&mut rule_diagnostics, config);
             diagnostics.extend(rule_diagnostics);
         }
 
         diagnostics
+    }
+}
+
+/// Promote every `Warning` to `Error` if `config.warnings_as_errors`
+/// is set. Shared post-processing between `RuleRegistry::check` and
+/// `ChangesetRuleRegistry::check` — both registries used to have a
+/// hand-rolled copy of the same loop, and a future severity tweak
+/// would have needed two edits.
+fn apply_warnings_as_errors(diagnostics: &mut [Diagnostic], config: &Config) {
+    if !config.warnings_as_errors {
+        return;
+    }
+    for diag in diagnostics {
+        if diag.severity == Severity::Warning {
+            diag.severity = Severity::Error;
+        }
     }
 }
 
@@ -214,6 +308,11 @@ impl ChangesetRuleRegistry {
     /// Get a rule by ID.
     pub fn get(&self, id: &str) -> Option<&dyn ChangesetRule> {
         self.rules.iter().find(|r| r.id() == id).map(|r| r.as_ref())
+    }
+
+    /// Append a custom changeset rule. See [`RuleRegistry::register`].
+    pub fn register(&mut self, rule: Box<dyn ChangesetRule>) {
+        self.rules.push(rule);
     }
 
     /// Run all changeset rules.
@@ -263,15 +362,7 @@ impl ChangesetRuleRegistry {
                     }
                 });
 
-                // Apply warnings_as_errors
-                if config.warnings_as_errors {
-                    for diag in &mut rule_diagnostics {
-                        if diag.severity == Severity::Warning {
-                            diag.severity = Severity::Error;
-                        }
-                    }
-                }
-
+                apply_warnings_as_errors(&mut rule_diagnostics, config);
                 diagnostics.extend(rule_diagnostics);
             }
         }
@@ -336,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_changeset_registry_honours_inline_suppression() {
-        use crate::ast::extractor::MigrationExtractor;
+        use crate::ast::MigrationExtractor;
         use crate::parser::ParsedMigration;
         use std::path::Path;
 
@@ -395,7 +486,7 @@ class Migration(migrations.Migration):
 
     #[test]
     fn test_changeset_registry_suppresses_r008_via_any_migration() {
-        use crate::ast::extractor::MigrationExtractor;
+        use crate::ast::MigrationExtractor;
         use crate::parser::ParsedMigration;
         use std::path::Path;
 
@@ -436,7 +527,7 @@ class Migration(migrations.Migration):
 
     #[test]
     fn test_changeset_registry_does_not_suppress_r008_via_unrelated_rule() {
-        use crate::ast::extractor::MigrationExtractor;
+        use crate::ast::MigrationExtractor;
         use crate::parser::ParsedMigration;
         use std::path::Path;
 
@@ -467,5 +558,181 @@ class Migration(migrations.Migration):
         // R008 still fires because the directive targets a different rule.
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R008");
+    }
+
+    // -------------------------------------------------------------------
+    // walk_with_created_models
+    //
+    // The helper consolidates a pattern that used to be hand-rolled in
+    // R001/R002/R006/R010/R016/R017. Tests pin the invariants the
+    // callers rely on so a future refactor of the helper can't
+    // silently change exemption behaviour for all six rules at once.
+    // -------------------------------------------------------------------
+
+    use crate::ast::MigrationExtractor;
+    use crate::parser::ParsedMigration;
+    use std::path::Path;
+
+    fn extract(source: &str) -> Migration {
+        let parsed = ParsedMigration::parse(source).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        extractor.extract(Path::new("test.py")).unwrap()
+    }
+
+    #[test]
+    fn walk_with_created_models_strictly_before() {
+        // A CreateModel reaches `created_so_far` for the callbacks
+        // of every op that follows it, but not the op before it.
+        // This is the invariant that makes the order-aware
+        // exemption work — an order-blind set would silently let a
+        // CreateModel below a flagged op exempt that op.
+        let source = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(fields=['name'], name='product_name_idx'),
+        ),
+        migrations.CreateModel(
+            name='Product',
+            fields=[('id', models.BigAutoField(primary_key=True))],
+        ),
+    ]
+"#;
+        let migration = extract(source);
+        let mut seen: Vec<(OperationType, bool)> = Vec::new();
+        walk_with_created_models(&migration, |op, created| {
+            seen.push((op.op_type, created.contains("product")));
+        });
+        assert_eq!(
+            seen,
+            vec![
+                (OperationType::AddIndex, false),
+                (OperationType::CreateModel, true),
+            ],
+            "AddIndex above its CreateModel must NOT see the model in created",
+        );
+    }
+
+    #[test]
+    fn walk_with_created_models_case_insensitive_both_sides() {
+        // The CreatedModels newtype lowercases on insert AND on
+        // lookup, so a caller passing the original title-cased
+        // name finds the model. Before the newtype existed,
+        // callers had to remember to lowercase on lookup too;
+        // forgetting silently missed exemptions. Pin both halves.
+        let source = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.CreateModel(
+            name='Product',
+            fields=[('id', models.BigAutoField(primary_key=True))],
+        ),
+    ]
+"#;
+        let migration = extract(source);
+        let mut saw_lowercase = false;
+        let mut saw_titlecase = false;
+        let mut saw_uppercase = false;
+        walk_with_created_models(&migration, |_, created| {
+            saw_lowercase |= created.contains("product");
+            saw_titlecase |= created.contains("Product");
+            saw_uppercase |= created.contains("PRODUCT");
+        });
+        assert!(saw_lowercase && saw_titlecase && saw_uppercase);
+    }
+
+    #[test]
+    fn walk_with_created_models_visits_wrapped_database_ops_in_source_order() {
+        let source = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.CreateModel(
+            name='Product',
+            fields=[('id', models.BigAutoField(primary_key=True))],
+        ),
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.AddIndex(
+                    model_name='product',
+                    index=models.Index(fields=['name'], name='product_name_idx'),
+                ),
+            ],
+            state_operations=[
+                migrations.CreateModel(
+                    name='StateOnly',
+                    fields=[('id', models.BigAutoField(primary_key=True))],
+                ),
+            ],
+        ),
+        migrations.AddIndex(
+            model_name='stateonly',
+            index=models.Index(fields=['name'], name='stateonly_name_idx'),
+        ),
+    ]
+"#;
+        let migration = extract(source);
+        let mut seen: Vec<(OperationType, bool, bool)> = Vec::new();
+        walk_with_created_models(&migration, |op, created| {
+            seen.push((
+                op.op_type,
+                created.contains("product"),
+                created.contains("stateonly"),
+            ));
+        });
+        assert_eq!(
+            seen,
+            vec![
+                (OperationType::CreateModel, true, false),
+                (OperationType::AddIndex, true, false),
+                (OperationType::AddIndex, true, false),
+            ],
+            "wrapped database ops should inherit prior real CreateModel state, \
+             and state_operations must not create database state",
+        );
+    }
+
+    #[test]
+    fn walk_with_created_models_non_createmodel_does_not_insert() {
+        // The set must be populated *only* by CreateModel ops.
+        // A future helper tweak that also recorded e.g.
+        // AddField target models would silently expand exemptions
+        // for every caller and break their semantics. Pin the
+        // invariant.
+        let source = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddField(
+            model_name='order',
+            name='customer',
+            field=models.ForeignKey(on_delete=models.CASCADE, to='app.customer'),
+        ),
+    ]
+"#;
+        let migration = extract(source);
+        let mut saw_order = false;
+        walk_with_created_models(&migration, |_, created| {
+            saw_order |= created.contains("order");
+        });
+        assert!(
+            !saw_order,
+            "non-CreateModel ops must not populate `created`",
+        );
     }
 }

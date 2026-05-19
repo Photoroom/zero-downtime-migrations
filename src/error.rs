@@ -14,7 +14,16 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// The main error type for zdm.
+///
+/// `#[non_exhaustive]` so downstream code that exhaustively
+/// matches on the variants doesn't break when we add a new error
+/// path. The `UnknownRule` variant also gained an `available`
+/// field during this PR's review pass — pre-existing callers of
+/// `Error::unknown_rule` were updated in lockstep, but
+/// out-of-tree callers constructing the variant by struct-literal
+/// would have broken silently before this attribute landed.
 #[derive(Error, Debug, Diagnostic)]
+#[non_exhaustive]
 pub enum Error {
     /// File I/O error
     #[error("Failed to read file: {path}")]
@@ -63,22 +72,30 @@ pub enum Error {
         column: usize,
     },
 
-    /// Configuration parse error
+    /// Configuration parse error.
+    ///
+    /// The `source` is an opaque [`ConfigParseSource`] so that a
+    /// future major version of the underlying TOML library can be
+    /// adopted without it being a breaking change for our consumers.
     #[error("Failed to parse configuration: {path}")]
     #[diagnostic(code(zdm::config::parse_error))]
     ConfigParseError {
         path: PathBuf,
         #[source]
-        source: toml::de::Error,
+        source: ConfigParseSource,
     },
 
-    /// Git error
+    /// Git error.
+    ///
+    /// The `source` is an opaque [`GitSource`] for the same
+    /// reason as `ConfigParseError`: keeps git2 out of our
+    /// public ABI.
     #[error("Git error: {message}")]
     #[diagnostic(code(zdm::git::error))]
     GitError {
         message: String,
         #[source]
-        source: Option<git2::Error>,
+        source: Option<GitSource>,
     },
 
     /// The supplied `--diff` reference does not exist (libgit2's NotFound).
@@ -95,13 +112,27 @@ pub enum Error {
     )]
     InvalidGitReference { reference: String },
 
-    /// Unknown rule
-    #[error("Unknown rule: {rule_id}")]
+    /// Invalid command-line flag or argument combination.
+    #[error("CLI usage error: {message}")]
+    #[diagnostic(code(zdm::cli::usage_error))]
+    CliUsage { message: String },
+
+    /// Unknown rule. Format is single-line because the top-level
+    /// error sink runs the chain through `sanitize_single_line`,
+    /// which would otherwise escape an embedded `\n` into `\x0a`.
+    #[error("Unknown rule: {rule_id} (available rules: {})", available.join(", "))]
     #[diagnostic(
         code(zdm::rule::unknown),
         help("Run 'zdm rule <id>' to see documentation for a specific rule")
     )]
-    UnknownRule { rule_id: String },
+    UnknownRule {
+        rule_id: String,
+        /// All rule IDs the binary knows about, sorted, for the
+        /// "available rules: …" line in the error message. Populated
+        /// at the error-construction site (the CLI dispatcher) so the
+        /// error type itself doesn't depend on the rule registries.
+        available: Vec<String>,
+    },
 
     /// Invalid path
     #[error("Invalid path: {path}")]
@@ -149,14 +180,6 @@ impl Error {
         }
     }
 
-    /// Create a parse error.
-    pub fn parse_error(path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
-        Self::ParseError {
-            path: path.into(),
-            message: message.into(),
-        }
-    }
-
     /// Create a parse error with location.
     pub fn parse_error_with_location(path: impl Into<PathBuf>, line: usize, column: usize) -> Self {
         Self::ParseErrorWithLocation {
@@ -170,7 +193,7 @@ impl Error {
     pub fn config_parse_error(path: impl Into<PathBuf>, source: toml::de::Error) -> Self {
         Self::ConfigParseError {
             path: path.into(),
-            source,
+            source: source.into(),
         }
     }
 
@@ -179,6 +202,13 @@ impl Error {
         Self::GitError {
             message: message.into(),
             source: None,
+        }
+    }
+
+    /// Create a CLI usage error.
+    pub fn cli_usage(message: impl Into<String>) -> Self {
+        Self::CliUsage {
+            message: message.into(),
         }
     }
 
@@ -198,15 +228,60 @@ impl Error {
         }
     }
 
-    /// Create an unknown rule error.
-    pub fn unknown_rule(rule_id: impl Into<String>) -> Self {
+    /// Create an unknown rule error. `available` should be every rule
+    /// ID the binary recognises (per-file + changeset registries),
+    /// sorted, so the rendered error can suggest valid alternatives.
+    pub fn unknown_rule(rule_id: impl Into<String>, available: Vec<String>) -> Self {
         Self::UnknownRule {
             rule_id: rule_id.into(),
+            available,
         }
     }
 
     /// Create a path not found error.
     pub fn path_not_found(path: impl Into<PathBuf>) -> Self {
         Self::InvalidPath { path: path.into() }
+    }
+}
+
+/// Opaque wrapper around a TOML parse failure. Implements
+/// `std::error::Error + Display` so it shows up as the
+/// `#[source]` of [`Error::ConfigParseError`]; consumers can
+/// print it but cannot downcast to the underlying TOML library
+/// type. That keeps the TOML crate out of our public ABI — a
+/// future major version of it is not a breaking change for us.
+#[derive(Debug)]
+pub struct ConfigParseSource(toml::de::Error);
+
+impl std::fmt::Display for ConfigParseSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for ConfigParseSource {}
+
+impl From<toml::de::Error> for ConfigParseSource {
+    fn from(e: toml::de::Error) -> Self {
+        Self(e)
+    }
+}
+
+/// Opaque wrapper around a libgit2 failure. See
+/// [`ConfigParseSource`] for the rationale.
+#[derive(Debug)]
+pub struct GitSource(git2::Error);
+
+impl std::fmt::Display for GitSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for GitSource {}
+
+impl From<git2::Error> for GitSource {
+    fn from(e: git2::Error) -> Self {
+        Self(e)
     }
 }
