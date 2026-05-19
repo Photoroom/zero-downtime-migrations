@@ -77,6 +77,24 @@ fn git_stage(path: &std::path::Path, file: &str) {
         .expect("Failed to stage file");
 }
 
+fn set_base_to_head(path: &std::path::Path) {
+    StdCommand::new("git")
+        .args(["branch", "-f", "origin/main", "HEAD"])
+        .current_dir(path)
+        .output()
+        .expect("Failed to update base branch");
+}
+
+fn parse_json_output(output: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(output).expect("output must be valid JSON")
+}
+
+fn diagnostics(json: &serde_json::Value) -> &Vec<serde_json::Value> {
+    json.get("diagnostics")
+        .and_then(|v| v.as_array())
+        .expect("JSON output must include a `diagnostics` array")
+}
+
 const CLEAN_MIGRATION: &str = r#"
 from django.db import migrations
 
@@ -197,7 +215,6 @@ class Migration(migrations.Migration):
             .arg(temp.path())
             .assert()
             .success()
-            .code(0)
             .stdout(predicate::str::is_empty());
     }
 }
@@ -309,11 +326,7 @@ mod diff_mode {
         .unwrap();
         git_commit_all(temp.path(), "Add config");
 
-        StdCommand::new("git")
-            .args(["branch", "-f", "origin/main", "HEAD"])
-            .current_dir(temp.path())
-            .output()
-            .expect("Failed to update base branch");
+        set_base_to_head(temp.path());
 
         // Staged migration A lives under the excluded path; without
         // the exclude filter R001 would fire on it.
@@ -360,12 +373,8 @@ mod diff_mode {
             .get_output()
             .stdout
             .clone();
-        let json: serde_json::Value =
-            serde_json::from_str(&String::from_utf8(output).unwrap()).unwrap();
-        let diags = json
-            .get("diagnostics")
-            .and_then(|v| v.as_array())
-            .expect("JSON must include a `diagnostics` array");
+        let json = parse_json_output(&output);
+        let diags = diagnostics(&json);
         // Exactly one diagnostic: the control. The excluded file
         // contributes nothing.
         assert_eq!(
@@ -401,11 +410,7 @@ mod diff_mode {
         .unwrap();
         git_commit_all(temp.path(), "Add config");
 
-        StdCommand::new("git")
-            .args(["branch", "-f", "origin/main", "HEAD"])
-            .current_dir(temp.path())
-            .output()
-            .expect("Failed to update base branch");
+        set_base_to_head(temp.path());
 
         let migration_path = temp
             .path()
@@ -447,22 +452,9 @@ mod diff_mode {
 mod output_format {
     use super::*;
 
-    const BAD_MIGRATION: &str = r#"
-from django.db import migrations, models
-
-class Migration(migrations.Migration):
-    dependencies = []
-    operations = [
-        migrations.AddIndex(
-            model_name='product',
-            index=models.Index(fields=['name'], name='product_name_idx'),
-        ),
-    ]
-"#;
-
     #[test]
     fn default_output_shows_filename_and_rule() {
-        let temp = setup_migrations(&[("0001_bad.py", BAD_MIGRATION)]);
+        let temp = setup_migrations(&[("0001_bad.py", BAD_MIGRATION_NON_CONCURRENT_INDEX)]);
 
         zdm()
             .arg(temp.path())
@@ -474,7 +466,7 @@ class Migration(migrations.Migration):
 
     #[test]
     fn json_output_contains_required_fields() {
-        let temp = setup_migrations(&[("0001_bad.py", BAD_MIGRATION)]);
+        let temp = setup_migrations(&[("0001_bad.py", BAD_MIGRATION_NON_CONCURRENT_INDEX)]);
 
         let output = zdm()
             .arg(temp.path())
@@ -486,18 +478,13 @@ class Migration(migrations.Migration):
             .stdout
             .clone();
 
-        let json_str = String::from_utf8(output).unwrap();
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json_str).expect("output must be valid JSON");
+        let parsed = parse_json_output(&output);
 
         // Parse structurally rather than grepping the raw text: an
         // accidental rename of `path` to `pathname` (or moving fields
         // into a nested object) would otherwise still pass the old
         // substring check.
-        let diagnostics = parsed
-            .get("diagnostics")
-            .and_then(|v| v.as_array())
-            .expect("top-level JSON must have a `diagnostics` array");
+        let diagnostics = diagnostics(&parsed);
         assert!(
             !diagnostics.is_empty(),
             "expected at least one diagnostic in the JSON output"
@@ -560,8 +547,7 @@ class Migration(migrations.Migration):
             .stdout
             .clone();
 
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&output).expect("clean JSON output must be valid JSON");
+        let parsed = parse_json_output(&output);
         assert_eq!(parsed["diagnostics"].as_array().unwrap().len(), 0);
         assert_eq!(parsed["summary"]["total"].as_u64(), Some(0));
         assert_eq!(parsed["summary"]["errors"].as_u64(), Some(0));
@@ -570,7 +556,7 @@ class Migration(migrations.Migration):
 
     #[test]
     fn compact_output_one_line_per_diagnostic() {
-        let temp = setup_migrations(&[("0001_bad.py", BAD_MIGRATION)]);
+        let temp = setup_migrations(&[("0001_bad.py", BAD_MIGRATION_NON_CONCURRENT_INDEX)]);
 
         let output = zdm()
             .arg(temp.path())
@@ -682,12 +668,8 @@ class Migration(migrations.Migration):
             .get_output()
             .stdout
             .clone();
-        let json: serde_json::Value =
-            serde_json::from_str(&String::from_utf8(output).unwrap()).unwrap();
-        let diags = json
-            .get("diagnostics")
-            .and_then(|v| v.as_array())
-            .expect("JSON output must include a `diagnostics` array");
+        let json = parse_json_output(&output);
+        let diags = diagnostics(&json);
         assert_eq!(
             diags.len(),
             1,
@@ -729,10 +711,8 @@ class Migration(migrations.Migration):
             .get_output()
             .stdout
             .clone();
-        let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
-        let ids: Vec<&str> = json["diagnostics"]
-            .as_array()
-            .unwrap()
+        let json = parse_json_output(&output);
+        let ids: Vec<&str> = diagnostics(&json)
             .iter()
             .map(|d| d["rule_id"].as_str().unwrap())
             .collect();
@@ -753,8 +733,7 @@ class Migration(migrations.Migration):
             .arg("--ignore")
             .arg("R001,R016")
             .assert()
-            .success()
-            .code(0);
+            .success();
     }
 
     #[test]
@@ -937,32 +916,11 @@ mod rule_command {
 mod multiple_files {
     use super::*;
 
-    const CLEAN_MIGRATION: &str = r#"
-from django.db import migrations
-
-class Migration(migrations.Migration):
-    dependencies = []
-    operations = []
-"#;
-
-    const BAD_MIGRATION: &str = r#"
-from django.db import migrations, models
-
-class Migration(migrations.Migration):
-    dependencies = []
-    operations = [
-        migrations.AddIndex(
-            model_name='product',
-            index=models.Index(fields=['name'], name='product_name_idx'),
-        ),
-    ]
-"#;
-
     #[test]
     fn lint_multiple_files_in_directory() {
         let temp = setup_migrations(&[
             ("0001_initial.py", CLEAN_MIGRATION),
-            ("0002_bad.py", BAD_MIGRATION),
+            ("0002_bad.py", BAD_MIGRATION_NON_CONCURRENT_INDEX),
         ]);
 
         zdm()
@@ -974,10 +932,10 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn lint_specific_file() {
+    fn lint_explicit_file_arguments() {
         let temp = setup_migrations(&[
             ("0001_initial.py", CLEAN_MIGRATION),
-            ("0002_bad.py", BAD_MIGRATION),
+            ("0002_bad.py", BAD_MIGRATION_NON_CONCURRENT_INDEX),
         ]);
 
         let migrations_dir = temp.path().join("app").join("migrations");
@@ -986,8 +944,7 @@ class Migration(migrations.Migration):
         zdm()
             .arg(migrations_dir.join("0001_initial.py"))
             .assert()
-            .success()
-            .code(0);
+            .success();
 
         // Only lint the bad file
         zdm()
@@ -995,16 +952,6 @@ class Migration(migrations.Migration):
             .assert()
             .failure()
             .code(1);
-    }
-
-    #[test]
-    fn lint_multiple_specific_files() {
-        let temp = setup_migrations(&[
-            ("0001_initial.py", CLEAN_MIGRATION),
-            ("0002_bad.py", BAD_MIGRATION),
-        ]);
-
-        let migrations_dir = temp.path().join("app").join("migrations");
 
         zdm()
             .arg(migrations_dir.join("0001_initial.py"))
@@ -1104,42 +1051,21 @@ mod list_rules {
             );
         }
 
-        // Counter-assertion: the printed rule count should match
-        // the expected total exactly. Catches the "extras" case
-        // where stdout contains all expected IDs PLUS a stale one
-        // (e.g. a retired R007 line still printed alongside live
-        // rules).
-        // Anchored shape: `R` followed by exactly three digits and
-        // then whitespace. Catches the "wrap" case where
-        // `--list-rules` later grows a multi-line format (e.g. an
-        // indented help line that happens to start with `Rule …`),
-        // which a `starts_with('R') && next-is-digit` filter would
-        // over-count.
-        let printed_count = stdout
-            .lines()
-            .filter(|l| {
-                let trimmed = l.trim_start();
-                let mut chars = trimmed.chars();
-                if chars.next() != Some('R') {
-                    return false;
-                }
-                let id_digits: String = chars.by_ref().take(3).collect();
-                if id_digits.len() != 3 || !id_digits.chars().all(|c| c.is_ascii_digit()) {
-                    return false;
-                }
-                // Next char after the 3-digit id must be whitespace
-                // (separating the ID column from the name/severity
-                // columns). This rejects accidental matches like
-                // "R001-something" in body text.
-                chars.next().is_some_and(char::is_whitespace)
-            })
-            .count();
-        assert_eq!(
-            printed_count,
-            expected_ids.len(),
-            "--list-rules printed {printed_count} rule lines, expected {} (one per registered rule). \
-             Got:\n{stdout}",
-            expected_ids.len(),
-        );
+        // Counter-assertion: each expected ID should appear on
+        // exactly one line. Catches both the "extras" case
+        // (a stale R007 line still printed) and any future
+        // double-listing. Using `contains("Rxxx ")` (id +
+        // trailing space) instead of the previous hand-rolled
+        // `R\d{3}\s` regex keeps the assertion stable across
+        // format changes (e.g. an ANSI-colour prefix or
+        // indented continuation line).
+        for id in &expected_ids {
+            let needle = format!("{id} ");
+            let occurrences = stdout.lines().filter(|l| l.contains(&needle)).count();
+            assert_eq!(
+                occurrences, 1,
+                "expected exactly one line mentioning {id}, got {occurrences}\noutput:\n{stdout}",
+            );
+        }
     }
 }

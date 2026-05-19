@@ -1,7 +1,19 @@
-//! End-to-end integration tests using real migration fixture files.
+//! End-to-end CLI tests driven by on-disk fixture files.
 //!
-//! These tests validate the full CLI workflow with fixture files
-//! that represent real-world migration patterns.
+//! # Where to add a test
+//!
+//! - **`e2e.rs`** (this file) — when the test exercises a
+//!   real-world Django migration shape stored as a `.py` file
+//!   under `tests/fixtures/rules/RNNN/`. Use these to pin
+//!   "rule still fires on the canonical pattern" contracts.
+//! - **`cli_integration.rs`** — when the test exercises CLI
+//!   flag handling, output formats, exit codes, or in-memory
+//!   migration sources written via tempdir. Tests in that file
+//!   construct migrations ad-hoc; no fixture files involved.
+//!
+//! Fixture paths are asserted by basename only (e.g.
+//! `path.ends_with("fail_…py")`), so Windows path separators
+//! don't break them. New tests should follow that convention.
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
