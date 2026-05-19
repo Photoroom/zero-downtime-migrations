@@ -91,7 +91,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "{}: {}",
                 "error".red().bold(),
-                sanitize_single_line(&e.to_string())
+                sanitize_text(&e.to_string(), SanitizePolicy::SingleLine)
             );
             ExitCode::from(2)
         }
@@ -150,7 +150,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     "{}: {} - {}",
                     "error".red().bold(),
                     sanitize_path(path),
-                    sanitize_single_line(&e.to_string())
+                    sanitize_text(&e.to_string(), SanitizePolicy::SingleLine)
                 );
                 has_parse_errors = true;
             }
@@ -458,41 +458,39 @@ fn output_diagnostics(diagnostics: &[Diagnostic], format: &OutputFormat) {
     }
 }
 
-/// Escape ASCII control characters so a migration that smuggles
-/// ANSI sequences, carriage returns, BEL, or backspace through an
-/// identifier (or a filename) can't repaint the user's terminal when
-/// the diagnostic renders. Newlines are passed through because the
-/// help text uses them for multi-line layout; tabs are escaped so a
-/// `\t`-heavy message can't desync the compact format's
-/// `path:line:severity:...` column layout. Everything else in
-/// 0x00–0x1F and 0x7F becomes `\xHH`. JSON output is already safe
-/// because `serde_json` escapes control characters by default.
+/// What kind of value we're sanitizing, which controls newline
+/// handling. Everything else (control chars 0x00–0x1F minus
+/// whichever newlines are kept, plus 0x7F DEL) is always escaped
+/// to `\xHH`.
 ///
-/// Out of scope: dangerous Unicode codepoints (bidi-override U+202E,
-/// zero-width joiner, line/paragraph separators U+2028/U+2029). Rule
-/// messages legitimately contain em-dashes and smart quotes, so a
-/// blanket non-ASCII escape would mangle them. A future pass can add
-/// a narrower deny-list for the known-bad codepoints.
-fn sanitize_for_terminal(s: &str) -> String {
-    sanitize_with_policy(s, /* preserve_newlines = */ true)
+/// - `Multiline` is for help text and rule messages, where the
+///   author legitimately uses `\n` for layout. Tabs and CR are
+///   still escaped (a `\t`-heavy message would desync the compact
+///   format's column layout; a CR would let a hostile message
+///   repaint the prefix the renderer just printed).
+/// - `SingleLine` is for paths, error-chain strings, and anything
+///   else the renderer prints on a single line. Embedded `\n`
+///   would inject fake diagnostic lines into stderr (a POSIX
+///   filename can contain newlines, and the default and compact
+///   formats both interpolate the path unescaped).
+///
+/// Out of scope on either policy: dangerous Unicode codepoints
+/// (bidi-override U+202E, zero-width joiner, line/paragraph
+/// separators U+2028/U+2029). Rule messages legitimately contain
+/// em-dashes and smart quotes, so a blanket non-ASCII escape would
+/// mangle them. JSON output is already safe — `serde_json`
+/// escapes 0x00–0x1F by default — so this sanitizer is for the
+/// human-facing renderers only.
+#[derive(Debug, Clone, Copy)]
+enum SanitizePolicy {
+    Multiline,
+    SingleLine,
 }
 
-/// Sanitize a value that must render on a single line — paths and
-/// error chain strings. Unlike rule messages and help text, these
-/// have no legitimate use for embedded newlines or carriage returns,
-/// so we escape them too. Without this, a POSIX filename containing
-/// a literal `\n` would inject fake diagnostic lines into stderr
-/// (the default `path:line:` line, the compact `path:line: SEV:`
-/// prefix, and the top-level `error: <e>` sink all interpolate
-/// untrusted path data).
-fn sanitize_single_line(s: &str) -> String {
-    sanitize_with_policy(s, /* preserve_newlines = */ false)
-}
-
-fn sanitize_with_policy(s: &str, preserve_newlines: bool) -> String {
+fn sanitize_text(s: &str, policy: SanitizePolicy) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
-        if ch == '\n' && preserve_newlines {
+        if ch == '\n' && matches!(policy, SanitizePolicy::Multiline) {
             out.push(ch);
         } else if (ch as u32) < 0x20 || ch == '\x7f' {
             out.push_str(&format!("\\x{:02x}", ch as u32));
@@ -503,11 +501,11 @@ fn sanitize_with_policy(s: &str, preserve_newlines: bool) -> String {
     out
 }
 
-/// Render a path for terminal display, escaping control characters
-/// in case the filename itself is hostile (Unix allows ESC, BEL, CR,
-/// and even `\n` in filenames).
+/// Render a path for terminal display, escaping control
+/// characters in case the filename itself is hostile (Unix
+/// allows ESC, BEL, CR, and even `\n` in filenames).
 fn sanitize_path(path: &std::path::Path) -> String {
-    sanitize_single_line(&path.display().to_string())
+    sanitize_text(&path.display().to_string(), SanitizePolicy::SingleLine)
 }
 
 fn output_default(diagnostics: &[Diagnostic]) {
@@ -532,7 +530,7 @@ fn output_default(diagnostics: &[Diagnostic]) {
         println!(
             "{}: {} [{} {}]",
             severity_str,
-            sanitize_single_line(&diag.message),
+            sanitize_text(&diag.message, SanitizePolicy::SingleLine),
             diag.rule_id.cyan(),
             diag.rule_name.cyan(),
         );
@@ -544,7 +542,11 @@ fn output_default(diagnostics: &[Diagnostic]) {
         );
 
         if let Some(ref help) = diag.help {
-            println!("  {} {}", "help:".green(), sanitize_for_terminal(help));
+            println!(
+                "  {} {}",
+                "help:".green(),
+                sanitize_text(help, SanitizePolicy::Multiline)
+            );
         }
 
         println!();
@@ -674,21 +676,24 @@ fn output_compact(diagnostics: &[Diagnostic]) {
             severity_char,
             diag.rule_id,
             diag.rule_name,
-            sanitize_single_line(&diag.message),
+            sanitize_text(&diag.message, SanitizePolicy::SingleLine),
         );
         if let Some(help) = &diag.help {
-            println!("  help: {}", sanitize_for_terminal(help));
+            println!("  help: {}", sanitize_text(help, SanitizePolicy::Multiline));
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_for_terminal, sanitize_single_line};
+    use super::{sanitize_text, SanitizePolicy};
 
     #[test]
     fn sanitize_passes_through_printable_ascii() {
-        assert_eq!(sanitize_for_terminal("hello world"), "hello world");
+        assert_eq!(
+            sanitize_text("hello world", SanitizePolicy::Multiline),
+            "hello world"
+        );
     }
 
     #[test]
@@ -697,14 +702,20 @@ mod tests {
         // through. Tabs would desync the compact format's
         // `path:line:severity:[rule] message` column layout, so they
         // are escaped.
-        assert_eq!(sanitize_for_terminal("a\nb\tc"), "a\nb\\x09c");
+        assert_eq!(
+            sanitize_text("a\nb\tc", SanitizePolicy::Multiline),
+            "a\nb\\x09c"
+        );
     }
 
     #[test]
     fn sanitize_escapes_backspace() {
         // \x08 can erase preceding chars on most terminals, hiding
         // arbitrary content from a diagnostic.
-        assert_eq!(sanitize_for_terminal("foo\x08\x08bar"), "foo\\x08\\x08bar");
+        assert_eq!(
+            sanitize_text("foo\x08\x08bar", SanitizePolicy::Multiline),
+            "foo\\x08\\x08bar"
+        );
     }
 
     #[test]
@@ -713,7 +724,7 @@ mod tests {
         // would otherwise repaint the terminal when R005 renders
         // "RemoveField 'evil...RED...'".
         let attack = "evil\x1b[31mRED\x1b[0m";
-        let out = sanitize_for_terminal(attack);
+        let out = sanitize_text(attack, SanitizePolicy::Multiline);
         assert_eq!(out, "evil\\x1b[31mRED\\x1b[0m");
     }
 
@@ -721,13 +732,22 @@ mod tests {
     fn sanitize_escapes_carriage_return_and_bel() {
         // \r alone is a common trick to overwrite the current line;
         // \x07 rings the terminal bell.
-        assert_eq!(sanitize_for_terminal("\rfoo"), "\\x0dfoo");
-        assert_eq!(sanitize_for_terminal("bar\x07"), "bar\\x07");
+        assert_eq!(
+            sanitize_text("\rfoo", SanitizePolicy::Multiline),
+            "\\x0dfoo"
+        );
+        assert_eq!(
+            sanitize_text("bar\x07", SanitizePolicy::Multiline),
+            "bar\\x07"
+        );
     }
 
     #[test]
     fn sanitize_escapes_del() {
-        assert_eq!(sanitize_for_terminal("a\x7fb"), "a\\x7fb");
+        assert_eq!(
+            sanitize_text("a\x7fb", SanitizePolicy::Multiline),
+            "a\\x7fb"
+        );
     }
 
     #[test]
@@ -735,7 +755,10 @@ mod tests {
         // Non-ASCII printable codepoints are not terminal control
         // sequences and should not be escaped — the rule messages
         // already use em-dashes and smart quotes.
-        assert_eq!(sanitize_for_terminal("café — naïve"), "café — naïve");
+        assert_eq!(
+            sanitize_text("café — naïve", SanitizePolicy::Multiline),
+            "café — naïve"
+        );
     }
 
     #[test]
@@ -746,16 +769,16 @@ mod tests {
         // diagnostic lines into stderr (the `path:line:` prefix in
         // every output format interpolates untrusted path data).
         assert_eq!(
-            sanitize_single_line("foo\n  --> /etc/passwd:1\nbar"),
+            sanitize_text("foo\n  --> /etc/passwd:1\nbar", SanitizePolicy::SingleLine),
             "foo\\x0a  --> /etc/passwd:1\\x0abar",
         );
-        assert_eq!(sanitize_single_line("a\rb"), "a\\x0db");
+        assert_eq!(sanitize_text("a\rb", SanitizePolicy::SingleLine), "a\\x0db");
     }
 
     #[test]
     fn sanitize_single_line_keeps_normal_text() {
         assert_eq!(
-            sanitize_single_line("/repo/app/migrations/0001.py"),
+            sanitize_text("/repo/app/migrations/0001.py", SanitizePolicy::SingleLine),
             "/repo/app/migrations/0001.py",
         );
     }
