@@ -50,6 +50,9 @@ use crate::config::Config;
 use crate::diagnostics::{Diagnostic, Severity};
 
 /// Context passed to rules during linting.
+///
+/// `#[non_exhaustive]`: build via [`RuleContext::new`] so a
+/// future field addition doesn't break out-of-tree rule authors.
 #[non_exhaustive]
 pub struct RuleContext<'a> {
     /// The configuration.
@@ -58,31 +61,76 @@ pub struct RuleContext<'a> {
     pub path: &'a Path,
 }
 
-/// Walk a migration's database-effective operations in source
-/// order, threading a `created` set through each callback. A
-/// top-level `CreateModel` op inserts its name into the set
-/// *before* `handle` is called, so the current op sees its own
-/// model in `created` only if the op is itself a `CreateModel`.
+impl<'a> RuleContext<'a> {
+    /// Build a context for invoking a rule. Out-of-tree
+    /// consumers building custom rules call this in their tests.
+    pub fn new(config: &'a Config, path: &'a Path) -> Self {
+        Self { config, path }
+    }
+}
+
+/// Case-insensitive set of model names created so far during a
+/// `walk_with_created_models` traversal.
+///
+/// Django is case-insensitive on `model_name=` lookups (the ORM
+/// lowercases on both sides), so the previous hand-rolled walks
+/// did `created_so_far.contains(&data.model_name.to_lowercase())`
+/// at six call sites. Centralising that into a method here means
+/// (a) a future case-handling change is one edit, and (b) callers
+/// can't accidentally compare a non-lowercased name and silently
+/// miss an exemption.
+pub struct CreatedModels {
+    names: HashSet<String>,
+}
+
+impl CreatedModels {
+    fn new() -> Self {
+        Self {
+            names: HashSet::new(),
+        }
+    }
+
+    fn insert(&mut self, name: &str) {
+        self.names.insert(name.to_lowercase());
+    }
+
+    /// Is `name` in the set? Comparison is case-insensitive on
+    /// both sides — callers do not need to lowercase before
+    /// calling.
+    pub fn contains(&self, name: &str) -> bool {
+        self.names.contains(&name.to_lowercase())
+    }
+}
+
+/// Walk a migration's database-effective operations in source order,
+/// threading created-model state through each callback.
+///
+/// Rules that exempt an operation when its target model was
+/// created earlier in the same migration (R001, R002, R006,
+/// R010, R016, R017) use this. The closure receives the op and
+/// the set; it should call `created.contains(model_name)` to
+/// check for the exemption — no manual lowercasing needed,
+/// `CreatedModels` handles that.
 ///
 /// Operations wrapped in `SeparateDatabaseAndState(database_operations=[...])`
 /// are walked after the top-level list with an empty created set:
-/// the wrapper implies the database op targets the live schema, so
-/// a top-level state-only `CreateModel` must not exempt it.
+/// the wrapper implies the database op targets the live schema, so a
+/// top-level state-only `CreateModel` must not exempt it.
 pub(crate) fn walk_with_created_models(
     migration: &Migration,
-    mut handle: impl FnMut(&Operation, &HashSet<String>),
+    mut handle: impl FnMut(&Operation, &CreatedModels),
 ) {
-    let mut created_so_far: HashSet<String> = HashSet::new();
+    let mut created = CreatedModels::new();
     for op in &migration.operations {
         if op.op_type == OperationType::CreateModel {
             if let OperationData::Model(ModelOperation { name, .. }) = &op.data {
-                created_so_far.insert(name.to_lowercase());
+                created.insert(name);
             }
         }
-        handle(op, &created_so_far);
+        handle(op, &created);
     }
 
-    let wrapped_created = HashSet::new();
+    let wrapped_created = CreatedModels::new();
     for op in &migration.wrapped_database_ops {
         handle(op, &wrapped_created);
     }
@@ -173,6 +221,15 @@ impl RuleRegistry {
         self.rules.iter().find(|r| r.id() == id).map(|r| r.as_ref())
     }
 
+    /// Append a custom rule. Out-of-tree consumers building
+    /// custom rules call this after constructing the registry
+    /// with [`Self::new`] (which seeds the built-ins). Rules
+    /// run in registration order; suppression and
+    /// `warnings_as_errors` apply uniformly.
+    pub fn register(&mut self, rule: Box<dyn Rule>) {
+        self.rules.push(rule);
+    }
+
     /// Get enabled rules based on config.
     pub fn enabled_rules(&self, config: &Config) -> Vec<&dyn Rule> {
         self.rules
@@ -253,6 +310,11 @@ impl ChangesetRuleRegistry {
     /// Get a rule by ID.
     pub fn get(&self, id: &str) -> Option<&dyn ChangesetRule> {
         self.rules.iter().find(|r| r.id() == id).map(|r| r.as_ref())
+    }
+
+    /// Append a custom changeset rule. See [`RuleRegistry::register`].
+    pub fn register(&mut self, rule: Box<dyn ChangesetRule>) {
+        self.rules.push(rule);
     }
 
     /// Run all changeset rules.
@@ -554,16 +616,17 @@ class Migration(migrations.Migration):
                 (OperationType::AddIndex, false),
                 (OperationType::CreateModel, true),
             ],
-            "AddIndex above its CreateModel must NOT see the model in created_so_far",
+            "AddIndex above its CreateModel must NOT see the model in created",
         );
     }
 
     #[test]
-    fn walk_with_created_models_case_insensitive() {
-        // Django is case-insensitive on `model_name=` lookups, so
-        // the helper stores names lowercased. Every caller
-        // lowercases on the way in too. Pin the contract so a
-        // helper-internal change can't silently break callers.
+    fn walk_with_created_models_case_insensitive_both_sides() {
+        // The CreatedModels newtype lowercases on insert AND on
+        // lookup, so a caller passing the original title-cased
+        // name finds the model. Before the newtype existed,
+        // callers had to remember to lowercase on lookup too;
+        // forgetting silently missed exemptions. Pin both halves.
         let source = r#"
 from django.db import migrations, models
 
@@ -580,15 +643,44 @@ class Migration(migrations.Migration):
         let migration = extract(source);
         let mut saw_lowercase = false;
         let mut saw_titlecase = false;
+        let mut saw_uppercase = false;
         walk_with_created_models(&migration, |_, created| {
-            if created.contains("product") {
-                saw_lowercase = true;
-            }
-            if created.contains("Product") {
-                saw_titlecase = true;
-            }
+            saw_lowercase |= created.contains("product");
+            saw_titlecase |= created.contains("Product");
+            saw_uppercase |= created.contains("PRODUCT");
         });
-        assert!(saw_lowercase, "names stored lowercased");
-        assert!(!saw_titlecase, "case-folded — titlecase lookup should miss");
+        assert!(saw_lowercase && saw_titlecase && saw_uppercase);
+    }
+
+    #[test]
+    fn walk_with_created_models_non_createmodel_does_not_insert() {
+        // The set must be populated *only* by CreateModel ops.
+        // A future helper tweak that also recorded e.g.
+        // AddField target models would silently expand exemptions
+        // for every caller and break their semantics. Pin the
+        // invariant.
+        let source = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddField(
+            model_name='order',
+            name='customer',
+            field=models.ForeignKey(on_delete=models.CASCADE, to='app.customer'),
+        ),
+    ]
+"#;
+        let migration = extract(source);
+        let mut saw_order = false;
+        walk_with_created_models(&migration, |_, created| {
+            saw_order |= created.contains("order");
+        });
+        assert!(
+            !saw_order,
+            "non-CreateModel ops must not populate `created`",
+        );
     }
 }

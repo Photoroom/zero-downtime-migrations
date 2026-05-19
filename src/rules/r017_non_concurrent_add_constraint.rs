@@ -45,14 +45,14 @@ impl Rule for R017NonConcurrentAddConstraint {
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
-        walk_with_created_models(migration, |op, created_so_far| {
+        walk_with_created_models(migration, |op, created| {
             if op.op_type != OperationType::AddConstraint {
                 return;
             }
             let OperationData::Constraint(data) = &op.data else {
                 return;
             };
-            if created_so_far.contains(&data.model_name.to_lowercase()) {
+            if created.contains(&data.model_name) {
                 return;
             }
 

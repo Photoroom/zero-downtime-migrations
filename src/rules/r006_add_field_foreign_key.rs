@@ -66,7 +66,7 @@ impl Rule for R006AddFieldForeignKey {
             std::collections::HashSet<String>,
         > = std::collections::HashMap::new();
 
-        walk_with_created_models(migration, |op, created_so_far| {
+        walk_with_created_models(migration, |op, created| {
             // First: record any concurrent-index op we see, so
             // subsequent AddFields can consult `leading_columns`.
             if op.op_type == OperationType::AddIndexConcurrently {
@@ -92,7 +92,7 @@ impl Rule for R006AddFieldForeignKey {
                 return;
             }
 
-            if created_so_far.contains(&data.model_name.to_lowercase()) {
+            if created.contains(&data.model_name) {
                 return;
             }
             // Django uses lowercase column names; we also accept

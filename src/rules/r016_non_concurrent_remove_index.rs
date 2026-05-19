@@ -33,12 +33,12 @@ impl Rule for R016NonConcurrentRemoveIndex {
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
-        walk_with_created_models(migration, |op, created_so_far| {
+        walk_with_created_models(migration, |op, created| {
             if op.op_type != OperationType::RemoveIndex {
                 return;
             }
             if let OperationData::Index(idx) = &op.data {
-                if created_so_far.contains(&idx.model_name.to_lowercase()) {
+                if created.contains(&idx.model_name) {
                     return;
                 }
             }

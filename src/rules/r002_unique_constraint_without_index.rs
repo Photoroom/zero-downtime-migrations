@@ -37,7 +37,7 @@ impl Rule for R002UniqueConstraintWithoutIndex {
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
-        walk_with_created_models(migration, |op, created_so_far| {
+        walk_with_created_models(migration, |op, created| {
             if op.op_type != OperationType::AddConstraint {
                 return;
             }
@@ -47,7 +47,7 @@ impl Rule for R002UniqueConstraintWithoutIndex {
             if data.constraint_type != ConstraintType::Unique {
                 return;
             }
-            if created_so_far.contains(&data.model_name.to_lowercase()) {
+            if created.contains(&data.model_name) {
                 return;
             }
 
