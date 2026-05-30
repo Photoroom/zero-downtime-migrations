@@ -1289,7 +1289,9 @@ class Migration(migrations.Migration):
         let max_file_size = std::hint::black_box(MAX_FILE_SIZE);
         assert!(max_file_size > 0);
         assert_eq!(
-            migration.operations_of_type(OperationType::RunSQL).count(),
+            migration
+                .top_level_operations_of_type(OperationType::RunSQL)
+                .count(),
             1,
         );
         assert_eq!(

@@ -3,7 +3,10 @@
 //! Detects RunSQL operations that contain CREATE INDEX without CONCURRENTLY.
 //! This pattern bypasses Django's concurrent operations and can cause table locks.
 
-use crate::ast::{strip_sql_noise, Migration, OperationData, OperationType};
+use crate::ast::{
+    any_sql_statement, sql_statement_contains_concurrently, sql_statement_contains_create_index,
+    Migration, OperationData, OperationType,
+};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::rules::{Rule, RuleContext};
 
@@ -33,22 +36,13 @@ impl Rule for R003RunSQLCreateIndex {
 
         for op in migration.database_effective_operations_of_type(OperationType::RunSQL) {
             if let OperationData::RunSQL(data) = &op.data {
-                // Strip comments and string literals before splitting,
-                // so an `INSERT INTO log VALUES ('CREATE INDEX ...; ...')`
-                // doesn't get diced into spurious statements.
-                let cleaned = strip_sql_noise(&data.sql).to_uppercase();
-
-                // Walk statement-by-statement instead of a single
-                // whole-string `contains CREATE INDEX && !contains
-                // CONCURRENTLY`. A RunSQL like
-                //   CREATE INDEX a ON t (c); CREATE INDEX CONCURRENTLY b ON t (c);
-                // contains BOTH `CREATE INDEX` and `CONCURRENTLY`, so the
-                // whole-string check would silently exempt the
-                // non-concurrent first statement.
-                let fires = cleaned.split(';').any(|stmt| {
-                    let s = stmt.trim();
-                    (s.contains("CREATE INDEX") || s.contains("CREATE UNIQUE INDEX"))
-                        && !s.contains("CONCURRENTLY")
+                // Check each statement independently: a non-concurrent
+                // CREATE INDEX sharing a RunSQL with a concurrent one must
+                // still fire (a whole-string check would see CONCURRENTLY
+                // elsewhere and wrongly exempt it).
+                let fires = any_sql_statement(&data.sql, |stmt| {
+                    sql_statement_contains_create_index(stmt)
+                        && !sql_statement_contains_concurrently(stmt)
                 });
                 if fires {
                     diagnostics.push(Diagnostic {

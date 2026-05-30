@@ -14,6 +14,22 @@ pub struct Operation {
     pub data: OperationData,
 }
 
+impl Operation {
+    /// The target model this operation acts on, when it has a single one
+    /// (index, field, and constraint operations). Returns `None` for
+    /// operations without a target model — `CreateModel`, `RunSQL`,
+    /// `RunPython`, and `SeparateDatabaseAndState`. Used by the
+    /// created-in-this-migration exemption shared across several rules.
+    pub fn model_name(&self) -> Option<&str> {
+        match &self.data {
+            OperationData::Index(op) => Some(&op.model_name),
+            OperationData::Field(op) => Some(&op.model_name),
+            OperationData::Constraint(op) => Some(&op.model_name),
+            _ => None,
+        }
+    }
+}
+
 /// The type of a Django migration operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -134,26 +150,6 @@ pub enum OperationData {
 pub struct IndexOperation {
     /// The model name (lowercase).
     pub model_name: String,
-    /// The index name, if specified. Populated for both Add and Remove
-    /// forms: for `AddIndex`/`AddIndexConcurrently` it's the `name`
-    /// kwarg inside `models.Index(...)`, for `RemoveIndex` it's the
-    /// top-level `name=` kwarg.
-    pub index_name: Option<String>,
-    /// Index column names, as written. Only populated for Add forms,
-    /// where the inner `models.Index(fields=[...])` lists them. Empty
-    /// for Remove forms (the rule has no column info — only the index
-    /// name) and for indexes whose `fields=...` value isn't a literal
-    /// list (e.g. an identifier referencing a module-level constant).
-    /// Order matches the source order, which is the index's column
-    /// order in Postgres.
-    ///
-    /// Casing: preserved verbatim from the source. Django writes
-    /// column names lowercase by default, so callers should compare
-    /// case-insensitively for the common path. Case-sensitive matching
-    /// is only correct when the caller knows the column came from a
-    /// `db_column='MixedCase'` (a quoted Postgres identifier) — that
-    /// information isn't carried in this struct.
-    pub columns: Vec<String>,
 }
 
 /// Data for model operations (CreateModel, DeleteModel, etc.).
@@ -186,8 +182,8 @@ pub struct FieldOperation {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct FieldInfo {
-    /// The field type (e.g., "CharField", "ForeignKey").
-    pub field_type: String,
+    /// Whether the field is a `ForeignKey` or `OneToOneField`.
+    pub is_relation: bool,
     /// Whether the field is nullable.
     pub is_nullable: bool,
     /// Whether the field has a default value.
@@ -202,8 +198,6 @@ pub struct ConstraintOperation {
     pub model_name: String,
     /// The constraint type.
     pub constraint_type: ConstraintType,
-    /// The constraint name.
-    pub constraint_name: Option<String>,
 }
 
 /// Type of database constraint added via `migrations.AddConstraint`.
@@ -236,17 +230,73 @@ impl RunSQLOperation {
     /// literals are stripped before the substring search so SQL like
     /// `"-- about CREATE INDEX"` or `"'CREATE INDEX'"` does not match.
     pub fn contains_create_index(&self) -> bool {
-        let stripped = strip_sql_noise(&self.sql).to_uppercase();
-        stripped.contains("CREATE INDEX") || stripped.contains("CREATE UNIQUE INDEX")
+        strip_sql_noise(&self.sql)
+            .split(';')
+            .any(sql_statement_contains_create_index)
     }
 
     /// Check if the SQL contains a `DROP INDEX` statement, ignoring
     /// comments and string literals.
     pub fn contains_drop_index(&self) -> bool {
         strip_sql_noise(&self.sql)
-            .to_uppercase()
-            .contains("DROP INDEX")
+            .split(';')
+            .any(sql_statement_contains_drop_index)
     }
+}
+
+pub(crate) fn sql_statement_contains_create_index(statement: &str) -> bool {
+    let tokens = sql_tokens(statement);
+    tokens.first().is_some_and(|t| t == "CREATE")
+        && (tokens.get(1).is_some_and(|t| t == "INDEX")
+            || (tokens.get(1).is_some_and(|t| t == "UNIQUE")
+                && tokens.get(2).is_some_and(|t| t == "INDEX")))
+        || tokens
+            .first()
+            .is_some_and(|t| compact_sql_token_starts_with(t, &["CREATE", "INDEX"]))
+        || tokens
+            .first()
+            .is_some_and(|t| compact_sql_token_starts_with(t, &["CREATE", "UNIQUE", "INDEX"]))
+}
+
+pub(crate) fn sql_statement_contains_drop_index(statement: &str) -> bool {
+    let tokens = sql_tokens(statement);
+    tokens.first().is_some_and(|t| t == "DROP") && tokens.get(1).is_some_and(|t| t == "INDEX")
+        || tokens
+            .first()
+            .is_some_and(|t| compact_sql_token_starts_with(t, &["DROP", "INDEX"]))
+}
+
+pub(crate) fn sql_statement_contains_reindex(statement: &str) -> bool {
+    sql_tokens(statement)
+        .first()
+        .is_some_and(|t| t == "REINDEX")
+}
+
+pub(crate) fn sql_statement_contains_concurrently(statement: &str) -> bool {
+    sql_tokens(statement).iter().any(|t| t == "CONCURRENTLY")
+}
+
+fn compact_sql_token_starts_with(token: &str, keywords: &[&str]) -> bool {
+    if keywords.is_empty() {
+        return false;
+    }
+    let expected = keywords.join("");
+    token.starts_with(&expected)
+}
+
+fn sql_tokens(statement: &str) -> Vec<String> {
+    // Split on any non-identifier byte. Python escapes (`\n`, `\x20`, …) are
+    // already resolved before SQL ever reaches here: the extractor decodes
+    // them in non-raw strings (so `'CREATE\nINDEX'` arrives as real
+    // whitespace and splits cleanly) and preserves the backslash in raw
+    // strings (so `r'CREATE\nINDEX'` keeps the `\`, which is itself a
+    // separator and breaks the keyword run). Neither path can produce a bare
+    // `CREATEnINDEX`, so no escape-healing heuristic is needed.
+    statement
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect()
 }
 
 /// Remove SQL line comments (`-- ...` to end of line), block comments
@@ -256,8 +306,13 @@ impl RunSQLOperation {
 ///
 /// Known gaps (rare in Django migrations, accepted for simplicity):
 /// - PostgreSQL dollar-quoted strings (`$tag$ ... $tag$`) pass through
-///   unchanged — false-*positive* bias if they contain CREATE/DROP
-///   INDEX as plain text.
+///   unchanged. Combined with statement-anchored matching (which keys off a
+///   statement's *leading* tokens), an index built inside a wrapper —
+///   `DO $$ ... CREATE INDEX ... $$` or a `CREATE FUNCTION` body — is
+///   *missed*: the enclosing statement starts with `DO` / `CREATE FUNCTION`,
+///   not `CREATE INDEX`. This is a false-*negative*. See
+///   `create_index_inside_do_block_is_a_known_gap`. A `$$`-aware pass in this
+///   function would close it if such migrations ever appear in practice.
 /// - An unterminated single-quoted string is consumed to end-of-input —
 ///   false-*negative* bias for whatever followed, but real SQL with
 ///   unterminated quotes won't execute anyway.
@@ -310,6 +365,14 @@ pub(crate) fn strip_sql_noise(sql: &str) -> String {
         }
     }
     out
+}
+
+/// Strip SQL comments and string literals (via [`strip_sql_noise`]), split the
+/// result into individual statements on `;`, and return whether any statement
+/// satisfies `predicate`. Splitting per-statement matters: a RunSQL mixing a
+/// non-concurrent and a concurrent index would otherwise be judged as a whole.
+pub(crate) fn any_sql_statement(sql: &str, predicate: impl Fn(&str) -> bool) -> bool {
+    strip_sql_noise(sql).split(';').any(predicate)
 }
 
 #[cfg(test)]
@@ -371,6 +434,17 @@ mod tests {
         assert!(
             !op("INSERT INTO t (s) VALUES ('isn''t CREATE INDEX okay');").contains_create_index()
         );
+    }
+
+    #[test]
+    fn create_index_inside_do_block_is_a_known_gap() {
+        // Documents an accepted false-negative: `strip_sql_noise` does not
+        // strip dollar-quoted bodies, and matching is anchored to a
+        // statement's leading tokens, so an index created inside a `DO $$
+        // ... $$` block (or a CREATE FUNCTION body) is not flagged — the
+        // statement begins with `DO`, not `CREATE INDEX`. Pinned so a future
+        // `$$`-aware pass that closes the gap updates this on purpose.
+        assert!(!op("DO $$ BEGIN CREATE INDEX idx ON t (c); END $$;").contains_create_index());
     }
 
     #[test]

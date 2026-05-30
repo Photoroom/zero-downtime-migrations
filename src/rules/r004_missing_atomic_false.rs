@@ -3,7 +3,11 @@
 //! Concurrent index operations (AddIndexConcurrently, RemoveIndexConcurrently)
 //! cannot run inside a transaction. The migration must have `atomic = False`.
 
-use crate::ast::{strip_sql_noise, Migration, Operation, OperationData};
+use crate::ast::{
+    any_sql_statement, sql_statement_contains_concurrently, sql_statement_contains_create_index,
+    sql_statement_contains_drop_index, sql_statement_contains_reindex, Migration, Operation,
+    OperationData,
+};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::rules::{Rule, RuleContext};
 
@@ -43,9 +47,7 @@ impl Rule for R004MissingAtomicFalse {
         //      RunSQL silently fails on every deploy — the rule
         //      should catch it at lint time.
         let has_concurrent = migration
-            .operations
-            .iter()
-            .chain(&migration.wrapped_database_ops)
+            .database_effective_operations()
             .any(operation_requires_non_atomic);
 
         if has_concurrent && !migration.is_non_atomic {
@@ -78,14 +80,11 @@ fn operation_requires_non_atomic(op: &Operation) -> bool {
         return true;
     }
     if let OperationData::RunSQL(data) = &op.data {
-        let cleaned = strip_sql_noise(&data.sql).to_uppercase();
-        return cleaned.split(';').any(|stmt| {
-            let s = stmt.trim();
-            s.contains("CONCURRENTLY")
-                && (s.contains("CREATE INDEX")
-                    || s.contains("CREATE UNIQUE INDEX")
-                    || s.contains("DROP INDEX")
-                    || s.contains("REINDEX"))
+        return any_sql_statement(&data.sql, |stmt| {
+            sql_statement_contains_concurrently(stmt)
+                && (sql_statement_contains_create_index(stmt)
+                    || sql_statement_contains_drop_index(stmt)
+                    || sql_statement_contains_reindex(stmt))
         });
     }
     false

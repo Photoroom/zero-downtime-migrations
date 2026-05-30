@@ -215,16 +215,21 @@ impl ParsedMigration {
     pub(crate) fn get_imports(&self) -> Vec<Node<'_>> {
         let root = self.root_node();
         let mut imports = Vec::new();
-
-        for child in root.children(&mut root.walk()) {
-            if child.kind() == "import_statement" || child.kind() == "import_from_statement" {
-                imports.push(child);
-            }
-        }
-
+        collect_imports(root, &mut imports);
         imports
     }
+}
 
+fn collect_imports<'tree>(node: Node<'tree>, imports: &mut Vec<Node<'tree>>) {
+    if node.kind() == "import_statement" || node.kind() == "import_from_statement" {
+        imports.push(node);
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_imports(child, imports);
+    }
+}
+
+impl ParsedMigration {
     /// Get the text of a node.
     pub(crate) fn node_text(&self, node: Node<'_>) -> &str {
         node.utf8_text(self.source_bytes()).unwrap_or("")
