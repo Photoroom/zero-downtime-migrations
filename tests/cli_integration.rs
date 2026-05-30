@@ -315,6 +315,61 @@ mod diff_mode {
             .stdout(predicate::str::contains("0001_initial.py").not());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn diff_staged_rejects_staged_symlink_typechange() {
+        let temp = setup_git_repo();
+        let migration_path = temp
+            .path()
+            .join("app")
+            .join("migrations")
+            .join("0001_initial.py");
+        fs::write(&migration_path, CLEAN_MIGRATION).unwrap();
+        git_commit_all(temp.path(), "Add regular migration");
+        set_base_to_head(temp.path());
+
+        fs::remove_file(&migration_path).unwrap();
+        std::os::unix::fs::symlink("../models.py", &migration_path).unwrap();
+        git_stage(temp.path(), "app/migrations/0001_initial.py");
+
+        zdm()
+            .current_dir(temp.path())
+            .arg("--diff-staged")
+            .arg("origin/main")
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "Refusing to read non-regular staged file",
+            ));
+    }
+
+    #[test]
+    fn diff_staged_scope_accepts_index_only_file() {
+        let temp = setup_git_repo();
+        let migration_path = temp
+            .path()
+            .join("app")
+            .join("migrations")
+            .join("0001_bad.py");
+        fs::write(&migration_path, BAD_MIGRATION_NON_CONCURRENT_INDEX).unwrap();
+        git_stage(temp.path(), "app/migrations/0001_bad.py");
+        fs::remove_file(&migration_path).unwrap();
+
+        zdm()
+            .current_dir(temp.path())
+            .arg("app/migrations/0001_bad.py")
+            .arg("--diff-staged")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R001")
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("R001"))
+            .stderr(predicate::str::contains("Invalid path").not());
+    }
+
     #[test]
     fn diff_staged_respects_exclude_patterns() {
         let temp = setup_git_repo();
@@ -394,6 +449,67 @@ mod diff_mode {
     }
 
     #[test]
+    fn diff_staged_exclude_accepts_repo_relative_pattern() {
+        let temp = setup_git_repo();
+
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"exclude = ["app/test_migrations/**"]"#,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Add config");
+        set_base_to_head(temp.path());
+
+        let excluded_dir = temp
+            .path()
+            .join("app")
+            .join("test_migrations")
+            .join("migrations");
+        fs::create_dir_all(&excluded_dir).unwrap();
+        fs::write(excluded_dir.join("__init__.py"), "").unwrap();
+        fs::write(
+            excluded_dir.join("0001_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        git_stage(temp.path(), "app/test_migrations");
+        fs::write(
+            temp.path().join("app/migrations/0002_control_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        git_stage(temp.path(), "app/migrations/0002_control_bad.py");
+
+        let output = zdm()
+            .current_dir(temp.path())
+            .arg("--diff-staged")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R001")
+            .arg("--output-format")
+            .arg("json")
+            .assert()
+            .failure()
+            .code(1)
+            .get_output()
+            .stdout
+            .clone();
+        let json = parse_json_output(&output);
+        let diags = diagnostics(&json);
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected only control diagnostic: {diags:#?}"
+        );
+        let path = diags[0]["path"].as_str().unwrap();
+        assert!(path.ends_with("0002_control_bad.py"), "got path: {path}");
+        assert!(
+            !path.contains("test_migrations"),
+            "excluded file leaked: {path}"
+        );
+    }
+
+    #[test]
     fn diff_mode_respects_positional_path_scope() {
         let temp = setup_git_repo();
 
@@ -423,6 +539,71 @@ mod diff_mode {
             .arg("R001")
             .arg("--output-format")
             .arg("compact")
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("0001_scoped_bad.py"))
+            .stdout(predicate::str::contains("0001_outside_bad.py").not());
+    }
+
+    #[test]
+    fn diff_mode_defaults_dot_scope_to_current_directory() {
+        let temp = setup_git_repo();
+
+        fs::write(
+            temp.path().join("app/migrations/0001_scoped_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        let other_dir = temp.path().join("other_app").join("migrations");
+        fs::create_dir_all(&other_dir).unwrap();
+        fs::write(other_dir.join("__init__.py"), "").unwrap();
+        fs::write(
+            other_dir.join("0001_outside_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Add scoped and outside migrations");
+
+        zdm()
+            .current_dir(temp.path().join("app"))
+            .arg("--diff")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R001")
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("0001_scoped_bad.py"))
+            .stdout(predicate::str::contains("0001_outside_bad.py").not());
+    }
+
+    #[test]
+    fn diff_staged_defaults_dot_scope_to_current_directory() {
+        let temp = setup_git_repo();
+
+        fs::write(
+            temp.path().join("app/migrations/0001_scoped_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        let other_dir = temp.path().join("other_app").join("migrations");
+        fs::create_dir_all(&other_dir).unwrap();
+        fs::write(other_dir.join("__init__.py"), "").unwrap();
+        fs::write(
+            other_dir.join("0001_outside_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        git_stage(temp.path(), "app/migrations/0001_scoped_bad.py");
+        git_stage(temp.path(), "other_app");
+
+        zdm()
+            .current_dir(temp.path().join("app"))
+            .arg("--diff-staged")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R001")
             .assert()
             .failure()
             .code(1)
@@ -504,6 +685,52 @@ mod diff_mode {
     }
 
     #[test]
+    fn diff_mode_ignores_migrations_changed_only_on_diverged_base() {
+        let temp = setup_git_repo();
+        fs::write(
+            temp.path().join("app/migrations/0001_existing.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Add existing unsafe migration");
+        set_base_to_head(temp.path());
+
+        StdCommand::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(temp.path())
+            .output()
+            .expect("Failed to create feature branch");
+
+        StdCommand::new("git")
+            .args(["checkout", "origin/main"])
+            .current_dir(temp.path())
+            .output()
+            .expect("Failed to checkout base branch");
+        fs::write(
+            temp.path().join("app/migrations/0001_existing.py"),
+            CLEAN_MIGRATION,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Fix unsafe migration on base");
+
+        StdCommand::new("git")
+            .args(["checkout", "feature"])
+            .current_dir(temp.path())
+            .output()
+            .expect("Failed to checkout feature branch");
+
+        zdm()
+            .current_dir(temp.path())
+            .arg("--diff")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R001")
+            .assert()
+            .success()
+            .stdout(predicate::str::is_empty());
+    }
+
+    #[test]
     fn diff_mode_scopes_non_migration_files_for_r008() {
         let temp = setup_git_repo();
         fs::write(
@@ -540,6 +767,132 @@ mod diff_mode {
             .stdout(predicate::str::contains("R008"))
             .stdout(predicate::str::contains("app/views.py"))
             .stdout(predicate::str::contains("other_app/views.py").not());
+    }
+
+    #[test]
+    fn diff_mode_runs_r008_when_migration_is_deleted() {
+        let temp = setup_git_repo();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"allowed-file-patterns = []"#,
+        )
+        .unwrap();
+        fs::write(temp.path().join("app/migrations/0001.py"), CLEAN_MIGRATION).unwrap();
+        git_commit_all(temp.path(), "Add config and migration");
+        set_base_to_head(temp.path());
+
+        fs::remove_file(temp.path().join("app/migrations/0001.py")).unwrap();
+        fs::write(temp.path().join("app/models.py"), "# changed model").unwrap();
+        git_commit_all(temp.path(), "Delete migration and change model");
+
+        zdm()
+            .current_dir(temp.path())
+            .arg("--diff")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R008")
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("R008"))
+            .stdout(predicate::str::contains("app/models.py"));
+    }
+
+    #[test]
+    fn diff_mode_runs_r008_when_migration_is_renamed_out() {
+        let temp = setup_git_repo();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"allowed-file-patterns = []"#,
+        )
+        .unwrap();
+        fs::write(temp.path().join("app/migrations/0001.py"), CLEAN_MIGRATION).unwrap();
+        git_commit_all(temp.path(), "Add config and migration");
+        set_base_to_head(temp.path());
+
+        fs::rename(
+            temp.path().join("app/migrations/0001.py"),
+            temp.path().join("app/archived_0001.py"),
+        )
+        .unwrap();
+        fs::write(temp.path().join("app/models.py"), "# changed model").unwrap();
+        git_commit_all(temp.path(), "Move migration and change model");
+
+        zdm()
+            .current_dir(temp.path())
+            .arg("--diff")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R008")
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("R008"))
+            .stdout(predicate::str::contains("app/models.py"));
+    }
+
+    #[test]
+    fn diff_mode_excludes_non_migration_files_for_r008() {
+        let temp = setup_git_repo();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"exclude = ["generated/**"]
+allowed-file-patterns = []"#,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Add config");
+        set_base_to_head(temp.path());
+
+        fs::write(temp.path().join("app/migrations/0001.py"), CLEAN_MIGRATION).unwrap();
+        fs::create_dir_all(temp.path().join("generated")).unwrap();
+        fs::write(temp.path().join("generated/client.py"), "# generated").unwrap();
+        fs::write(temp.path().join("app/views.py"), "# control").unwrap();
+        git_commit_all(temp.path(), "Add migration and app files");
+
+        zdm()
+            .current_dir(temp.path())
+            .arg("--diff")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R008")
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("app/views.py"))
+            .stdout(predicate::str::contains("generated/client.py").not());
+    }
+
+    #[test]
+    fn diff_staged_excludes_non_migration_files_for_r008() {
+        let temp = setup_git_repo();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"exclude = ["generated/**"]
+allowed-file-patterns = []"#,
+        )
+        .unwrap();
+        git_commit_all(temp.path(), "Add config");
+        set_base_to_head(temp.path());
+
+        fs::write(temp.path().join("app/migrations/0001.py"), CLEAN_MIGRATION).unwrap();
+        fs::create_dir_all(temp.path().join("generated")).unwrap();
+        fs::write(temp.path().join("generated/client.py"), "# generated").unwrap();
+        fs::write(temp.path().join("app/views.py"), "# control").unwrap();
+        git_stage(temp.path(), "app/migrations/0001.py");
+        git_stage(temp.path(), "generated/client.py");
+        git_stage(temp.path(), "app/views.py");
+
+        zdm()
+            .current_dir(temp.path())
+            .arg("--diff-staged")
+            .arg("origin/main")
+            .arg("--select")
+            .arg("R008")
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("app/views.py"))
+            .stdout(predicate::str::contains("generated/client.py").not());
     }
 
     #[test]
@@ -615,7 +968,25 @@ mod output_format {
 
     #[test]
     fn json_output_contains_required_fields() {
-        let temp = setup_migrations(&[("0001_bad.py", BAD_MIGRATION_NON_CONCURRENT_INDEX)]);
+        let temp = setup_migrations(&[(
+            "0001_bad.py",
+            r#"
+from django.db import migrations, models
+
+class Migration(migrations.Migration):
+    dependencies = []
+    operations = [
+        migrations.AddIndex(
+            model_name='product',
+            index=models.Index(fields=['name'], name='product_name_idx'),
+        ),
+        migrations.RemoveIndex(
+            model_name='product',
+            name='old_idx',
+        ),
+    ]
+"#,
+        )]);
 
         let output = zdm()
             .arg(temp.path())
@@ -638,35 +1009,51 @@ mod output_format {
             !diagnostics.is_empty(),
             "expected at least one diagnostic in the JSON output"
         );
-        let diag = diagnostics[0]
-            .as_object()
-            .expect("each diagnostic must be a JSON object");
-        // The full documented per-diagnostic shape: a rename or
-        // accidental drop of any of these would otherwise slip
-        // through the substring grep that preceded this commit.
-        for field in [
-            "rule_id",
-            "rule_name",
-            "message",
-            "path",
-            "severity",
-            "line",
-            "column",
-            "help",
-        ] {
+        assert_eq!(
+            diagnostics.len(),
+            2,
+            "fixture should produce two diagnostics so schema checks cover every row"
+        );
+        for diagnostic in diagnostics {
+            let diag = diagnostic
+                .as_object()
+                .expect("each diagnostic must be a JSON object");
+            // The full documented per-diagnostic shape: a rename or
+            // accidental drop of any of these would otherwise slip
+            // through the substring grep that preceded this commit.
+            for field in [
+                "rule_id",
+                "rule_name",
+                "message",
+                "path",
+                "severity",
+                "line",
+                "column",
+                "help",
+            ] {
+                assert!(
+                    diag.contains_key(field),
+                    "diagnostic is missing required field `{field}`, got: {diag:?}",
+                );
+            }
             assert!(
-                diag.contains_key(field),
-                "diagnostic is missing required field `{field}`, got: {diag:?}",
+                diag["path"]
+                    .as_str()
+                    .is_some_and(|s| s.ends_with("0001_bad.py")),
+                "path should end with the fixture filename, got: {:?}",
+                diag["path"],
             );
         }
-        assert_eq!(diag["rule_id"].as_str(), Some("R001"));
-        assert_eq!(diag["severity"].as_str(), Some("error"));
+        let ids: Vec<&str> = diagnostics
+            .iter()
+            .map(|diag| diag["rule_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["R001", "R016"]);
         assert!(
-            diag["path"]
-                .as_str()
-                .is_some_and(|s| s.ends_with("0001_bad.py")),
-            "path should end with the fixture filename, got: {:?}",
-            diag["path"],
+            diagnostics
+                .iter()
+                .all(|diag| diag["severity"].as_str() == Some("error")),
+            "all fixture diagnostics should be errors, got: {diagnostics:?}",
         );
 
         // The documented JSON shape also carries a `summary` object.
@@ -927,6 +1314,55 @@ class Migration(migrations.Migration):
             .stdout(predicate::str::contains("R016"));
     }
 
+    #[test]
+    fn unknown_cli_select_rule_is_rejected() {
+        let temp = setup_migrations(&[("0001_multi.py", MIGRATION_WITH_MULTIPLE_ISSUES)]);
+
+        zdm()
+            .arg(temp.path())
+            .arg("--select")
+            .arg("R999")
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains("Unknown rule: R999"))
+            .stderr(predicate::str::contains("available rules:"))
+            .stderr(predicate::str::contains("R001"));
+    }
+
+    #[test]
+    fn unknown_cli_ignore_rule_is_rejected() {
+        let temp = setup_migrations(&[("0001_multi.py", MIGRATION_WITH_MULTIPLE_ISSUES)]);
+
+        zdm()
+            .arg(temp.path())
+            .arg("--ignore")
+            .arg("R999")
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains("Unknown rule: R999"))
+            .stderr(predicate::str::contains("available rules:"));
+    }
+
+    #[test]
+    fn unknown_config_rule_is_rejected() {
+        let temp = setup_migrations(&[("0001_multi.py", MIGRATION_WITH_MULTIPLE_ISSUES)]);
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"select = ["R999"]"#,
+        )
+        .unwrap();
+
+        zdm()
+            .current_dir(temp.path())
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains("Unknown rule: R999"))
+            .stderr(predicate::str::contains("available rules:"));
+    }
+
     const MIGRATION_WITH_IGNORE_COMMENTS: &str = r#"
 from django.db import migrations, models
 
@@ -1109,6 +1545,92 @@ mod multiple_files {
             .failure()
             .stdout(predicate::str::contains("0002_bad.py"));
     }
+
+    #[test]
+    fn normal_mode_exclude_accepts_repo_relative_pattern() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join(".git")).unwrap();
+        let migrations_dir = temp
+            .path()
+            .join("app")
+            .join("test_migrations")
+            .join("migrations");
+        fs::create_dir_all(&migrations_dir).unwrap();
+        fs::write(migrations_dir.join("__init__.py"), "").unwrap();
+        fs::write(
+            migrations_dir.join("0001_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        let control_dir = temp.path().join("app").join("migrations");
+        fs::create_dir_all(&control_dir).unwrap();
+        fs::write(
+            control_dir.join("0002_control_bad.py"),
+            BAD_MIGRATION_NON_CONCURRENT_INDEX,
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"exclude = ["app/test_migrations/**"]"#,
+        )
+        .unwrap();
+
+        let output = zdm()
+            .current_dir(temp.path())
+            .arg("--select")
+            .arg("R001")
+            .arg("--output-format")
+            .arg("json")
+            .assert()
+            .failure()
+            .code(1)
+            .get_output()
+            .stdout
+            .clone();
+        let json = parse_json_output(&output);
+        let diags = diagnostics(&json);
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected only control diagnostic: {diags:#?}"
+        );
+        let path = diags[0]["path"].as_str().unwrap();
+        assert!(path.ends_with("0002_control_bad.py"), "got path: {path}");
+        assert!(
+            !path.contains("test_migrations"),
+            "excluded file leaked: {path}"
+        );
+    }
+
+    #[test]
+    fn normal_mode_excludes_absolute_explicit_file_with_repo_relative_pattern() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join(".git")).unwrap();
+        let migrations_dir = temp
+            .path()
+            .join("app")
+            .join("test_migrations")
+            .join("migrations");
+        fs::create_dir_all(&migrations_dir).unwrap();
+        fs::write(migrations_dir.join("__init__.py"), "").unwrap();
+        let excluded_file = migrations_dir.join("0001_bad.py");
+        fs::write(&excluded_file, BAD_MIGRATION_NON_CONCURRENT_INDEX).unwrap();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"exclude = ["app/test_migrations/**"]"#,
+        )
+        .unwrap();
+
+        zdm()
+            .current_dir(temp.path())
+            .arg(&excluded_file)
+            .arg("--select")
+            .arg("R001")
+            .assert()
+            .success()
+            .code(0)
+            .stdout(predicate::str::contains("R001").not());
+    }
 }
 
 // =============================================================================
@@ -1156,10 +1678,10 @@ mod list_rules {
             .stdout(predicate::str::contains("R001"))
             .stdout(predicate::str::contains("non-concurrent-add-index"))
             .stdout(predicate::str::contains("R017"))
-            // R015 was downgraded to Warning in this PR; the listing
-            // should reflect the current severity.
+            // R015 is a Warning; the listing should reflect the current
+            // severity (lowercase label, consistent with lint output).
             .stdout(predicate::str::contains("R015"))
-            .stdout(predicate::str::contains("Warning"));
+            .stdout(predicate::str::contains("warning"));
     }
 
     #[test]
@@ -1263,7 +1785,7 @@ mod list_rules {
 
     #[test]
     fn public_compatibility_shims_remain_available() {
-        use zero_downtime_migrations::ast::{Migration, OperationType};
+        use zero_downtime_migrations::ast::{FieldInfo, Migration, OperationType};
         use zero_downtime_migrations::parser::MAX_FILE_SIZE;
 
         let migration = Migration::from_source(
@@ -1288,8 +1810,12 @@ class Migration(migrations.Migration):
 
         let max_file_size = std::hint::black_box(MAX_FILE_SIZE);
         assert!(max_file_size > 0);
+        let field_info_type_is_public = std::hint::black_box::<Option<&FieldInfo>>(None);
+        assert!(field_info_type_is_public.is_none());
         assert_eq!(
-            migration.operations_of_type(OperationType::RunSQL).count(),
+            migration
+                .top_level_operations_of_type(OperationType::RunSQL)
+                .count(),
             1,
         );
         assert_eq!(

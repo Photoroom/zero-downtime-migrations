@@ -45,6 +45,8 @@ fn fixtures_root() -> &'static Path {
 fn assert_fixture_fires(fixture: &Path, rule_id: &str, expected_count: usize) {
     let output = zdm()
         .arg(fixture)
+        .arg("--select")
+        .arg(rule_id)
         .arg("--output-format")
         .arg("json")
         .assert()
@@ -63,25 +65,46 @@ fn assert_fixture_fires(fixture: &Path, rule_id: &str, expected_count: usize) {
         .file_name()
         .and_then(|n| n.to_str())
         .expect("fixture has a basename");
-    let matching: Vec<&serde_json::Value> = diagnostics
-        .iter()
-        .filter(|d| d.get("rule_id").and_then(|v| v.as_str()) == Some(rule_id))
-        .filter(|d| {
-            d.get("path")
-                .and_then(|v| v.as_str())
-                .is_some_and(|p| p.ends_with(basename))
-        })
-        .collect();
     assert_eq!(
-        matching.len(),
+        diagnostics.len(),
         expected_count,
-        "expected {expected_count} {rule_id} diagnostic(s) on {basename}, got {} (all: {diagnostics:?})",
-        matching.len(),
+        "expected exactly {expected_count} {rule_id} diagnostic(s) on {basename}, got {diagnostics:?}",
     );
+    for diagnostic in diagnostics {
+        assert_eq!(
+            diagnostic.get("rule_id").and_then(|v| v.as_str()),
+            Some(rule_id)
+        );
+        assert!(
+            diagnostic
+                .get("path")
+                .and_then(|v| v.as_str())
+                .is_some_and(|p| p.ends_with(basename)),
+            "expected diagnostic path to end with {basename}, got {diagnostic:?}",
+        );
+    }
 }
 
 fn assert_pass_fixture_with_live_control(pass_fixture: &Path, fail_fixture: &Path, rule_id: &str) {
-    zdm().arg(pass_fixture).assert().success();
+    let output = zdm()
+        .arg(pass_fixture)
+        .arg("--output-format")
+        .arg("json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value =
+        serde_json::from_slice(&output).expect("expected valid JSON output");
+    let diagnostics = json
+        .get("diagnostics")
+        .and_then(|d| d.as_array())
+        .expect("`diagnostics` array");
+    assert!(
+        diagnostics.is_empty(),
+        "expected pass fixture to emit no diagnostics, got: {diagnostics:?}",
+    );
     assert_fixture_fires(fail_fixture, rule_id, 1);
 }
 
@@ -218,6 +241,12 @@ fn e2e_r003_fail_run_sql_create_index() {
 #[test]
 fn e2e_r006_fail_add_field_fk() {
     let fixture = fixtures_dir().join("R006/fail_add_field_fk.py");
+    assert_fixture_fires(&fixture, "R006", 1);
+}
+
+#[test]
+fn e2e_r006_fail_add_field_one_to_one() {
+    let fixture = fixtures_dir().join("R006/fail_add_field_one_to_one.py");
     assert_fixture_fires(&fixture, "R006", 1);
 }
 
@@ -702,5 +731,11 @@ fn e2e_r013_fail_irreversible_run_sql() {
 #[test]
 fn e2e_r017_fail_check_constraint() {
     let fixture = fixtures_dir().join("R017/fail_check_constraint.py");
+    assert_fixture_fires(&fixture, "R017", 1);
+}
+
+#[test]
+fn e2e_r017_fail_exclusion_constraint() {
+    let fixture = fixtures_dir().join("R017/fail_exclusion_constraint.py");
     assert_fixture_fires(&fixture, "R017", 1);
 }

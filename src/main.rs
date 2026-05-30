@@ -2,6 +2,7 @@
 //!
 //! A PostgreSQL migration safety linter for Django.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -126,6 +127,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     // as additive to the file's ignore list and `--select` as replacing it.
     let mut config = load_config()?;
     config.apply_cli_overrides(cli.select, cli.ignore, cli.warnings_as_errors);
+    validate_config_rule_ids(&config)?;
 
     let diff_mode = match (cli.diff.as_deref(), cli.diff_staged.as_deref()) {
         (Some(base_ref), None) => Some(DiffMode::Head { base_ref }),
@@ -136,9 +138,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
     // Discover migration files (with exclude patterns from config)
     let migration_paths = discover_migrations(&cli.paths, diff_mode, &config.exclude)?;
+    let unparseable_migration_changes = if migration_paths.is_empty() {
+        discover_unparseable_migration_changes(diff_mode, &cli.paths, &config.exclude)?
+    } else {
+        Vec::new()
+    };
 
     // If no migrations found, that's OK
-    if migration_paths.is_empty() {
+    if migration_paths.is_empty() && unparseable_migration_changes.is_empty() {
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -166,10 +173,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
     }
+    migrations.extend(
+        unparseable_migration_changes
+            .into_iter()
+            .map(|path| placeholder_migration(&path))
+            .collect::<Result<Vec<_>>>()?,
+    );
 
     // Run changeset rules if in diff mode
     if let Some(diff_mode) = diff_mode {
-        let other_files = discover_non_migration_files(diff_mode, &cli.paths)?;
+        let other_files = discover_non_migration_files(diff_mode, &cli.paths, &config.exclude)?;
         let changeset_registry = ChangesetRuleRegistry::new();
         let migration_refs: Vec<&Migration> = migrations.iter().collect();
         let other_file_refs: Vec<&Path> = other_files.iter().map(|p| p.as_path()).collect();
@@ -246,6 +259,19 @@ fn all_rule_metadata() -> Vec<(String, String, Severity, String)> {
     rows
 }
 
+fn validate_config_rule_ids(config: &Config) -> Result<()> {
+    let available: Vec<String> = all_rule_metadata().into_iter().map(|(id, ..)| id).collect();
+    let known: BTreeSet<&str> = available.iter().map(String::as_str).collect();
+
+    for rule_id in config.select.iter().chain(&config.ignore) {
+        if !known.contains(rule_id.as_str()) {
+            return Err(Error::unknown_rule(rule_id, available));
+        }
+    }
+
+    Ok(())
+}
+
 /// Print every rule the binary recognises, sorted by ID, with
 /// its name and severity. One row per rule.
 fn list_rules() -> Result<ExitCode> {
@@ -253,7 +279,7 @@ fn list_rules() -> Result<ExitCode> {
     let id_width = rows.iter().map(|(id, ..)| id.len()).max().unwrap_or(4);
     let sev_width = rows
         .iter()
-        .map(|(_, _, sev, _)| format!("{sev:?}").len())
+        .map(|(_, _, sev, _)| sev.label().len())
         .max()
         .unwrap_or(7);
 
@@ -261,7 +287,7 @@ fn list_rules() -> Result<ExitCode> {
         println!(
             "{:<id_width$}  {:<sev_width$}  {}",
             id.bold().cyan(),
-            format!("{sev:?}"),
+            sev.label(),
             name,
             id_width = id_width,
             sev_width = sev_width,
@@ -276,7 +302,7 @@ fn run_rule_command(rule_id: &str) -> Result<ExitCode> {
     if let Some((id, name, severity, description)) = rows.iter().find(|(id, ..)| id == rule_id) {
         println!("{}", id.bold().cyan());
         println!("{}: {}", "Name".bold(), name);
-        println!("{}: {:?}", "Severity".bold(), severity);
+        println!("{}: {}", "Severity".bold(), severity.label());
         println!();
         println!("{}", description);
         return Ok(ExitCode::SUCCESS);
@@ -304,6 +330,23 @@ enum DiffMode<'a> {
     Staged { base_ref: &'a str },
 }
 
+impl<'a> DiffMode<'a> {
+    /// The git diff source this mode reads from.
+    fn source(self) -> DiffSource {
+        match self {
+            DiffMode::Head { .. } => DiffSource::Head,
+            DiffMode::Staged { .. } => DiffSource::Index,
+        }
+    }
+
+    /// The base reference being compared against.
+    fn base_ref(self) -> &'a str {
+        match self {
+            DiffMode::Head { base_ref } | DiffMode::Staged { base_ref } => base_ref,
+        }
+    }
+}
+
 fn discover_migrations(
     paths: &[PathBuf],
     diff_mode: Option<DiffMode<'_>>,
@@ -312,14 +355,11 @@ fn discover_migrations(
     if let Some(diff_mode) = diff_mode {
         // In diff mode, get changed migrations from git
         let repo = GitRepo::open(Path::new("."))?;
-        let migrations = match diff_mode {
-            DiffMode::Head { base_ref } => {
-                repo.changed_paths(base_ref, DiffSource::Head, ChangedKind::Migrations)?
-            }
-            DiffMode::Staged { base_ref } => {
-                repo.changed_paths(base_ref, DiffSource::Index, ChangedKind::Migrations)?
-            }
-        };
+        let migrations = repo.changed_paths(
+            diff_mode.base_ref(),
+            diff_mode.source(),
+            ChangedKind::Migrations,
+        )?;
         let root = repo.root()?;
         let migrations = filter_paths_by_cli_scope(migrations, paths, &root)?;
 
@@ -330,10 +370,7 @@ fn discover_migrations(
             let patterns = compile_glob_patterns(exclude_patterns)?;
             Ok(migrations
                 .into_iter()
-                .filter(|p| {
-                    let path_str = p.to_string_lossy();
-                    !patterns.iter().any(|pat| pat.matches(&path_str))
-                })
+                .filter(|p| !path_matches_any_glob(p, &[Path::new("."), &root], &patterns))
                 .collect())
         }
     } else {
@@ -343,6 +380,8 @@ fn discover_migrations(
         let mut all_migrations = Vec::new();
 
         let patterns = compile_glob_patterns(exclude_patterns)?;
+        let current_dir = std::env::current_dir().map_err(|e| Error::io(e, PathBuf::from(".")))?;
+        let normalized_current_dir = current_dir.canonicalize().ok();
 
         for path in paths {
             if !path.exists() {
@@ -363,8 +402,17 @@ fn discover_migrations(
                 // Accept any .py file passed explicitly
                 if path.extension().is_some_and(|ext| ext == "py") {
                     // Check against exclude patterns
-                    let path_str = path.to_string_lossy();
-                    if !patterns.iter().any(|pat| pat.matches(&path_str)) {
+                    let mut roots = vec![Path::new("."), current_dir.as_path()];
+                    if let Some(normalized) = &normalized_current_dir {
+                        roots.push(normalized.as_path());
+                    }
+                    let excluded = path_matches_any_glob(path, &roots, &patterns)
+                        || normalize_existing_path(path)
+                            .ok()
+                            .is_some_and(|normalized| {
+                                path_matches_any_glob(&normalized, &roots, &patterns)
+                            });
+                    if !excluded {
                         all_migrations.push(path.clone());
                     }
                 }
@@ -384,19 +432,54 @@ fn discover_migrations(
     }
 }
 
+fn discover_unparseable_migration_changes(
+    diff_mode: Option<DiffMode<'_>>,
+    paths: &[PathBuf],
+    exclude_patterns: &[String],
+) -> Result<Vec<PathBuf>> {
+    let Some(diff_mode) = diff_mode else {
+        return Ok(Vec::new());
+    };
+    let repo = GitRepo::open(Path::new("."))?;
+    let root = repo.root()?;
+    let touched = repo.changed_migration_touches(diff_mode.base_ref(), diff_mode.source())?;
+    let touched = filter_paths_by_cli_scope(touched, paths, &root)?;
+    if touched.is_empty() {
+        return Ok(Vec::new());
+    }
+    let patterns = compile_glob_patterns(exclude_patterns)?;
+    Ok(touched
+        .into_iter()
+        .filter(|path| !path_matches_any_glob(path, &[Path::new("."), &root], &patterns))
+        .collect())
+}
+
+fn placeholder_migration(path: &Path) -> Result<Migration> {
+    Migration::from_source(
+        path,
+        "from django.db import migrations\n\nclass Migration(migrations.Migration):\n    operations = []\n",
+    )
+}
+
 fn filter_paths_by_cli_scope(
     paths: Vec<PathBuf>,
     scopes: &[PathBuf],
     repo_root: &Path,
 ) -> Result<Vec<PathBuf>> {
-    if scopes == [PathBuf::from(".")] {
-        return Ok(paths);
-    }
     let current_dir = normalize_existing_path(
         &std::env::current_dir().map_err(|e| Error::io(e, PathBuf::from(".")))?,
     )?;
     let original_repo_root = repo_root.to_path_buf();
     let normalized_repo_root = normalize_existing_path(repo_root)?;
+    if scopes == [PathBuf::from(".")] && current_dir == normalized_repo_root {
+        return Ok(paths);
+    }
+    let normalized_paths: Vec<PathBuf> = paths
+        .iter()
+        .map(|path| {
+            normalize_changed_path_for_scope(path, &original_repo_root, &normalized_repo_root)
+        })
+        .collect();
     let absolute_scopes: Vec<PathBuf> = scopes
         .iter()
         .map(|scope| {
@@ -405,11 +488,19 @@ fn filter_paths_by_cli_scope(
             } else {
                 current_dir.join(scope)
             };
-            if !path.exists() {
+            let normalized_scope = if path.exists() {
+                normalize_existing_path(&path)?
+            } else {
+                normalize_changed_path_for_scope(&path, &original_repo_root, &normalized_repo_root)
+            };
+            if !path_is_in_scope(&normalized_scope, &normalized_repo_root) {
                 return Err(Error::path_not_found(scope.clone()));
             }
-            let normalized_scope = normalize_existing_path(&path)?;
-            if !path_is_in_scope(&normalized_scope, &normalized_repo_root) {
+            if !path.exists()
+                && !normalized_paths
+                    .iter()
+                    .any(|changed| path_is_in_scope(changed, &normalized_scope))
+            {
                 return Err(Error::path_not_found(scope.clone()));
             }
             Ok(normalized_scope)
@@ -417,12 +508,12 @@ fn filter_paths_by_cli_scope(
         .collect::<Result<_>>()?;
     Ok(paths
         .into_iter()
-        .filter(|path| {
-            let normalized_path =
-                normalize_changed_path_for_scope(path, &original_repo_root, &normalized_repo_root);
+        .zip(normalized_paths)
+        .filter_map(|(path, normalized_path)| {
             absolute_scopes
                 .iter()
                 .any(|scope| path_is_in_scope(&normalized_path, scope))
+                .then_some(path)
         })
         .collect())
 }
@@ -451,6 +542,9 @@ fn normalize_changed_path_for_scope(
         if let Ok(relative) = path.strip_prefix(original_repo_root) {
             return normalized_repo_root.join(relative);
         }
+        if let Ok(relative) = path.strip_prefix(normalized_repo_root) {
+            return normalized_repo_root.join(relative);
+        }
         path.to_path_buf()
     } else {
         normalized_repo_root.join(path)
@@ -469,26 +563,46 @@ fn compile_glob_patterns(patterns: &[String]) -> Result<Vec<glob::Pattern>> {
         .collect()
 }
 
+fn path_matches_any_glob(path: &Path, roots: &[&Path], patterns: &[glob::Pattern]) -> bool {
+    let mut candidates = vec![discovery::slash_path(path)];
+    if let Ok(stripped) = path.strip_prefix(".") {
+        candidates.push(discovery::slash_path(stripped));
+    }
+    for root in roots {
+        if let Ok(stripped) = path.strip_prefix(root) {
+            candidates.push(discovery::slash_path(stripped));
+        }
+    }
+    candidates
+        .iter()
+        .any(|candidate| patterns.iter().any(|pat| pat.matches(candidate)))
+}
+
 /// Returns repo-relative paths so changeset rules can match without
 /// touching the filesystem.
 fn discover_non_migration_files(
     diff_mode: DiffMode<'_>,
     paths: &[PathBuf],
+    exclude_patterns: &[String],
 ) -> Result<Vec<PathBuf>> {
     let repo = GitRepo::open(Path::new("."))?;
     let root = repo.root()?;
-    let absolute = match diff_mode {
-        DiffMode::Head { base_ref } => {
-            repo.changed_paths(base_ref, DiffSource::Head, ChangedKind::NonMigrations)?
-        }
-        DiffMode::Staged { base_ref } => {
-            repo.changed_paths(base_ref, DiffSource::Index, ChangedKind::NonMigrations)?
-        }
-    };
+    let absolute = repo.changed_paths(
+        diff_mode.base_ref(),
+        diff_mode.source(),
+        ChangedKind::NonMigrations,
+    )?;
+    if absolute.is_empty() {
+        return Ok(Vec::new());
+    }
     let absolute = filter_paths_by_cli_scope(absolute, paths, &root)?;
     let normalized_root = normalize_existing_path(&root)?;
+    let patterns = compile_glob_patterns(exclude_patterns)?;
     Ok(absolute
         .into_iter()
+        .filter(|p| {
+            !path_matches_any_glob(p, &[Path::new("."), &root, &normalized_root], &patterns)
+        })
         .map(|p| {
             p.strip_prefix(&root)
                 .map(|r| r.to_path_buf())
@@ -569,11 +683,25 @@ fn sanitize_path(path: &std::path::Path) -> String {
     sanitize_text(&path.display().to_string(), SanitizePolicy::SingleLine)
 }
 
+/// Count diagnostics by severity, returning `(errors, warnings)`.
+fn count_by_severity(diagnostics: &[Diagnostic]) -> (usize, usize) {
+    let errors = diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .count();
+    let warnings = diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Warning)
+        .count();
+    (errors, warnings)
+}
+
 fn output_default(diagnostics: &[Diagnostic]) {
     for diag in diagnostics {
+        let label = diag.severity.label();
         let severity_str = match diag.severity {
-            Severity::Error => "error".red().bold(),
-            Severity::Warning => "warning".yellow().bold(),
+            Severity::Error => label.red().bold(),
+            Severity::Warning => label.yellow().bold(),
         };
 
         println!(
@@ -602,14 +730,7 @@ fn output_default(diagnostics: &[Diagnostic]) {
     }
 
     // Summary
-    let error_count = diagnostics
-        .iter()
-        .filter(|d| d.severity == Severity::Error)
-        .count();
-    let warning_count = diagnostics
-        .iter()
-        .filter(|d| d.severity == Severity::Warning)
-        .count();
+    let (error_count, warning_count) = count_by_severity(diagnostics);
 
     if error_count > 0 || warning_count > 0 {
         let mut parts = Vec::new();
@@ -663,7 +784,7 @@ fn output_json(diagnostics: &[Diagnostic]) {
             rule_id: d.rule_id.to_string(),
             rule_name: d.rule_name.to_string(),
             message: d.message.clone(),
-            severity: format!("{:?}", d.severity).to_lowercase(),
+            severity: d.severity.label().to_string(),
             path: d.path.display().to_string(),
             line: d.span.start_line,
             column: d.span.start_column,
@@ -671,18 +792,13 @@ fn output_json(diagnostics: &[Diagnostic]) {
         })
         .collect();
 
+    let (errors, warnings) = count_by_severity(diagnostics);
     let output = JsonOutput {
         diagnostics: json_diagnostics,
         summary: JsonSummary {
             total: diagnostics.len(),
-            errors: diagnostics
-                .iter()
-                .filter(|d| d.severity == Severity::Error)
-                .count(),
-            warnings: diagnostics
-                .iter()
-                .filter(|d| d.severity == Severity::Warning)
-                .count(),
+            errors,
+            warnings,
         },
     };
 
