@@ -7,8 +7,9 @@
 use std::path::Path;
 
 use crate::ast::{Migration, OperationData};
+use crate::config::Config;
 use crate::diagnostics::{Diagnostic, Severity, Span};
-use crate::rules::{ChangesetRule, RuleContext};
+use crate::rules::ChangesetRule;
 
 /// Rule that detects SeparateDatabaseAndState followed by second step in same PR.
 pub struct R009SeparateDbStateSamePr;
@@ -35,7 +36,7 @@ impl ChangesetRule for R009SeparateDbStateSamePr {
         &self,
         migrations: &[&Migration],
         _other_changed_files: &[&Path],
-        _ctx: &RuleContext,
+        _config: &Config,
     ) -> Vec<Diagnostic> {
         // The rule only triggers when the changeset contains BOTH halves of
         // a SeparateDatabaseAndState two-step deployment: at least one
@@ -72,22 +73,22 @@ impl ChangesetRule for R009SeparateDbStateSamePr {
             let Some(span) = separation_span(migration) else {
                 continue;
             };
-            diagnostics.push(Diagnostic {
-                rule_id: self.id(),
-                rule_name: self.name(),
-                message: "Both halves of a SeparateDatabaseAndState two-step deployment \
-                     appear in this changeset"
-                    .to_string(),
-                severity: self.severity(),
-                path: migration.path.clone(),
-                span,
-                help: Some(
+            diagnostics.push(
+                Diagnostic::new(
+                    self.id(),
+                    self.name(),
+                    self.severity(),
+                    "Both halves of a SeparateDatabaseAndState two-step deployment \
+                     appear in this changeset",
+                    migration.path.clone(),
+                    span,
+                )
+                .with_help(
                     "Deploy the state-only migration first, wait for all application \
                      servers to pick up the change, then deploy the database-only \
-                     migration in a separate PR."
-                        .to_string(),
+                     migration in a separate PR.",
                 ),
-            });
+            );
         }
 
         diagnostics
@@ -222,6 +223,38 @@ class Migration(migrations.Migration):
     ]
 "#;
 
+    const EMPTY_STATE_CONSTANT_MIGRATION: &str = r#"
+from django.db import migrations
+
+
+STATE_OPS = []
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            state_operations=STATE_OPS,
+        ),
+    ]
+"#;
+
+    const EMPTY_DB_CONSTANT_MIGRATION: &str = r#"
+from django.db import migrations
+
+
+DB_OPS = []
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=DB_OPS,
+        ),
+    ]
+"#;
+
     const OTHER_MIGRATION: &str = r#"
 from django.db import migrations, models
 
@@ -272,11 +305,7 @@ class Migration(migrations.Migration):
     fn run(migrations: &[&Migration]) -> Vec<Diagnostic> {
         let other_files: Vec<&Path> = vec![];
         let config = Config::default();
-        let ctx = RuleContext {
-            config: &config,
-            path: Path::new("."),
-        };
-        R009SeparateDbStateSamePr.check(migrations, &other_files, &ctx)
+        R009SeparateDbStateSamePr.check(migrations, &other_files, &config)
     }
 
     #[test]
@@ -311,6 +340,17 @@ class Migration(migrations.Migration):
 
         assert_eq!(diagnostics.len(), 2);
         assert!(diagnostics.iter().all(|d| d.rule_id == "R009"));
+    }
+
+    #[test]
+    fn test_empty_list_constant_arms_do_not_count_as_present() {
+        let empty_state = parse_migration(EMPTY_STATE_CONSTANT_MIGRATION, "0001_empty_state.py");
+        let db_migration = parse_migration(DB_ONLY_MIGRATION, "0002_db.py");
+        let empty_db = parse_migration(EMPTY_DB_CONSTANT_MIGRATION, "0003_empty_db.py");
+        let state_migration = parse_migration(STATE_ONLY_MIGRATION, "0004_state.py");
+
+        assert!(run(&[&empty_state, &db_migration]).is_empty());
+        assert!(run(&[&empty_db, &state_migration]).is_empty());
     }
 
     #[test]

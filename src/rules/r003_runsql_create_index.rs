@@ -45,21 +45,22 @@ impl Rule for R003RunSQLCreateIndex {
                         && !sql_statement_contains_concurrently(stmt)
                 });
                 if fires {
-                    diagnostics.push(Diagnostic {
-                        rule_id: self.id(),
-                        rule_name: self.name(),
-                        message: "RunSQL contains CREATE INDEX without CONCURRENTLY".to_string(),
-                        severity: self.severity(),
-                        path: ctx.path.to_path_buf(),
-                        span: op.span,
-                        help: Some(
+                    diagnostics.push(
+                        Diagnostic::new(
+                            self.id(),
+                            self.name(),
+                            self.severity(),
+                            "RunSQL contains CREATE INDEX without CONCURRENTLY",
+                            ctx.path.to_path_buf(),
+                            op.span,
+                        )
+                        .with_help(
                             "Use CREATE INDEX CONCURRENTLY to avoid table locks. Each \
                              CREATE INDEX statement is checked independently — splitting \
                              a non-concurrent CREATE INDEX into the same RunSQL as a \
-                             concurrent one does not exempt it."
-                                .to_string(),
+                             concurrent one does not exempt it.",
                         ),
-                    });
+                    );
                 }
             }
         }
@@ -276,6 +277,47 @@ class Migration(migrations.Migration):
         assert_eq!(diagnostics[0].rule_id, "R003");
     }
 
+    const RUNSQL_IDENTIFIER_SEQUENCE_BAD: &str = r#"
+from django.db import migrations
+
+
+SQL = [
+    'CREATE INDEX a_idx ON t (a)',
+]
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL(SQL),
+    ]
+"#;
+
+    #[test]
+    fn test_identifier_bound_statement_sequence_is_checked() {
+        let diagnostics = check_migration(RUNSQL_IDENTIFIER_SEQUENCE_BAD);
+        assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+        assert_eq!(diagnostics[0].rule_id, "R003");
+    }
+
+    const RUNSQL_MULTILINE_CREATE_INDEX_BAD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL(sql='CREATE\nINDEX idx_name ON table_name (column);'),
+    ]
+"#;
+
+    #[test]
+    fn test_create_index_with_escaped_whitespace_is_flagged() {
+        let diagnostics = check_migration(RUNSQL_MULTILINE_CREATE_INDEX_BAD);
+        assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+        assert_eq!(diagnostics[0].rule_id, "R003");
+    }
+
     const RUNSQL_BOTH_CONCURRENT_GOOD: &str = r#"
 from django.db import migrations
 
@@ -297,6 +339,65 @@ class Migration(migrations.Migration):
         // pin, a too-aggressive split-and-check refactor could
         // false-positive on legitimate multi-CONCURRENTLY bundles.
         let diagnostics = check_migration(RUNSQL_BOTH_CONCURRENT_GOOD);
+        assert!(diagnostics.is_empty(), "got: {diagnostics:?}");
+    }
+
+    const NESTED_SDAS_RUNSQL_BAD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.SeparateDatabaseAndState(
+                    database_operations=[
+                        migrations.RunSQL(sql='CREATE INDEX idx_name ON table_name (column);'),
+                    ],
+                ),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_nested_sdas_database_runsql_is_flagged() {
+        let diagnostics = check_migration(NESTED_SDAS_RUNSQL_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R003");
+    }
+
+    const RUNSQL_NUMERIC_ESCAPES_BAD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+    operations = [
+        migrations.RunSQL(sql='CREATE\x20INDEX\u0020idx_name ON table_name (column);'),
+    ]
+"#;
+
+    #[test]
+    fn test_python_numeric_escapes_are_decoded_before_sql_matching() {
+        let diagnostics = check_migration(RUNSQL_NUMERIC_ESCAPES_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R003");
+    }
+
+    const RUNSQL_RAW_BACKSLASH_N_GOOD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+    operations = [
+        migrations.RunSQL(sql=r'CREATE\nINDEX idx_name ON table_name (column);'),
+    ]
+"#;
+
+    #[test]
+    fn test_raw_string_backslash_n_is_not_treated_as_whitespace() {
+        let diagnostics = check_migration(RUNSQL_RAW_BACKSLASH_N_GOOD);
         assert!(diagnostics.is_empty(), "got: {diagnostics:?}");
     }
 }

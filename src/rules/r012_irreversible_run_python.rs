@@ -32,23 +32,26 @@ impl Rule for R012IrreversibleRunPython {
         let mut diagnostics = Vec::new();
 
         for op in migration.database_effective_operations_of_type(OperationType::RunPython) {
-            if let OperationData::RunPython(data) = &op.data {
-                if !data.is_reversible() {
-                    diagnostics.push(Diagnostic {
-                        rule_id: self.id(),
-                        rule_name: self.name(),
-                        message: format!("RunPython '{}' has no reverse function", data.code),
-                        severity: self.severity(),
-                        path: ctx.path.to_path_buf(),
-                        span: op.span,
-                        help: Some(
-                            "Add a reverse function: RunPython(forward, reverse) or use \
-                             RunPython(forward, migrations.RunPython.noop) if no reverse is needed"
-                                .to_string(),
-                        ),
-                    });
-                }
+            let OperationData::RunPython(data) = &op.data else {
+                continue;
+            };
+            if data.is_reversible() {
+                continue;
             }
+            diagnostics.push(
+                Diagnostic::new(
+                    self.id(),
+                    self.name(),
+                    self.severity(),
+                    format!("RunPython '{}' has no reverse function", data.code),
+                    ctx.path.to_path_buf(),
+                    op.span,
+                )
+                .with_help(
+                    "Add a reverse function: RunPython(forward, reverse) or use \
+                     RunPython(forward, migrations.RunPython.noop) if no reverse is needed",
+                ),
+            );
         }
 
         diagnostics

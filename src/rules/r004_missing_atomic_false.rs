@@ -56,19 +56,19 @@ impl Rule for R004MissingAtomicFalse {
             // inline suppression with `# zdm: ignore R004` only work at
             // the top of the file, which is rarely where users write it.
             let span = migration.class_span.unwrap_or_default();
-            diagnostics.push(Diagnostic {
-                rule_id: self.id(),
-                rule_name: self.name(),
-                message: "Migration uses concurrent operations but is not marked as non-atomic"
-                    .to_string(),
-                severity: self.severity(),
-                path: ctx.path.to_path_buf(),
-                span,
-                help: Some(
-                    "Add `atomic = False` to the Migration class to allow concurrent operations"
-                        .to_string(),
+            diagnostics.push(
+                Diagnostic::new(
+                    self.id(),
+                    self.name(),
+                    self.severity(),
+                    "Migration uses concurrent operations but is not marked as non-atomic",
+                    ctx.path.to_path_buf(),
+                    span,
+                )
+                .with_help(
+                    "Add `atomic = False` to the Migration class to allow concurrent operations",
                 ),
-            });
+            );
         }
 
         diagnostics
@@ -222,6 +222,26 @@ class Migration(migrations.Migration):
         // deploy fails every time. R004's `is_concurrent` check
         // only looked at Django op types and missed RunSQL entirely.
         let diagnostics = check_migration(RUNSQL_CONCURRENTLY_NO_ATOMIC_BAD);
+        assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+        assert_eq!(diagnostics[0].rule_id, "R004");
+    }
+
+    const RUNSQL_MULTILINE_CONCURRENTLY_NO_ATOMIC_BAD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RunSQL(
+            sql='CREATE\nINDEX\nCONCURRENTLY idx_name ON t (c);',
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_runsql_create_index_concurrently_with_escaped_whitespace_fires() {
+        let diagnostics = check_migration(RUNSQL_MULTILINE_CONCURRENTLY_NO_ATOMIC_BAD);
         assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
         assert_eq!(diagnostics[0].rule_id, "R004");
     }

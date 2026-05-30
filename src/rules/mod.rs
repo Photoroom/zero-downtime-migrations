@@ -111,29 +111,31 @@ pub(crate) fn walk_with_created_models(
 ) {
     let mut created = CreatedModels::new();
     for op in &migration.operations {
-        match &op.data {
-            OperationData::SeparateDatabaseAndState(data) => {
-                for db_op in &data.database_operations {
-                    if db_op.op_type == OperationType::CreateModel {
-                        if let OperationData::Model(ModelOperation { name, .. }) = &db_op.data {
-                            created.insert(name);
-                        }
-                    }
-                    handle(db_op, &created);
-                }
-            }
-            _ => {
-                if op.op_type == OperationType::CreateModel {
-                    if let OperationData::Model(ModelOperation { name, .. }) = &op.data {
-                        created.insert(name);
-                    }
-                }
-                handle(op, &created);
-            }
-        }
+        walk_database_effective_operation(op, &mut created, &mut handle);
     }
 }
 
+fn walk_database_effective_operation(
+    op: &Operation,
+    created: &mut CreatedModels,
+    handle: &mut impl FnMut(&Operation, &CreatedModels),
+) {
+    match &op.data {
+        OperationData::SeparateDatabaseAndState(data) => {
+            for db_op in &data.database_operations {
+                walk_database_effective_operation(db_op, created, handle);
+            }
+        }
+        _ => {
+            if op.op_type == OperationType::CreateModel {
+                if let OperationData::Model(ModelOperation { name, .. }) = &op.data {
+                    created.insert(name);
+                }
+            }
+            handle(op, created);
+        }
+    }
+}
 /// A per-file rule that analyzes individual migration files.
 pub trait Rule: Send + Sync {
     /// The unique rule identifier (e.g., "R001").
@@ -167,11 +169,14 @@ pub trait ChangesetRule: Send + Sync {
     fn severity(&self) -> Severity;
 
     /// Run the rule on a set of changed migrations and other changed files.
+    /// Changeset rules build their own diagnostic paths from the migration /
+    /// file data, so they receive the `Config` directly rather than a
+    /// per-file `RuleContext`.
     fn check(
         &self,
         migrations: &[&Migration],
         other_changed_files: &[&Path],
-        ctx: &RuleContext,
+        config: &Config,
     ) -> Vec<Diagnostic>;
 }
 
@@ -322,16 +327,11 @@ impl ChangesetRuleRegistry {
         other_changed_files: &[&Path],
         config: &Config,
     ) -> Vec<Diagnostic> {
-        let ctx = RuleContext {
-            config,
-            path: Path::new("."),
-        };
-
         let mut diagnostics = Vec::new();
 
         for rule in &self.rules {
             if config.is_rule_enabled(rule.id()) {
-                let mut rule_diagnostics = rule.check(migrations, other_changed_files, &ctx);
+                let mut rule_diagnostics = rule.check(migrations, other_changed_files, config);
 
                 // Honour `# zdm: ignore RXXX` comments. Two cases:
                 //
@@ -569,14 +569,10 @@ class Migration(migrations.Migration):
     // silently change exemption behaviour for all six rules at once.
     // -------------------------------------------------------------------
 
-    use crate::ast::MigrationExtractor;
-    use crate::parser::ParsedMigration;
     use std::path::Path;
 
     fn extract(source: &str) -> Migration {
-        let parsed = ParsedMigration::parse(source).unwrap();
-        let extractor = MigrationExtractor::new(&parsed);
-        extractor.extract(Path::new("test.py")).unwrap()
+        Migration::from_source(Path::new("test.py"), source).unwrap()
     }
 
     #[test]

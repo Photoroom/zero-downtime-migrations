@@ -56,18 +56,20 @@ impl Rule for R006AddFieldForeignKey {
                 return;
             }
 
-            diagnostics.push(Diagnostic {
-                rule_id: self.id(),
-                rule_name: self.name(),
-                message: format!(
-                    "AddField with ForeignKey on existing model '{}'",
-                    data.model_name
-                ),
-                severity: self.severity(),
-                path: ctx.path.to_path_buf(),
-                span: op.span,
-                help: Some(include_str!("help/r006_add_fk.txt").to_string()),
-            });
+            diagnostics.push(
+                Diagnostic::new(
+                    self.id(),
+                    self.name(),
+                    self.severity(),
+                    format!(
+                        "AddField with ForeignKey on existing model '{}'",
+                        data.model_name
+                    ),
+                    ctx.path.to_path_buf(),
+                    op.span,
+                )
+                .with_help(include_str!("help/r006_add_fk.txt")),
+            );
         });
 
         diagnostics
@@ -203,10 +205,7 @@ class Migration(migrations.Migration):
     #[test]
     fn test_addfield_fk_before_createmodel_is_not_exempted() {
         // Order-aware exemption: a CreateModel that runs *after* the
-        // AddField cannot retroactively make the AddField safe. The
-        // previous `is_model_created` lookup was order-blind and
-        // silently exempted this — the same false negative R002 and
-        // R016 fixed earlier in this PR.
+        // AddField cannot retroactively make the AddField safe.
         let diagnostics = check_migration(ADDFIELD_FK_BEFORE_CREATEMODEL_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R006");
@@ -234,6 +233,80 @@ class Migration(migrations.Migration):
     #[test]
     fn test_wrapped_database_add_fk_is_flagged() {
         let diagnostics = check_migration(WRAPPED_ADD_FK_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R006");
+    }
+
+    const NESTED_SDAS_ADD_FK_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.SeparateDatabaseAndState(
+                    database_operations=[
+                        migrations.AddField(
+                            model_name='order',
+                            name='customer',
+                            field=models.ForeignKey(on_delete=models.CASCADE, to='app.customer'),
+                        ),
+                    ],
+                ),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_nested_sdas_database_add_fk_is_flagged() {
+        let diagnostics = check_migration(NESTED_SDAS_ADD_FK_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R006");
+    }
+
+    const ADD_ONE_TO_ONE_EXISTING_MODEL_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddField(
+            model_name='profile',
+            name='user',
+            field=models.OneToOneField(on_delete=models.CASCADE, to='auth.user'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_add_one_to_one_existing_model_bad() {
+        let diagnostics = check_migration(ADD_ONE_TO_ONE_EXISTING_MODEL_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R006");
+    }
+
+    const ADD_FK_POSITIONAL_EXISTING_MODEL_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddField(
+            'order',
+            'customer',
+            models.ForeignKey(on_delete=models.CASCADE, to='app.customer'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_add_fk_positional_existing_model_bad() {
+        let diagnostics = check_migration(ADD_FK_POSITIONAL_EXISTING_MODEL_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R006");
     }

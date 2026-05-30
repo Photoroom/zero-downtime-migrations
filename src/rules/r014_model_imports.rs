@@ -34,19 +34,20 @@ impl Rule for R014ModelImports {
 
         for import in &migration.imports {
             if import.is_direct_model_import() {
-                diagnostics.push(Diagnostic {
-                    rule_id: self.id(),
-                    rule_name: self.name(),
-                    message: "Direct model import found in migration".to_string(),
-                    severity: self.severity(),
-                    path: ctx.path.to_path_buf(),
-                    span: import.span,
-                    help: Some(
+                diagnostics.push(
+                    Diagnostic::new(
+                        self.id(),
+                        self.name(),
+                        self.severity(),
+                        "Direct model import found in migration",
+                        ctx.path.to_path_buf(),
+                        import.span,
+                    )
+                    .with_help(
                         "Use apps.get_model('app_name', 'ModelName') in RunPython to get \
-                         the historical model state instead of importing directly"
-                            .to_string(),
+                         the historical model state instead of importing directly",
                     ),
-                });
+                );
             }
         }
 
@@ -200,6 +201,28 @@ class Migration(migrations.Migration):
         // is to flag.
         let diagnostics = check_migration(WILDCARD_IMPORT_BAD);
         assert_eq!(diagnostics.len(), 1);
+    }
+
+    const FUNCTION_LOCAL_MODEL_IMPORT_BAD: &str = r#"
+from django.db import migrations
+
+
+def forwards(apps, schema_editor):
+    from .models import Product
+    Product.objects.update(active=True)
+
+
+class Migration(migrations.Migration):
+    operations = [
+        migrations.RunPython(forwards),
+    ]
+"#;
+
+    #[test]
+    fn test_function_local_model_import_is_flagged() {
+        let diagnostics = check_migration(FUNCTION_LOCAL_MODEL_IMPORT_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R014");
     }
 
     const PLAIN_IMPORT_OF_MODELS_GOOD: &str = r#"
