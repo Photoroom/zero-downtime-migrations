@@ -237,6 +237,29 @@ class Migration(migrations.Migration):
         );
     }
 
+    #[test]
+    fn test_renamed_fresh_model_remains_exempt() {
+        let diagnostics = check_migration(
+            r#"
+from django.db import migrations, models
+
+class Migration(migrations.Migration):
+    operations = [
+        migrations.CreateModel(
+            name='Product',
+            fields=[('id', models.AutoField(primary_key=True))],
+        ),
+        migrations.RenameModel(old_name='Product', new_name='Item'),
+        migrations.AddIndex(
+            model_name='item',
+            index=models.Index(fields=['name'], name='item_name_idx'),
+        ),
+    ]
+"#,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
     const CREATEMODEL_BEFORE_POSITIONAL_ADDINDEX_GOOD: &str = r#"
 from django.db import migrations, models
 

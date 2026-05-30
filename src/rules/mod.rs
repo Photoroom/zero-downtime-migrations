@@ -90,6 +90,10 @@ impl CreatedModels {
         self.names.insert(name.to_lowercase());
     }
 
+    fn remove(&mut self, name: &str) {
+        self.names.remove(&name.to_lowercase());
+    }
+
     /// Is `name` in the set? Comparison is case-insensitive on
     /// both sides — callers do not need to lowercase before
     /// calling.
@@ -127,9 +131,16 @@ fn walk_database_effective_operation(
             }
         }
         _ => {
-            if op.op_type == OperationType::CreateModel {
-                if let OperationData::Model(ModelOperation { name, .. }) = &op.data {
+            if let OperationData::Model(ModelOperation { name, old_name }) = &op.data {
+                if op.op_type == OperationType::CreateModel {
                     created.insert(name);
+                } else if op.op_type == OperationType::RenameModel {
+                    if let Some(old_name) = old_name {
+                        created.remove(old_name);
+                        created.insert(name);
+                    }
+                } else if op.op_type == OperationType::DeleteModel {
+                    created.remove(name);
                 }
             }
             handle(op, created);
@@ -175,6 +186,7 @@ pub trait ChangesetRule: Send + Sync {
     fn check(
         &self,
         migrations: &[&Migration],
+        changed_migration_paths: &[&Path],
         other_changed_files: &[&Path],
         config: &Config,
     ) -> Vec<Diagnostic>;
@@ -324,6 +336,7 @@ impl ChangesetRuleRegistry {
     pub fn check(
         &self,
         migrations: &[&Migration],
+        changed_migration_paths: &[&Path],
         other_changed_files: &[&Path],
         config: &Config,
     ) -> Vec<Diagnostic> {
@@ -331,7 +344,12 @@ impl ChangesetRuleRegistry {
 
         for rule in &self.rules {
             if config.is_rule_enabled(rule.id()) {
-                let mut rule_diagnostics = rule.check(migrations, other_changed_files, config);
+                let mut rule_diagnostics = rule.check(
+                    migrations,
+                    changed_migration_paths,
+                    other_changed_files,
+                    config,
+                );
 
                 // Honour `# zdm: ignore RXXX` comments. Two cases:
                 //
@@ -474,8 +492,9 @@ class Migration(migrations.Migration):
         let registry = ChangesetRuleRegistry::new();
         let config = Config::default();
         let migrations = vec![&state_m, &db_m];
+        let migration_paths: Vec<&Path> = migrations.iter().map(|m| m.path.as_path()).collect();
         let other_files: Vec<&Path> = vec![];
-        let diagnostics = registry.check(&migrations, &other_files, &config);
+        let diagnostics = registry.check(&migrations, &migration_paths, &other_files, &config);
 
         // R009 emits one diagnostic per file in the pair; the state-side
         // suppresses, so only the db-side diagnostic survives.
@@ -512,12 +531,13 @@ class Migration(migrations.Migration):
         let registry = ChangesetRuleRegistry::new();
         let config = Config::default();
         let migrations = vec![&migration];
+        let migration_paths = vec![migration.path.as_path()];
         // The non-migration changed file would normally trigger R008
         // (no allowed-file-patterns configured, so all non-migration
         // files are flagged).
         let models = Path::new("app/models.py");
         let other_files: Vec<&Path> = vec![models];
-        let diagnostics = registry.check(&migrations, &other_files, &config);
+        let diagnostics = registry.check(&migrations, &migration_paths, &other_files, &config);
 
         assert!(
             diagnostics.is_empty(),
@@ -551,9 +571,10 @@ class Migration(migrations.Migration):
         let registry = ChangesetRuleRegistry::new();
         let config = Config::default();
         let migrations = vec![&migration];
+        let migration_paths = vec![migration.path.as_path()];
         let models = Path::new("app/models.py");
         let other_files: Vec<&Path> = vec![models];
-        let diagnostics = registry.check(&migrations, &other_files, &config);
+        let diagnostics = registry.check(&migrations, &migration_paths, &other_files, &config);
 
         // R008 still fires because the directive targets a different rule.
         assert_eq!(diagnostics.len(), 1);
@@ -644,6 +665,44 @@ class Migration(migrations.Migration):
             saw_uppercase |= created.contains("PRODUCT");
         });
         assert!(saw_lowercase && saw_titlecase && saw_uppercase);
+    }
+
+    #[test]
+    fn walk_with_created_models_tracks_renames() {
+        let migration = extract(
+            r#"
+from django.db import migrations, models
+
+class Migration(migrations.Migration):
+    operations = [
+        migrations.CreateModel(
+            name='Product',
+            fields=[('id', models.BigAutoField(primary_key=True))],
+        ),
+        migrations.RenameModel(old_name='Product', new_name='Item'),
+        migrations.AddIndex(
+            model_name='item',
+            index=models.Index(fields=['name'], name='item_name_idx'),
+        ),
+    ]
+"#,
+        );
+        let mut state = Vec::new();
+        walk_with_created_models(&migration, |op, created| {
+            state.push((
+                op.op_type,
+                created.contains("product"),
+                created.contains("item"),
+            ));
+        });
+        assert_eq!(
+            state,
+            [
+                (OperationType::CreateModel, true, false),
+                (OperationType::RenameModel, false, true),
+                (OperationType::AddIndex, false, true),
+            ]
+        );
     }
 
     #[test]

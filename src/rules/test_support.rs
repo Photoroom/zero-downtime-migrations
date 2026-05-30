@@ -42,5 +42,6 @@ pub(crate) fn check_changeset_rule<R: ChangesetRule>(
     other_files: &[&Path],
     config: &Config,
 ) -> Vec<Diagnostic> {
-    rule.check(migrations, other_files, config)
+    let migration_paths: Vec<&Path> = migrations.iter().map(|m| m.path.as_path()).collect();
+    rule.check(migrations, &migration_paths, other_files, config)
 }

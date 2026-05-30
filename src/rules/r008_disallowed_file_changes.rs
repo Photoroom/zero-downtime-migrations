@@ -36,14 +36,15 @@ impl ChangesetRule for R008DisallowedFileChanges {
 
     fn check(
         &self,
-        migrations: &[&Migration],
+        _migrations: &[&Migration],
+        changed_migration_paths: &[&Path],
         other_changed_files: &[&Path],
         config: &Config,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
         // If no migrations are changed, nothing to check
-        if migrations.is_empty() {
+        if changed_migration_paths.is_empty() {
             return diagnostics;
         }
 

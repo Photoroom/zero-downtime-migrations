@@ -35,6 +35,7 @@ impl ChangesetRule for R009SeparateDbStateSamePr {
     fn check(
         &self,
         migrations: &[&Migration],
+        _changed_migration_paths: &[&Path],
         _other_changed_files: &[&Path],
         _config: &Config,
     ) -> Vec<Diagnostic> {
@@ -303,9 +304,10 @@ class Migration(migrations.Migration):
     }
 
     fn run(migrations: &[&Migration]) -> Vec<Diagnostic> {
+        let migration_paths: Vec<&Path> = migrations.iter().map(|m| m.path.as_path()).collect();
         let other_files: Vec<&Path> = vec![];
         let config = Config::default();
-        R009SeparateDbStateSamePr.check(migrations, &other_files, &config)
+        R009SeparateDbStateSamePr.check(migrations, &migration_paths, &other_files, &config)
     }
 
     #[test]
