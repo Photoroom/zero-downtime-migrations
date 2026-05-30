@@ -14,3 +14,15 @@ pub enum Severity {
     /// An error that blocks CI (exit code 1).
     Error,
 }
+
+impl Severity {
+    /// The lowercase label used in human and JSON output
+    /// (`"error"` / `"warning"`). Avoids leaking the `Debug`
+    /// representation into user-facing text.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        }
+    }
+}

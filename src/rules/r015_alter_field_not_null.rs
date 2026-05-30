@@ -62,48 +62,30 @@ impl Rule for R015AlterFieldNotNull {
         let mut diagnostics = Vec::new();
 
         for op in migration.database_effective_operations_of_type(OperationType::AlterField) {
-            if let OperationData::Field(data) = &op.data {
-                if let Some(ref field) = data.field {
-                    if !field.is_nullable {
-                        diagnostics.push(Diagnostic {
-                            rule_id: self.id(),
-                            rule_name: self.name(),
-                            message: format!(
-                                "AlterField '{}' results in a NOT NULL column \
-                                 (may require a full table scan)",
-                                data.field_name
-                            ),
-                            severity: self.severity(),
-                            path: ctx.path.to_path_buf(),
-                            span: op.span,
-                            help: Some(
-                                "If the column was already NOT NULL (e.g. you're only \
-                                 changing max_length or help_text), this is safe — add \
-                                 `# zdm: ignore R015` to suppress.\n\n\
-                                 If this is a genuine nullable → NOT NULL transition, use \
-                                 the four-step pattern. Pick a stable constraint name like \
-                                 `<table>_<col>_not_null` so step 4 can DROP it precisely \
-                                 (PostgreSQL ALTER TABLE ADD CONSTRAINT has no IF NOT EXISTS, \
-                                 so partially-applied migrations need to be cleaned up before \
-                                 re-running):\n  \
-                                 1. ALTER TABLE ... ADD CONSTRAINT <table>_<col>_not_null \
-                                 CHECK (col IS NOT NULL) NOT VALID;\n  \
-                                 2. ALTER TABLE ... VALIDATE CONSTRAINT <table>_<col>_not_null;  \
-                                 -- table-scan without blocking writes\n  \
-                                 3. ALTER TABLE ... ALTER COLUMN col SET NOT NULL;  \
-                                 -- PostgreSQL 12+: catalog-only, no scan, because the validated CHECK proves no NULLs. \
-                                 On 11 and earlier, SET NOT NULL still scans the table, weakening (but not eliminating) \
-                                 the benefit: VALIDATE in step 2 still runs under SHARE UPDATE EXCLUSIVE, allowing \
-                                 concurrent reads and writes; only the final SET NOT NULL takes the blocking lock.\n  \
-                                 4. ALTER TABLE ... DROP CONSTRAINT <table>_<col>_not_null;  \
-                                 -- recommended cleanup; the CHECK is subsumed by NOT NULL, \
-                                 but keeping both forces every INSERT to re-evaluate the predicate"
-                                    .to_string(),
-                            ),
-                        });
-                    }
-                }
+            let OperationData::Field(data) = &op.data else {
+                continue;
+            };
+            let Some(field) = &data.field else {
+                continue;
+            };
+            if field.is_nullable {
+                continue;
             }
+            diagnostics.push(
+                Diagnostic::new(
+                    self.id(),
+                    self.name(),
+                    self.severity(),
+                    format!(
+                        "AlterField '{}' results in a NOT NULL column \
+                         (may require a full table scan)",
+                        data.field_name
+                    ),
+                    ctx.path.to_path_buf(),
+                    op.span,
+                )
+                .with_help(include_str!("help/r015_alter_field_not_null.txt")),
+            );
         }
 
         diagnostics

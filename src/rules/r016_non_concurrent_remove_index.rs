@@ -6,7 +6,7 @@
 //! which blocks reads and writes — fine on an empty table but a
 //! real outage on a live one.
 
-use crate::ast::{Migration, OperationData, OperationType};
+use crate::ast::{Migration, OperationType};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::rules::{walk_with_created_models, Rule, RuleContext};
 
@@ -37,28 +37,26 @@ impl Rule for R016NonConcurrentRemoveIndex {
             if op.op_type != OperationType::RemoveIndex {
                 return;
             }
-            if let OperationData::Index(idx) = &op.data {
-                if created.contains(&idx.model_name) {
-                    return;
-                }
+            if op.model_name().is_some_and(|m| created.contains(m)) {
+                return;
             }
 
-            diagnostics.push(Diagnostic {
-                rule_id: self.id(),
-                rule_name: self.name(),
-                message: "Use RemoveIndexConcurrently instead of RemoveIndex to avoid table locks"
-                    .to_string(),
-                severity: self.severity(),
-                path: ctx.path.to_path_buf(),
-                span: op.span,
-                help: Some(
+            diagnostics.push(
+                Diagnostic::new(
+                    self.id(),
+                    self.name(),
+                    self.severity(),
+                    "Use RemoveIndexConcurrently instead of RemoveIndex to avoid table locks",
+                    ctx.path.to_path_buf(),
+                    op.span,
+                )
+                .with_help(
                     "Replace migrations.RemoveIndex with RemoveIndexConcurrently from \
                      django.contrib.postgres.operations. The concurrent form takes \
                      SHARE UPDATE EXCLUSIVE instead of ACCESS EXCLUSIVE and must run \
-                     outside a transaction (`atomic = False`)."
-                        .to_string(),
+                     outside a transaction (`atomic = False`).",
                 ),
-            });
+            );
         });
 
         diagnostics
@@ -110,6 +108,24 @@ class Migration(migrations.Migration):
         assert_eq!(diagnostics[0].rule_id, "R016");
     }
 
+    const REMOVE_INDEX_POSITIONAL_BAD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RemoveIndex('product', 'product_name_idx'),
+    ]
+"#;
+
+    #[test]
+    fn test_remove_index_positional_bad() {
+        let diagnostics = check_migration(REMOVE_INDEX_POSITIONAL_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R016");
+    }
+
     #[test]
     fn test_remove_index_concurrent_good() {
         let diagnostics = check_migration(REMOVE_INDEX_CONCURRENT_GOOD);
@@ -147,6 +163,34 @@ class Migration(migrations.Migration):
         assert!(
             diagnostics.is_empty(),
             "expected no diagnostics, got: {diagnostics:?}",
+        );
+    }
+
+    const POSITIONAL_REMOVE_INDEX_ON_FRESH_MODEL_GOOD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.CreateModel(
+            name='Product',
+            fields=[
+                ('id', models.BigAutoField(primary_key=True)),
+                ('name', models.CharField(max_length=255)),
+            ],
+            options={'indexes': [models.Index(fields=['name'], name='product_name_idx')]},
+        ),
+        migrations.RemoveIndex('product', 'product_name_idx'),
+    ]
+"#;
+
+    #[test]
+    fn test_positional_remove_index_on_fresh_model_is_exempt() {
+        let diagnostics = check_migration(POSITIONAL_REMOVE_INDEX_ON_FRESH_MODEL_GOOD);
+        assert!(
+            diagnostics.is_empty(),
+            "positional RemoveIndex on a fresh model should not fire R016, got: {diagnostics:?}",
         );
     }
 

@@ -72,15 +72,17 @@ impl Rule for R017NonConcurrentAddConstraint {
                 _ => return,
             };
 
-            diagnostics.push(Diagnostic {
-                rule_id: self.id(),
-                rule_name: self.name(),
-                message,
-                severity: self.severity(),
-                path: ctx.path.to_path_buf(),
-                span: op.span,
-                help: Some(help),
-            });
+            diagnostics.push(
+                Diagnostic::new(
+                    self.id(),
+                    self.name(),
+                    self.severity(),
+                    message,
+                    ctx.path.to_path_buf(),
+                    op.span,
+                )
+                .with_help(help),
+            );
         });
 
         diagnostics
@@ -182,11 +184,8 @@ class Migration(migrations.Migration):
 
     #[test]
     fn test_exclusion_constraint_bad() {
-        // The previous test asserted no diagnostic with the comment
-        // "Exclusion constraints don't require full table validation".
-        // That's wrong: ExclusionConstraint builds its enforcement
-        // index non-concurrently, which holds an ACCESS EXCLUSIVE lock
-        // for the duration of the build. R017 must flag it.
+        // ExclusionConstraint builds its enforcement index non-concurrently,
+        // holding an ACCESS EXCLUSIVE lock for the build, so R017 must flag it.
         let diagnostics = check_migration(EXCLUSION_CONSTRAINT_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R017");
@@ -239,10 +238,7 @@ class Migration(migrations.Migration):
     #[test]
     fn test_addconstraint_before_createmodel_is_not_exempted() {
         // Order-aware exemption: a CreateModel that runs *after* the
-        // AddConstraint cannot retroactively make the AddConstraint
-        // safe. The previous `is_model_created` lookup was
-        // order-blind and silently exempted this — the same false
-        // negative R002 and R016 fixed earlier in this PR.
+        // AddConstraint cannot retroactively make the AddConstraint safe.
         let diagnostics = check_migration(ADDCONSTRAINT_BEFORE_CREATEMODEL_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R017");
@@ -272,6 +268,83 @@ class Migration(migrations.Migration):
     #[test]
     fn test_wrapped_database_check_constraint_is_flagged() {
         let diagnostics = check_migration(WRAPPED_CHECK_CONSTRAINT_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R017");
+    }
+
+    const NESTED_SDAS_CHECK_CONSTRAINT_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.SeparateDatabaseAndState(
+                    database_operations=[
+                        migrations.AddConstraint(
+                            model_name='product',
+                            constraint=models.CheckConstraint(
+                                check=models.Q(price__gte=0),
+                                name='positive_price',
+                            ),
+                        ),
+                    ],
+                ),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_nested_sdas_database_check_constraint_is_flagged() {
+        let diagnostics = check_migration(NESTED_SDAS_CHECK_CONSTRAINT_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R017");
+    }
+
+    const CUSTOM_CONSTRAINT_NAME_CONTAINS_CHECK_GOOD: &str = r#"
+from django.db import migrations
+
+
+class MyCheckConstraintLikeThing:
+    pass
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddConstraint(
+            model_name='product',
+            constraint=MyCheckConstraintLikeThing(),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_custom_constraint_with_check_in_name_is_not_classified() {
+        let diagnostics = check_migration(CUSTOM_CONSTRAINT_NAME_CONTAINS_CHECK_GOOD);
+        assert!(diagnostics.is_empty(), "got: {diagnostics:?}");
+    }
+
+    const POSITIONAL_CHECK_CONSTRAINT_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddConstraint(
+            'product',
+            models.CheckConstraint(check=models.Q(price__gte=0), name='positive_price'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_positional_check_constraint_warns() {
+        let diagnostics = check_migration(POSITIONAL_CHECK_CONSTRAINT_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R017");
     }

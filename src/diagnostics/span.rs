@@ -2,10 +2,13 @@
 
 use std::ops::Range;
 
-/// A span representing a range in source code.
+/// A span representing a range in source code, used to highlight the
+/// exact location of an issue in the migration file.
 ///
-/// Spans are used to highlight the exact location of an issue
-/// in the migration file.
+/// Note the mixed convention: lines are 1-indexed, columns are 0-indexed
+/// (inherited from tree-sitter). `#[non_exhaustive]` for forward-compat
+/// with the other diagnostic types — consumers receive `Span`s rather
+/// than constructing them, so build via [`Span::new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct Span {
@@ -66,16 +69,6 @@ impl Span {
     /// Returns true if this span is on a single line.
     pub fn is_single_line(&self) -> bool {
         self.start_line == self.end_line
-    }
-
-    /// Returns the length in bytes.
-    pub fn len(&self) -> usize {
-        self.end - self.start
-    }
-
-    /// Returns true if the span is empty.
-    pub fn is_empty(&self) -> bool {
-        self.start == self.end
     }
 }
 

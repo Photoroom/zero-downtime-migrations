@@ -33,27 +33,24 @@ impl Rule for R005RemoveFieldWithoutSeparate {
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        // Note: We only extract top-level operations. If a RemoveField is properly
-        // wrapped inside SeparateDatabaseAndState, it won't be extracted as a
-        // separate operation. Therefore, any RemoveField we see here is NOT wrapped
-        // and should be flagged.
-
+        // Top-level only: a RemoveField correctly wrapped in
+        // SeparateDatabaseAndState is the safe pattern and must not be flagged.
         for op in migration.top_level_operations_of_type(OperationType::RemoveField) {
-            diagnostics.push(Diagnostic {
-                rule_id: self.id(),
-                rule_name: self.name(),
-                message: "RemoveField without SeparateDatabaseAndState can cause errors"
-                    .to_string(),
-                severity: self.severity(),
-                path: ctx.path.to_path_buf(),
-                span: op.span,
-                help: Some(
+            diagnostics.push(
+                Diagnostic::new(
+                    self.id(),
+                    self.name(),
+                    self.severity(),
+                    "RemoveField without SeparateDatabaseAndState can cause errors",
+                    ctx.path.to_path_buf(),
+                    op.span,
+                )
+                .with_help(
                     "Wrap RemoveField in SeparateDatabaseAndState. First migration removes \
                      from state (state_operations), deploy the app, then second migration \
-                     drops the column (database_operations)."
-                        .to_string(),
+                     drops the column (database_operations).",
                 ),
-            });
+            );
         }
 
         diagnostics

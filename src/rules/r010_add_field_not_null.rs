@@ -45,22 +45,23 @@ impl Rule for R010AddFieldNotNull {
                 return;
             }
 
-            diagnostics.push(Diagnostic {
-                rule_id: self.id(),
-                rule_name: self.name(),
-                message: format!(
-                    "AddField '{}' is NOT NULL without a default value",
-                    data.field_name
-                ),
-                severity: self.severity(),
-                path: ctx.path.to_path_buf(),
-                span: op.span,
-                help: Some(
+            diagnostics.push(
+                Diagnostic::new(
+                    self.id(),
+                    self.name(),
+                    self.severity(),
+                    format!(
+                        "AddField '{}' is NOT NULL without a default value",
+                        data.field_name
+                    ),
+                    ctx.path.to_path_buf(),
+                    op.span,
+                )
+                .with_help(
                     "Either: 1) Add the field as nullable with null=True, backfill, then \
-                     remove null=True in a separate migration, or 2) Provide a default value"
-                        .to_string(),
+                     remove null=True in a separate migration, or 2) Provide a default value",
                 ),
-            });
+            );
         });
 
         diagnostics
@@ -152,6 +153,51 @@ class Migration(migrations.Migration):
         assert!(diagnostics.is_empty());
     }
 
+    const DEFAULT_NONE_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddField(
+            model_name='product',
+            name='status',
+            field=models.CharField(max_length=50, default=None),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_default_none_does_not_count_as_default() {
+        let diagnostics = check_migration(DEFAULT_NONE_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R010");
+    }
+
+    const NOT_PROVIDED_DEFAULT_BAD: &str = r#"
+from django.db import migrations, models
+from django.db.models import NOT_PROVIDED
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddField(
+            'product',
+            'status',
+            models.CharField(max_length=50, default=NOT_PROVIDED),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_positional_addfield_with_not_provided_default_is_flagged() {
+        let diagnostics = check_migration(NOT_PROVIDED_DEFAULT_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R010");
+    }
+
     #[test]
     fn test_nullable_good() {
         let diagnostics = check_migration(NULLABLE_GOOD);
@@ -187,11 +233,6 @@ class Migration(migrations.Migration):
     fn test_addfield_before_createmodel_is_not_exempted() {
         // Order-aware exemption: a CreateModel that runs *after*
         // the AddField cannot retroactively make the AddField safe.
-        // The previous `is_model_created` lookup was order-blind
-        // and silently exempted this — the same false negative
-        // R002/R006/R016/R017 fixed earlier in this PR. The README
-        // even claimed R010 honoured the CreateModel exemption but
-        // the implementation was order-blind.
         let diagnostics = check_migration(ADDFIELD_BEFORE_CREATEMODEL_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R010");
