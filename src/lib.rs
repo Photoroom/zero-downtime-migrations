@@ -8,6 +8,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod discovery;
 pub mod error;
+mod file_io;
 pub mod git;
 pub mod parser;
 pub mod rules;

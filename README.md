@@ -63,6 +63,11 @@ zdm --list-rules
 zdm --warnings-as-errors .
 ```
 
+`--diff` compares the merge base to `HEAD` and reads file contents from the
+`HEAD` tree, giving deterministic PR/CI results even when the worktree is
+dirty. `--diff-staged` compares the same merge base to the index and reads the
+staged blobs.
+
 ### Exit Codes
 
 - `0` — no issues found
@@ -118,7 +123,7 @@ test suite — every field above is guaranteed on every diagnostic.
 
 ### CreateModel Exemption
 
-Several rules (R001, R002, R006, R010, R016, R017) automatically exempt operations that target models created in the same migration. This is because operations on newly created (empty) tables don't cause the locking issues these rules detect. The exemption is order-aware — a `CreateModel` that runs *after* the flagged op cannot retroactively exempt it.
+Several rules (R001, R002, R006, R010, R016, R017) automatically exempt operations that target models created in the same migration. This is because operations on newly created (empty) tables don't cause the locking issues these rules detect. The exemption is order-aware—a `CreateModel` that runs *after* the flagged op cannot retroactively exempt it—and follows `RenameModel` when the fresh table is renamed before a later operation.
 
 > **Note:** R007 (`fk-without-concurrent-index`) was merged into R006 and retired. R006 now takes the conservative stance that a prebuilt concurrent index does not make a one-step `AddField(ForeignKey)` safe on an existing table. Split the rollout instead of relying on an index exemption.
 
@@ -185,44 +190,72 @@ Settings are applied in this order (highest to lowest priority):
 3. **`pyproject.toml`** `[tool.zdm]` section in the same directory
 4. **Default values**
 
-The config search starts in the current working directory. If zdm is running inside a trusted git repository, it walks upward within that repository and stops at the first directory that contains `zero-downtime-migrations.toml` or a `pyproject.toml` with `[tool.zdm]`. A pyproject for another tool is ignored, so running `zdm` from `repo/apps/myapp/migrations/` still picks up `repo/zero-downtime-migrations.toml`. Without a `.git` ancestor, only the current directory is checked; parent configs in shared build or temp directories are intentionally ignored.
+The config search starts in the current working directory. On Unix, if zdm is running inside a trusted git repository, it walks upward within that repository and stops at the first directory that contains `zero-downtime-migrations.toml` or a `pyproject.toml` with `[tool.zdm]`. The nearest `.git` is always the boundary; an untrusted boundary never falls through to an outer repository. A pyproject for another tool is ignored, so running `zdm` from `repo/apps/myapp/migrations/` still picks up `repo/zero-downtime-migrations.toml`. Without a trusted `.git` ancestor—and on Windows, where zdm cannot yet validate repository ACL ownership—only the current directory is checked. Config inputs must be regular UTF-8 files no larger than 1 MiB.
 
 CLI flags always override config file settings. If both `zero-downtime-migrations.toml` and `pyproject.toml` exist in the same directory, the standalone file takes precedence; multi-level merging is not performed.
 
 ## Pre-commit Integration
 
-Add to your `.pre-commit-config.yaml`:
+Install `zdm` in the environment where pre-commit runs, then call that installed
+binary from your `.pre-commit-config.yaml`:
 
 ```yaml
 repos:
-  - repo: https://github.com/Photoroom/zero-downtime-migrations
-    rev: <latest release tag>
+  - repo: local
     hooks:
       - id: zdm
+        name: zdm
+        entry: zdm
+        language: system
+        types: [python]
+        files: .*/migrations/.*\.py$
+        exclude: __init__\.py$
 ```
 
 Or use diff mode to only check changed migrations:
 
 ```yaml
 repos:
-  - repo: https://github.com/Photoroom/zero-downtime-migrations
-    rev: <latest release tag>
+  - repo: local
     hooks:
       - id: zdm-diff
+        name: zdm diff
+        entry: zdm --diff-staged origin/main
+        language: system
+        pass_filenames: false
+        always_run: true
 ```
 
 The `zdm-diff` hook uses `--diff-staged` so it checks the staged index that
 pre-commit is validating, rather than the previous `HEAD` commit.
 
+The repository also publishes source-based pre-commit hooks for users who prefer
+`repo: https://github.com/Photoroom/zero-downtime-migrations` with
+`rev: <latest release tag>`. Those hooks install the package from source, so
+Rust must be available in the pre-commit environment.
+
 ## GitHub Actions
 
 ```yaml
+- uses: actions/checkout@v4
+  with:
+    # --diff needs the base ref and enough history to compute a merge base.
+    fetch-depth: 0
+
 - name: Install zdm
   run: pip install django-zdm
 
 - name: Lint migrations
   run: zdm --diff origin/main
 ```
+
+## Rust library API
+
+The Rust crate exposes a small programmatic API, but it remains experimental
+while the project is in the 0.x series. Prefer `Migration::from_path` or
+`Migration::from_source`, `Config`, and the built-in rule registries. Low-level
+parser, extractor, diagnostic-construction, discovery, and git helpers may
+change between minor 0.x releases.
 
 ## Comparison with Other Tools
 
