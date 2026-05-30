@@ -19,11 +19,7 @@ use crate::error::{Error, Result};
 
 /// Status of a file in the git diff.
 ///
-/// `#[non_exhaustive]`: libgit2 distinguishes Copied,
-/// Typechange, Unmodified, etc.; we surface only the four we
-/// currently act on, and reserve room to surface more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum FileStatus {
     Added,
     Modified,
@@ -84,7 +80,7 @@ impl GitRepo {
             .ok_or_else(|| Error::git_error_msg("Repository has no working directory (bare repo)"))
     }
 
-    /// Get files changed between a reference and HEAD.
+    /// Get files changed between a reference's merge-base with HEAD and HEAD.
     ///
     /// The reference can be:
     /// - A branch name (e.g., "main", "origin/main")
@@ -92,33 +88,41 @@ impl GitRepo {
     /// - A commit SHA (e.g., "abc123")
     /// - A relative reference (e.g., "HEAD~1", "HEAD^")
     pub fn changed_files(&self, base_ref: &str) -> Result<Vec<ChangedFile>> {
-        let base_tree = self.tree_at(base_ref)?;
-        let head_tree = self.head_tree()?;
-        let mut diff_opts = DiffOptions::new();
-        diff_opts.include_untracked(false);
-        let diff = self
-            .repo
-            .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut diff_opts))
-            .map_err(|e| Error::git_error_msg(format!("Failed to compute diff: {}", e)))?;
-        collect_changed_files(&diff)
+        self.diff_for_source(base_ref, DiffSource::Head)
     }
 
-    /// Get staged files changed between a reference and the git index.
+    /// Get staged files changed between a reference's merge-base with HEAD and the git index.
     ///
     /// This is intended for pre-commit hooks, where HEAD still points at the
     /// previous commit and the commit being checked exists only in the index.
     pub fn changed_staged_files(&self, base_ref: &str) -> Result<Vec<ChangedFile>> {
-        let base_tree = self.tree_at(base_ref)?;
-        let index = self
-            .repo
-            .index()
-            .map_err(|e| Error::git_error_msg(format!("Failed to read git index: {}", e)))?;
+        self.diff_for_source(base_ref, DiffSource::Index)
+    }
+
+    /// Compute the changed files between `base_ref`'s merge-base with HEAD and
+    /// either HEAD (`DiffSource::Head`) or the index (`DiffSource::Index`).
+    fn diff_for_source(&self, base_ref: &str, source: DiffSource) -> Result<Vec<ChangedFile>> {
+        let base_tree = self.merge_base_tree(base_ref)?;
         let mut diff_opts = DiffOptions::new();
         diff_opts.include_untracked(false);
-        let diff = self
-            .repo
-            .diff_tree_to_index(Some(&base_tree), Some(&index), Some(&mut diff_opts))
-            .map_err(|e| Error::git_error_msg(format!("Failed to compute staged diff: {}", e)))?;
+        let diff = match source {
+            DiffSource::Head => {
+                let head_tree = self.head_tree()?;
+                self.repo.diff_tree_to_tree(
+                    Some(&base_tree),
+                    Some(&head_tree),
+                    Some(&mut diff_opts),
+                )
+            }
+            DiffSource::Index => {
+                let index = self.repo.index().map_err(|e| {
+                    Error::git_error_msg(format!("Failed to read git index: {}", e))
+                })?;
+                self.repo
+                    .diff_tree_to_index(Some(&base_tree), Some(&index), Some(&mut diff_opts))
+            }
+        }
+        .map_err(|e| Error::git_error_msg(format!("Failed to compute diff: {}", e)))?;
         collect_changed_files(&diff)
     }
 
@@ -127,7 +131,7 @@ impl GitRepo {
     /// clone or fork checkout), returns `Error::InvalidGitReference` so
     /// the CLI can surface a targeted message; other libgit2 failures
     /// fall through as generic `GitError`s.
-    fn tree_at(&self, base_ref: &str) -> Result<git2::Tree<'_>> {
+    fn commit_at(&self, base_ref: &str) -> Result<git2::Commit<'_>> {
         let base_obj = self.repo.revparse_single(base_ref).map_err(|e| {
             // libgit2's NotFound also fires for things like `HEAD~999`
             // (commit out of range) or revspecs whose intermediate
@@ -142,26 +146,47 @@ impl GitRepo {
                 Error::git_error_msg(format!("Failed to resolve reference '{}': {}", base_ref, e))
             }
         })?;
-        let base_commit = base_obj.peel_to_commit().map_err(|e| {
+        base_obj.peel_to_commit().map_err(|e| {
             Error::git_error_msg(format!(
                 "Reference '{}' does not point to a commit: {}",
                 base_ref, e
             ))
-        })?;
-        base_commit
-            .tree()
-            .map_err(|e| Error::git_error_msg(format!("Failed to get tree for base commit: {}", e)))
+        })
     }
 
-    /// Get the tree at HEAD.
-    fn head_tree(&self) -> Result<git2::Tree<'_>> {
+    fn merge_base_tree(&self, base_ref: &str) -> Result<git2::Tree<'_>> {
+        let base_commit = self.commit_at(base_ref)?;
+        let head_commit = self.head_commit()?;
+        let merge_base = self
+            .repo
+            .merge_base(base_commit.id(), head_commit.id())
+            .map_err(|e| {
+                Error::git_error_msg(format!(
+                    "Failed to find merge-base for '{}' and HEAD: {}",
+                    base_ref, e
+                ))
+            })?;
+        let commit = self.repo.find_commit(merge_base).map_err(|e| {
+            Error::git_error_msg(format!("Failed to find merge-base commit: {}", e))
+        })?;
+        commit.tree().map_err(|e| {
+            Error::git_error_msg(format!("Failed to get tree for merge-base commit: {}", e))
+        })
+    }
+
+    fn head_commit(&self) -> Result<git2::Commit<'_>> {
         let head_ref = self
             .repo
             .head()
             .map_err(|e| Error::git_error_msg(format!("Failed to get HEAD: {}", e)))?;
-        let head_commit = head_ref
+        head_ref
             .peel_to_commit()
-            .map_err(|e| Error::git_error_msg(format!("Failed to get HEAD commit: {}", e)))?;
+            .map_err(|e| Error::git_error_msg(format!("Failed to get HEAD commit: {}", e)))
+    }
+
+    /// Get the tree at HEAD.
+    fn head_tree(&self) -> Result<git2::Tree<'_>> {
+        let head_commit = self.head_commit()?;
         head_commit
             .tree()
             .map_err(|e| Error::git_error_msg(format!("Failed to get tree for HEAD: {}", e)))
@@ -170,13 +195,11 @@ impl GitRepo {
     /// Read the staged contents of a file from the git index.
     ///
     /// `path` may be absolute (inside the repo root) or already
-    /// repo-relative. The function does not touch the filesystem to
-    /// resolve `path` — earlier code called `path.canonicalize()` to cope
-    /// with macOS-style `/tmp` ↔ `/private/tmp` aliases, but that
-    /// required `path` to exist on disk, which is wrong for a function
-    /// whose purpose is to read content that may exist only in the
-    /// index. The size cap from `parser::check_size` is applied against
-    /// the staged blob's object size before its content bytes are read.
+    /// repo-relative. Absolute paths under the repo root are stripped without
+    /// touching the worktree; an absolute path that only matches after
+    /// canonicalization may still require filesystem access to resolve path
+    /// aliases. The size cap from `parser::check_size` is applied against the
+    /// staged blob's object size before its content bytes are read.
     pub fn read_staged_file(&self, path: &Path) -> Result<String> {
         let root = self.root()?;
         let relative_path: PathBuf = if path.is_absolute() {
@@ -224,11 +247,25 @@ impl GitRepo {
                 relative_path.display()
             )));
         }
+        let odb = self.repo.odb().map_err(|e| {
+            Error::git_error_msg(format!("Failed to open git object database: {}", e))
+        })?;
+        let (blob_size, object_type) = odb.read_header(entry.id).map_err(|e| {
+            Error::git_error_msg(format!("Failed to read staged file header: {}", e))
+        })?;
+        if object_type != git2::ObjectType::Blob {
+            return Err(Error::git_error_msg(format!(
+                "Refusing to read non-blob staged object '{}' for '{}'",
+                entry.id,
+                relative_path.display()
+            )));
+        }
+        crate::parser::check_size(path, blob_size as u64)?;
+
         let blob = self
             .repo
             .find_blob(entry.id)
             .map_err(|e| Error::git_error_msg(format!("Failed to read staged file: {}", e)))?;
-        crate::parser::check_size(path, blob.size() as u64)?;
 
         std::str::from_utf8(blob.content())
             .map(|s| s.to_string())
@@ -241,44 +278,32 @@ impl GitRepo {
             })
     }
 
-    /// Project the diff against `base_ref` into absolute file
-    /// paths under the repo root, filtered by `source` (HEAD vs
-    /// index) and `kind` (migrations vs non-migrations). The
-    /// four call sites in `main.rs` cover every (source, kind)
-    /// combination, so the previous four wrapper methods
-    /// (`changed_migration_paths`, `changed_staged_migration_paths`,
-    /// etc.) collapsed into this single entry point.
+    /// Project the diff against `base_ref` into absolute file paths under the
+    /// repo root, filtered by `source` (HEAD vs index) and `kind` (migrations
+    /// vs non-migrations).
     pub fn changed_paths(
         &self,
         base_ref: &str,
         source: DiffSource,
         kind: ChangedKind,
     ) -> Result<Vec<PathBuf>> {
-        let files = match source {
-            DiffSource::Head => self.changed_files(base_ref)?,
-            DiffSource::Index => self.changed_staged_files(base_ref)?,
-        };
+        let files = self.diff_for_source(base_ref, source)?;
         self.paths_from(files, kind)
     }
 
-    /// Compatibility shim for callers that want changed migration files in HEAD.
-    pub fn changed_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
-        self.changed_paths(base_ref, DiffSource::Head, ChangedKind::Migrations)
-    }
-
-    /// Compatibility shim for callers that want changed migration files in the index.
-    pub fn changed_staged_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
-        self.changed_paths(base_ref, DiffSource::Index, ChangedKind::Migrations)
-    }
-
-    /// Compatibility shim for callers that want changed non-migration files in HEAD.
-    pub fn changed_non_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
-        self.changed_paths(base_ref, DiffSource::Head, ChangedKind::NonMigrations)
-    }
-
-    /// Compatibility shim for callers that want changed non-migration files in the index.
-    pub fn changed_staged_non_migration_paths(&self, base_ref: &str) -> Result<Vec<PathBuf>> {
-        self.changed_paths(base_ref, DiffSource::Index, ChangedKind::NonMigrations)
+    /// Return absolute paths for any migration file touched by the diff,
+    /// including deleted files and files renamed out of a migrations directory.
+    pub fn changed_migration_touches(
+        &self,
+        base_ref: &str,
+        source: DiffSource,
+    ) -> Result<Vec<PathBuf>> {
+        let root = self.root()?;
+        let files = self.diff_for_source(base_ref, source)?;
+        Ok(files
+            .into_iter()
+            .filter_map(|file| migration_path_for_change(&file).map(|path| root.join(path)))
+            .collect())
     }
 
     /// Project a list of `ChangedFile`s into absolute paths, filtering
@@ -296,10 +321,17 @@ impl GitRepo {
     }
 }
 
-/// Iterate a `git2::Diff` and project each `DiffDelta` into a
-/// `ChangedFile`. Used by both `changed_files` (tree-to-tree) and
-/// `changed_staged_files` (tree-to-index); the two paths only differ in
-/// how they produced the diff.
+fn migration_path_for_change(file: &ChangedFile) -> Option<&Path> {
+    if is_migration_file(&file.path) {
+        Some(&file.path)
+    } else {
+        file.old_path
+            .as_deref()
+            .filter(|path| is_migration_file(path))
+    }
+}
+
+/// Iterate a `git2::Diff` and project each `DiffDelta` into a `ChangedFile`.
 fn collect_changed_files(diff: &git2::Diff<'_>) -> Result<Vec<ChangedFile>> {
     let mut files = Vec::new();
     diff.foreach(
@@ -308,6 +340,7 @@ fn collect_changed_files(diff: &git2::Diff<'_>) -> Result<Vec<ChangedFile>> {
                 git2::Delta::Added => FileStatus::Added,
                 git2::Delta::Deleted => FileStatus::Deleted,
                 git2::Delta::Modified => FileStatus::Modified,
+                git2::Delta::Typechange => FileStatus::Modified,
                 git2::Delta::Renamed => FileStatus::Renamed,
                 git2::Delta::Copied => FileStatus::Added,
                 _ => return true,
@@ -771,6 +804,93 @@ mod tests {
             .expect("expected master or main to exist as the initial branch");
         assert_eq!(base.len(), 1);
         assert_eq!(base[0].path, PathBuf::from("feature.py"));
+    }
+
+    #[test]
+    fn test_diff_against_diverged_branch_uses_merge_base() {
+        let (temp, repo) = create_test_repo();
+        let root = repo.root().unwrap();
+
+        fs::write(root.join("README.md"), "initial").unwrap();
+        commit(&temp, "Initial");
+        Command::new("git")
+            .args(["branch", "origin/main"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join("feature.py"), "feature code").unwrap();
+        commit(&temp, "Feature commit");
+
+        Command::new("git")
+            .args(["checkout", "origin/main"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join("main_only.py"), "base code").unwrap();
+        commit(&temp, "Base branch commit");
+        Command::new("git")
+            .args(["checkout", "feature"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let changed = repo.changed_files("origin/main").unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].path, PathBuf::from("feature.py"));
+    }
+
+    #[test]
+    fn test_staged_diff_against_diverged_branch_uses_merge_base() {
+        let (temp, repo) = create_test_repo();
+        let root = repo.root().unwrap();
+
+        fs::write(root.join("README.md"), "initial").unwrap();
+        commit(&temp, "Initial");
+        Command::new("git")
+            .args(["branch", "origin/main"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join("feature.py"), "feature code").unwrap();
+        commit(&temp, "Feature commit");
+
+        Command::new("git")
+            .args(["checkout", "origin/main"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join("main_only.py"), "base code").unwrap();
+        commit(&temp, "Base branch commit");
+
+        Command::new("git")
+            .args(["checkout", "feature"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join("staged.py"), "staged code").unwrap();
+        Command::new("git")
+            .args(["add", "staged.py"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let changed = repo.changed_staged_files("origin/main").unwrap();
+        let paths: HashSet<_> = changed.iter().map(|file| file.path.as_path()).collect();
+        assert!(paths.contains(Path::new("feature.py")));
+        assert!(paths.contains(Path::new("staged.py")));
+        assert!(!paths.contains(Path::new("main_only.py")));
     }
 
     #[test]

@@ -32,6 +32,10 @@ pub fn discover_migrations_with_exclude(
         })
         .collect::<Result<_>>()?;
 
+    // Resolve once and reuse: `is_excluded` consults it for every file against
+    // every pattern, so re-querying the OS per call would be wasteful.
+    let current_dir = std::env::current_dir().ok();
+
     for path in paths {
         // `path.is_file()` transparently follows symlinks, so an
         // explicitly-passed symlink to `/etc/passwd` or `/dev/zero`
@@ -40,11 +44,11 @@ pub fn discover_migrations_with_exclude(
         // (see `discover_in_directory` below); apply the same
         // policy here so the explicit-path branch matches.
         if is_regular_file(path) {
-            if is_migration_file(path) && !is_excluded(path, &patterns) {
+            if is_migration_file(path) && !is_excluded(path, &patterns, current_dir.as_deref()) {
                 migrations.push(path.clone());
             }
         } else if is_directory(path) {
-            discover_in_directory(path, &mut migrations, &patterns)?;
+            discover_in_directory(path, &mut migrations, &patterns, current_dir.as_deref())?;
         } else {
             return Err(Error::InvalidPath { path: path.clone() });
         }
@@ -75,10 +79,28 @@ fn is_directory(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Check if a path matches any of the exclude patterns.
-fn is_excluded(path: &Path, patterns: &[Pattern]) -> bool {
-    let path_str = path.to_string_lossy();
-    patterns.iter().any(|p| p.matches(&path_str))
+/// Check if a path matches any of the exclude patterns. `current_dir` is the
+/// process working directory (resolved once by the caller) used to also test a
+/// repo-relative form of `path`.
+fn is_excluded(path: &Path, patterns: &[Pattern], current_dir: Option<&Path>) -> bool {
+    let mut candidates = vec![slash_path(path)];
+    if let Ok(stripped) = path.strip_prefix(".") {
+        candidates.push(slash_path(stripped));
+    }
+    if let Some(stripped) = current_dir.and_then(|cwd| path.strip_prefix(cwd).ok()) {
+        candidates.push(slash_path(stripped));
+    }
+    candidates
+        .iter()
+        .any(|candidate| patterns.iter().any(|p| p.matches(candidate)))
+}
+
+/// Render a path with `/` separators regardless of platform, for glob matching.
+pub fn slash_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Recursively discover migration files in a directory.
@@ -86,6 +108,7 @@ fn discover_in_directory(
     dir: &Path,
     migrations: &mut Vec<PathBuf>,
     exclude_patterns: &[Pattern],
+    current_dir: Option<&Path>,
 ) -> Result<()> {
     // `follow_links(false)` stops WalkDir from traversing symlinks
     // during the walk, but each yielded entry's `path` could itself
@@ -101,7 +124,7 @@ fn discover_in_directory(
 
         if entry.file_type().is_file()
             && is_migration_file(path)
-            && !is_excluded(path, exclude_patterns)
+            && !is_excluded(path, exclude_patterns, current_dir)
         {
             migrations.push(path.to_path_buf());
         }

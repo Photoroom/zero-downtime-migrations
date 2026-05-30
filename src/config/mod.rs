@@ -43,11 +43,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// Create a new config with defaults.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Check if a rule is enabled.
     pub fn is_rule_enabled(&self, rule_id: &str) -> bool {
         // If select is empty, all rules are enabled by default
@@ -104,29 +99,10 @@ impl Config {
     /// Returns `None` if no config file is found within those
     /// bounds.
     fn find_config_dir(start: &Path) -> Result<Option<std::path::PathBuf>> {
-        // Four structural rules, in order:
-        //
-        //   (1) A config in `start` always wins — no walk-up needed.
-        //   (2) If `start` is itself the repo root (has its own
-        //       `.git`), we never climb. Otherwise a world-writable
-        //       `/tmp/zero-downtime-migrations.toml` next to a
-        //       temp-dir repo would be adopted as "the project
-        //       config". On Unix this case is also caught by
-        //       `anchor_dir_is_trusted`, but on Windows the trust
-        //       check is a no-op, so we need a structural guard
-        //       too.
-        //   (3) Otherwise, the walk-up only runs *inside* a
-        //       trusted git repository: there must be a `.git`-
-        //       bearing ancestor we own, strictly *above* `start`.
-        //       This authorises upward movement and pins its bounds.
-        //   (4) Walk upward from `start`, stopping at the first
-        //       directory that holds a config file, or at the
-        //       trusted anchor itself if no config is found before
-        //       reaching it.
-        //
-        // The trust check on the anchor is the security-critical
-        // piece — see `anchor_dir_is_trusted` for the world-
-        // writable `/tmp` threat model.
+        // Config in `start` wins; if `start` is itself the repo root we never
+        // climb (a structural guard that also covers Windows, where
+        // `anchor_dir_is_trusted` is a no-op); otherwise walk up only inside a
+        // trusted git repo, stopping at the first config found or at the anchor.
         if has_zdm_config_file(start)? {
             return Ok(Some(start.to_path_buf()));
         }
@@ -260,22 +236,11 @@ fn has_zdm_config_file(dir: &Path) -> Result<bool> {
     Config::load_pyproject(&pyproject_path).map(|config| config.is_some())
 }
 
-/// The closest directory *strictly above* `start` that holds a
-/// `.git` entry AND passes the trust check (see
-/// `anchor_dir_is_trusted`). `None` means the walk-up is not
-/// authorised — either we're not inside a git repo or the only
-/// `.git` we can see was planted by another user.
-///
-/// "Strictly above" is the important bit. If `start` itself holds
-/// `.git`, the function returns `None`: a config file next to a
-/// `.git`-bearing `start` was already handled by `find_config_dir`'s
-/// rule (1), so reaching this helper means we should not climb
-/// further. A world-writable `/tmp/zero-downtime-migrations.toml`
-/// next to a temp-dir repo would otherwise be adopted as "the
-/// project config" via `start.parent()`.
-///
-/// `.git` can be a directory (regular repo) or a file (worktree /
-/// submodule gitdir pointer); both forms count.
+/// The closest directory *strictly above* `start` that holds a `.git` entry
+/// AND passes [`anchor_dir_is_trusted`]. `None` means the walk-up is not
+/// authorised (not in a repo, or the only visible `.git` was planted by
+/// another user). `.git` may be a directory or a worktree/submodule pointer
+/// file; both count.
 fn trusted_git_anchor_strictly_above(start: &Path) -> Option<std::path::PathBuf> {
     let mut probe = start;
     while let Some(parent) = probe.parent() {
@@ -287,16 +252,11 @@ fn trusted_git_anchor_strictly_above(start: &Path) -> Option<std::path::PathBuf>
     None
 }
 
-/// On Unix: `true` iff `dir` exists and its owner uid matches the
-/// current effective uid. Used by `Config::find_config_dir` to
-/// reject a `.git` ancestor that an attacker could plant in a
-/// shared parent (classic `/tmp` sticky-bit scenario). A directory
-/// we own — or that's owned by root in a system-managed location
-/// — passes; one owned by an arbitrary other user fails.
-///
-/// On Windows: always `true` because ownership semantics differ
-/// (ACL-based, no simple uid comparison). The same attack would
-/// need a Windows-specific guard; not implemented yet.
+/// Rejects a `.git` ancestor an attacker could plant in a shared parent
+/// (classic `/tmp` sticky-bit scenario) before we trust it as the walk-up
+/// anchor. On Unix: `true` iff `dir` is not group/other-writable and is
+/// owned by the effective uid (or root). On Windows: always `true` —
+/// ACL-based ownership has no simple uid check yet (TODO).
 #[cfg(unix)]
 fn anchor_dir_is_trusted(dir: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
