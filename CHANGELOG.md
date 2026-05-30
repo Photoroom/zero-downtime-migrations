@@ -1,9 +1,9 @@
 # Changelog
 
-## 0.4.0 - 2026-05-20
+## Unreleased
 
 Accumulating changes since 0.3.2. The notes below describe the
-user-visible behaviour shifts in the 0.4.0 release.
+user-visible behaviour shifts planned for the next release.
 
 ### Rules
 

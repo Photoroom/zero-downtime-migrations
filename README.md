@@ -191,28 +191,43 @@ CLI flags always override config file settings. If both `zero-downtime-migration
 
 ## Pre-commit Integration
 
-Add to your `.pre-commit-config.yaml`:
+Install `zdm` in the environment where pre-commit runs, then call that installed
+binary from your `.pre-commit-config.yaml`:
 
 ```yaml
 repos:
-  - repo: https://github.com/Photoroom/zero-downtime-migrations
-    rev: <latest release tag>
+  - repo: local
     hooks:
       - id: zdm
+        name: zdm
+        entry: zdm
+        language: system
+        types: [python]
+        files: .*/migrations/.*\.py$
+        exclude: __init__\.py$
 ```
 
 Or use diff mode to only check changed migrations:
 
 ```yaml
 repos:
-  - repo: https://github.com/Photoroom/zero-downtime-migrations
-    rev: <latest release tag>
+  - repo: local
     hooks:
       - id: zdm-diff
+        name: zdm diff
+        entry: zdm --diff-staged origin/main
+        language: system
+        pass_filenames: false
+        always_run: true
 ```
 
 The `zdm-diff` hook uses `--diff-staged` so it checks the staged index that
 pre-commit is validating, rather than the previous `HEAD` commit.
+
+The repository also publishes source-based pre-commit hooks for users who prefer
+`repo: https://github.com/Photoroom/zero-downtime-migrations` with
+`rev: <latest release tag>`. Those hooks install the package from source, so
+Rust must be available in the pre-commit environment.
 
 ## GitHub Actions
 
