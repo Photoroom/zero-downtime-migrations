@@ -56,18 +56,9 @@ impl ParsedMigration {
 
     /// Parse a migration file from a path.
     pub fn parse_file(path: &Path) -> Result<Self> {
-        // Cap on-disk size before reading to bound memory.
-        //
-        // `std::fs::metadata` follows symlinks, so a symlink to
-        // `/dev/zero` or `/dev/random` would report length 0 here,
-        // skip `check_size`, then OOM the process at
-        // `read_to_string`. Use `symlink_metadata` to stat the link
-        // itself, then reject any non-regular file outright — the
-        // size cap only meaningfully applies to regular files. A
-        // legitimate symlink-to-regular-file gets rejected too,
-        // mirroring the discovery walk's symlink policy (see
-        // src/discovery.rs:75) and giving the binary a single,
-        // consistent answer to "we don't open links".
+        // Stat the link itself (not its target) so the size cap can't be
+        // bypassed by a symlink to /dev/zero, and reject non-regular files
+        // outright — same "we don't open links" policy as the discovery walk.
         let metadata = std::fs::symlink_metadata(path).map_err(|e| Error::file_read(path, e))?;
         if !metadata.file_type().is_file() {
             return Err(Error::file_read(
@@ -232,16 +223,21 @@ impl ParsedMigration {
     pub(crate) fn get_imports(&self) -> Vec<Node<'_>> {
         let root = self.root_node();
         let mut imports = Vec::new();
-
-        for child in root.children(&mut root.walk()) {
-            if child.kind() == "import_statement" || child.kind() == "import_from_statement" {
-                imports.push(child);
-            }
-        }
-
+        collect_imports(root, &mut imports);
         imports
     }
+}
 
+fn collect_imports<'tree>(node: Node<'tree>, imports: &mut Vec<Node<'tree>>) {
+    if node.kind() == "import_statement" || node.kind() == "import_from_statement" {
+        imports.push(node);
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_imports(child, imports);
+    }
+}
+
+impl ParsedMigration {
     /// Get the text of a node.
     pub(crate) fn node_text(&self, node: Node<'_>) -> &str {
         node.utf8_text(self.source_bytes()).unwrap_or("")

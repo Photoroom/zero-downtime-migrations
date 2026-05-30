@@ -14,6 +14,22 @@ pub struct Operation {
     pub data: OperationData,
 }
 
+impl Operation {
+    /// The target model this operation acts on, when it has a single one
+    /// (index, field, and constraint operations). Returns `None` for
+    /// operations without a target model — `CreateModel`, `RunSQL`,
+    /// `RunPython`, and `SeparateDatabaseAndState`. Used by the
+    /// created-in-this-migration exemption shared across several rules.
+    pub fn model_name(&self) -> Option<&str> {
+        match &self.data {
+            OperationData::Index(op) => Some(&op.model_name),
+            OperationData::Field(op) => Some(&op.model_name),
+            OperationData::Constraint(op) => Some(&op.model_name),
+            _ => None,
+        }
+    }
+}
+
 /// The type of a Django migration operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -186,12 +202,29 @@ pub struct FieldOperation {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct FieldInfo {
-    /// The field type (e.g., "CharField", "ForeignKey").
-    pub field_type: String,
+    /// The field type.
+    pub field_type: FieldType,
     /// Whether the field is nullable.
     pub is_nullable: bool,
     /// Whether the field has a default value.
     pub has_default: bool,
+}
+
+/// The Django field class used in an `AddField`/`AlterField`.
+///
+/// Only the field types rules currently inspect are enumerated; any
+/// other call (a user-defined or third-party field) becomes [`FieldType::Unknown`]
+/// so no rule fires on it spuriously.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FieldType {
+    ForeignKey,
+    OneToOneField,
+    CharField,
+    IntegerField,
+    BooleanField,
+    TextField,
+    Unknown,
 }
 
 /// Data for constraint operations.
@@ -236,17 +269,104 @@ impl RunSQLOperation {
     /// literals are stripped before the substring search so SQL like
     /// `"-- about CREATE INDEX"` or `"'CREATE INDEX'"` does not match.
     pub fn contains_create_index(&self) -> bool {
-        let stripped = strip_sql_noise(&self.sql).to_uppercase();
-        stripped.contains("CREATE INDEX") || stripped.contains("CREATE UNIQUE INDEX")
+        strip_sql_noise(&self.sql)
+            .split(';')
+            .any(sql_statement_contains_create_index)
     }
 
     /// Check if the SQL contains a `DROP INDEX` statement, ignoring
     /// comments and string literals.
     pub fn contains_drop_index(&self) -> bool {
         strip_sql_noise(&self.sql)
-            .to_uppercase()
-            .contains("DROP INDEX")
+            .split(';')
+            .any(sql_statement_contains_drop_index)
     }
+}
+
+pub(crate) fn sql_statement_contains_create_index(statement: &str) -> bool {
+    let tokens = sql_tokens(statement);
+    tokens.first().is_some_and(|t| t == "CREATE")
+        && (tokens.get(1).is_some_and(|t| t == "INDEX")
+            || (tokens.get(1).is_some_and(|t| t == "UNIQUE")
+                && tokens.get(2).is_some_and(|t| t == "INDEX")))
+        || tokens
+            .first()
+            .is_some_and(|t| compact_sql_token_starts_with(t, &["CREATE", "INDEX"]))
+        || tokens
+            .first()
+            .is_some_and(|t| compact_sql_token_starts_with(t, &["CREATE", "UNIQUE", "INDEX"]))
+}
+
+pub(crate) fn sql_statement_contains_drop_index(statement: &str) -> bool {
+    let tokens = sql_tokens(statement);
+    tokens.first().is_some_and(|t| t == "DROP") && tokens.get(1).is_some_and(|t| t == "INDEX")
+        || tokens
+            .first()
+            .is_some_and(|t| compact_sql_token_starts_with(t, &["DROP", "INDEX"]))
+}
+
+pub(crate) fn sql_statement_contains_reindex(statement: &str) -> bool {
+    sql_tokens(statement)
+        .first()
+        .is_some_and(|t| t == "REINDEX")
+}
+
+pub(crate) fn sql_statement_contains_concurrently(statement: &str) -> bool {
+    sql_tokens(statement).iter().any(|t| t == "CONCURRENTLY")
+}
+
+fn compact_sql_token_starts_with(token: &str, keywords: &[&str]) -> bool {
+    if keywords.is_empty() {
+        return false;
+    }
+    let expected = keywords.join("");
+    token.starts_with(&expected)
+}
+
+fn sql_tokens(statement: &str) -> Vec<String> {
+    normalize_sql_escapes(statement)
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect()
+}
+
+fn normalize_sql_escapes(statement: &str) -> String {
+    let mut out = String::with_capacity(statement.len());
+    let mut chars = statement.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            out.push(ch);
+            continue;
+        }
+        if is_probable_dropped_python_whitespace_escape(ch, &out, chars.peek().copied()) {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn is_probable_dropped_python_whitespace_escape(
+    ch: char,
+    prefix: &str,
+    next: Option<char>,
+) -> bool {
+    if !matches!(ch, 'n' | 'r' | 't') || !next.is_some_and(|c| c.is_ascii_uppercase()) {
+        return false;
+    }
+    // Only the trailing keyword matters; uppercasing the whole prefix on every
+    // character would make the surrounding scan O(n^2). Inspect just the tail.
+    const KEYWORDS: [&str; 4] = ["CREATE", "CREATEUNIQUE", "DROP", "INDEX"];
+    let max = KEYWORDS.iter().map(|k| k.len()).max().unwrap_or(0);
+    let tail_chars: Vec<char> = prefix.chars().rev().take(max).collect();
+    let tail: String = tail_chars
+        .into_iter()
+        .rev()
+        .collect::<String>()
+        .to_ascii_uppercase();
+    KEYWORDS.iter().any(|k| tail.ends_with(k))
 }
 
 /// Remove SQL line comments (`-- ...` to end of line), block comments
@@ -310,6 +430,14 @@ pub(crate) fn strip_sql_noise(sql: &str) -> String {
         }
     }
     out
+}
+
+/// Strip SQL comments and string literals (via [`strip_sql_noise`]), split the
+/// result into individual statements on `;`, and return whether any statement
+/// satisfies `predicate`. Splitting per-statement matters: a RunSQL mixing a
+/// non-concurrent and a concurrent index would otherwise be judged as a whole.
+pub(crate) fn any_sql_statement(sql: &str, predicate: impl Fn(&str) -> bool) -> bool {
+    strip_sql_noise(sql).split(';').any(predicate)
 }
 
 #[cfg(test)]

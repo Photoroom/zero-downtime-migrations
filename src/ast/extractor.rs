@@ -6,39 +6,36 @@ use std::path::Path;
 use tree_sitter::Node;
 
 use super::{
-    ConstraintOperation, ConstraintType, FieldInfo, FieldOperation, Import, IndexOperation,
-    Migration, ModelOperation, Operation, OperationData, OperationType, RunPythonOperation,
-    RunSQLOperation, SeparateDatabaseAndStateOperation,
+    ConstraintOperation, ConstraintType, FieldInfo, FieldOperation, FieldType, Import,
+    IndexOperation, Migration, ModelOperation, Operation, OperationData, OperationType,
+    RunPythonOperation, RunSQLOperation, SeparateDatabaseAndStateOperation,
 };
 use crate::diagnostics::Span;
 use crate::error::Result;
 use crate::parser::ParsedMigration;
 
 /// Map the final function identifier of a field constructor call to a
-/// Django field-type label. The list is the closed set of types any rule
-/// currently inspects; an unrecognised call (a user-defined field class,
-/// a third-party field) becomes "Unknown" so no rule fires on it spuriously.
-fn classify_field_call(value: Node<'_>, ex: &MigrationExtractor<'_>) -> &'static str {
-    const KNOWN: &[&str] = &[
-        "ForeignKey",
-        "CharField",
-        "IntegerField",
-        "BooleanField",
-        "TextField",
-    ];
+/// [`FieldType`]. An unrecognised call (a user-defined field class, a
+/// third-party field) becomes [`FieldType::Unknown`] so no rule fires
+/// on it spuriously.
+fn classify_field_call(value: Node<'_>, ex: &MigrationExtractor<'_>) -> FieldType {
     let Some(function) = value.child_by_field_name("function") else {
-        return "Unknown";
+        return FieldType::Unknown;
     };
     let function_text = ex.node_text(function);
     let field_name = function_text
         .split('.')
         .next_back()
         .unwrap_or(function_text);
-    KNOWN
-        .iter()
-        .find(|t| **t == field_name)
-        .copied()
-        .unwrap_or("Unknown")
+    match field_name {
+        "ForeignKey" => FieldType::ForeignKey,
+        "OneToOneField" => FieldType::OneToOneField,
+        "CharField" => FieldType::CharField,
+        "IntegerField" => FieldType::IntegerField,
+        "BooleanField" => FieldType::BooleanField,
+        "TextField" => FieldType::TextField,
+        _ => FieldType::Unknown,
+    }
 }
 
 /// `true` if the `models.<Type>(...)` call rooted at `value` has
@@ -60,14 +57,25 @@ fn field_kwarg_equals(
     })
 }
 
-/// `true` if the `models.<Type>(...)` call rooted at `value` has
-/// a `keyword=<anything>` kwarg. Same AST-walking shape as
-/// [`field_kwarg_equals`] but ignores the value.
-fn field_has_kwarg(ex: &MigrationExtractor<'_>, value: Node<'_>, keyword: &str) -> bool {
+/// `true` if the `models.<Type>(...)` call rooted at `value` has a
+/// `keyword=<value>` kwarg where the value is a meaningful default rather than
+/// Python/Django's explicit "no default" sentinels.
+fn field_has_non_null_kwarg(ex: &MigrationExtractor<'_>, value: Node<'_>, keyword: &str) -> bool {
     field_call_kwargs(value).any(|kw| {
         kw.child_by_field_name("name")
             .is_some_and(|n| ex.node_text(n) == keyword)
+            && kw
+                .child_by_field_name("value")
+                .is_some_and(|v| !is_no_default_sentinel(ex.node_text(v).trim()))
     })
+}
+
+fn is_no_default_sentinel(value: &str) -> bool {
+    value == "None"
+        || value
+            .split('.')
+            .next_back()
+            .is_some_and(|name| name == "NOT_PROVIDED")
 }
 
 /// Iterate the `keyword_argument` children of the `arguments`
@@ -130,7 +138,7 @@ impl<'a> MigrationExtractor<'a> {
 
     /// Extract a complete Migration from the parsed file.
     pub fn extract(&self, path: &Path) -> Result<Migration> {
-        let (operations, wrapped_database_ops) = self.extract_operations();
+        let operations = self.extract_operations();
         let imports = self.extract_imports();
         let is_non_atomic = self.parsed.is_non_atomic();
         let line_ignores = self.extract_line_ignores();
@@ -144,7 +152,6 @@ impl<'a> MigrationExtractor<'a> {
             is_non_atomic,
             operations,
             imports,
-            wrapped_database_ops,
             class_span,
             line_ignores,
         })
@@ -162,49 +169,36 @@ impl<'a> MigrationExtractor<'a> {
         map
     }
 
-    /// Extract the migration's top-level operations and, alongside them,
-    /// any operations wrapped in
-    /// `SeparateDatabaseAndState(database_operations=[...])`. State-side
-    /// wrapped ops are intentionally NOT surfaced: they're metadata-only
-    /// and rules that scan for schema-locking patterns should ignore
-    /// them.
-    fn extract_operations(&self) -> (Vec<Operation>, Vec<Operation>) {
+    /// Extract the migration's top-level operations. Operations wrapped in
+    /// `SeparateDatabaseAndState(database_operations=[...])` are retained on
+    /// the wrapper op's [`SeparateDatabaseAndStateOperation::database_operations`]
+    /// and surfaced for rules via [`Migration::database_effective_operations`].
+    fn extract_operations(&self) -> Vec<Operation> {
         let mut top_level: Vec<Operation> = Vec::new();
-        let mut wrapped_database: Vec<Operation> = Vec::new();
 
         let Some(ops_list) = self.parsed.find_operations_list() else {
-            return (top_level, wrapped_database);
+            return top_level;
         };
 
         for child in ops_list.children(&mut ops_list.walk()) {
             if child.kind() != "call" {
                 continue;
             }
-            let Some(op) = self.extract_operation(child) else {
-                continue;
-            };
-            if let OperationData::SeparateDatabaseAndState(data) = &op.data {
-                for wrapped in &data.database_operations {
-                    wrapped_database.push(wrapped.clone());
-                }
+            if let Some(op) = self.extract_operation(child) {
+                top_level.push(op);
             }
-            top_level.push(op);
         }
 
-        (top_level, wrapped_database)
+        top_level
     }
 
     /// Iterate a `list` syntax node and extract any `call` children as
     /// operations. Shared by the top-level walk and the
     /// SeparateDatabaseAndState descent so the same extraction rules
     /// (e.g. unknown operation types) apply uniformly. Non-`list` value
-    /// nodes (e.g. `database_operations=None`, a comprehension, an
-    /// identifier referring to a module-level list) yield an empty
-    /// vector — we only descend into a literal list. A nested
-    /// `SeparateDatabaseAndState` inside `database_operations` is
-    /// surfaced as a single op; we deliberately do not recurse, since
-    /// the doubly-nested form has no real-world use and recursion would
-    /// hide it from rules that want to flag it.
+    /// nodes (e.g. `database_operations=None` or a comprehension) yield
+    /// an empty vector — callers resolve supported module-level list
+    /// identifiers before reaching this function.
     fn extract_operations_from_list(&self, list: Node<'_>) -> Vec<Operation> {
         let mut operations = Vec::new();
         if list.kind() != "list" {
@@ -256,10 +250,10 @@ impl<'a> MigrationExtractor<'a> {
             | OperationType::RemoveField
             | OperationType::AlterField
             | OperationType::RenameField => {
-                OperationData::Field(self.extract_field_operation(args))
+                OperationData::Field(self.extract_field_operation(op_type, args))
             }
             OperationType::AddConstraint | OperationType::RemoveConstraint => {
-                OperationData::Constraint(self.extract_constraint_operation(args))
+                OperationData::Constraint(self.extract_constraint_operation(op_type, args))
             }
             OperationType::RunSQL => OperationData::RunSQL(self.extract_run_sql_operation(args)),
             OperationType::RunPython => {
@@ -281,15 +275,16 @@ impl<'a> MigrationExtractor<'a> {
     /// reference the index by its top-level `name=` kwarg and carry no
     /// column info.
     fn extract_index_operation(&self, op_type: OperationType, args: Node<'a>) -> IndexOperation {
-        let model_name = self.get_keyword_arg_string(args, "model_name");
+        let model_name = self.get_keyword_or_positional_string(args, "model_name", 0);
 
         let (index_name, columns) = match op_type {
             OperationType::AddIndex | OperationType::AddIndexConcurrently => {
                 self.extract_inner_index_call(args)
             }
-            OperationType::RemoveIndex | OperationType::RemoveIndexConcurrently => {
-                (self.get_keyword_arg_string(args, "name"), Vec::new())
-            }
+            OperationType::RemoveIndex | OperationType::RemoveIndexConcurrently => (
+                self.get_keyword_or_positional_string(args, "name", 1),
+                Vec::new(),
+            ),
             _ => (None, Vec::new()),
         };
 
@@ -354,7 +349,7 @@ impl<'a> MigrationExtractor<'a> {
 
     /// Extract CreateModel operation data.
     fn extract_create_model_operation(&self, args: Node) -> ModelOperation {
-        let name = self.get_keyword_arg_string(args, "name");
+        let name = self.get_keyword_or_positional_string(args, "name", 0);
 
         ModelOperation {
             name: name.unwrap_or_default(),
@@ -363,14 +358,26 @@ impl<'a> MigrationExtractor<'a> {
     }
 
     /// Extract field operation data.
-    fn extract_field_operation(&self, args: Node) -> FieldOperation {
-        let model_name = self.get_keyword_arg_string(args, "model_name");
-        let field_name = self.get_keyword_arg_string(args, "name");
-        let old_name = self.get_keyword_arg_string(args, "old_name");
-        let new_name = self.get_keyword_arg_string(args, "new_name");
+    fn extract_field_operation(&self, op_type: OperationType, args: Node) -> FieldOperation {
+        let model_name = self.get_keyword_or_positional_string(args, "model_name", 0);
+        let field_name = self.get_keyword_or_positional_string(args, "name", 1);
+        let old_name = self.get_keyword_arg_string(args, "old_name").or_else(|| {
+            (op_type == OperationType::RenameField)
+                .then(|| self.get_nth_positional_string(args, 1))
+                .flatten()
+        });
+        let new_name = self.get_keyword_arg_string(args, "new_name").or_else(|| {
+            (op_type == OperationType::RenameField)
+                .then(|| self.get_nth_positional_string(args, 2))
+                .flatten()
+        });
 
         // Extract field info from the 'field' argument
-        let field = self.extract_field_info(args);
+        let field = if matches!(op_type, OperationType::AddField | OperationType::AlterField) {
+            self.extract_field_info(args)
+        } else {
+            None
+        };
 
         FieldOperation {
             model_name: model_name.unwrap_or_default(),
@@ -390,47 +397,57 @@ impl<'a> MigrationExtractor<'a> {
     /// AST directly — no raw-text scanning, no keyword-boundary
     /// gymnastics on a normalised byte buffer.
     fn extract_field_info(&self, args: Node) -> Option<FieldInfo> {
-        let value = self.get_keyword_arg_value(args, "field")?;
+        let value = self
+            .get_keyword_arg_value(args, "field")
+            .or_else(|| self.get_nth_positional_value(args, 2))?;
+        if value.kind() != "call" {
+            return None;
+        }
         Some(FieldInfo {
-            field_type: classify_field_call(value, self).to_string(),
+            field_type: classify_field_call(value, self),
             is_nullable: field_kwarg_equals(self, value, "null", "True"),
-            has_default: field_has_kwarg(self, value, "default"),
+            has_default: field_has_non_null_kwarg(self, value, "default"),
         })
     }
 
     /// Extract constraint operation data.
-    fn extract_constraint_operation(&self, args: Node) -> ConstraintOperation {
-        let model_name = self.get_keyword_arg_string(args, "model_name");
-        let constraint_type = self.extract_constraint_type(args);
+    fn extract_constraint_operation(
+        &self,
+        op_type: OperationType,
+        args: Node,
+    ) -> ConstraintOperation {
+        let model_name = self.get_keyword_or_positional_string(args, "model_name", 0);
+        let constraint_node = self
+            .get_keyword_arg_value(args, "constraint")
+            .or_else(|| self.get_nth_positional_value(args, 1));
+        let constraint_type = constraint_node
+            .map(|node| self.extract_constraint_type_from_value(node))
+            .unwrap_or(ConstraintType::Unknown);
+        let constraint_name = if op_type == OperationType::RemoveConstraint {
+            self.get_keyword_or_positional_string(args, "name", 1)
+        } else {
+            constraint_node.and_then(|node| self.extract_inner_call_string_kwarg(node, "name"))
+        };
 
         ConstraintOperation {
             model_name: model_name.unwrap_or_default(),
             constraint_type,
-            constraint_name: None,
+            constraint_name,
         }
     }
 
     /// Extract constraint type from arguments.
-    fn extract_constraint_type(&self, args: Node) -> ConstraintType {
-        for child in args.children(&mut args.walk()) {
-            if child.kind() == "keyword_argument" {
-                if let Some(name) = child.child_by_field_name("name") {
-                    if self.node_text(name) == "constraint" {
-                        if let Some(value) = child.child_by_field_name("value") {
-                            let text = self.node_text(value);
-                            if text.contains("UniqueConstraint") {
-                                return ConstraintType::Unique;
-                            } else if text.contains("CheckConstraint") {
-                                return ConstraintType::Check;
-                            } else if text.contains("ExclusionConstraint") {
-                                return ConstraintType::Exclusion;
-                            }
-                        }
-                    }
-                }
-            }
+    fn extract_constraint_type_from_value(&self, value: Node) -> ConstraintType {
+        let constraint_name = value.child_by_field_name("function").map(|function| {
+            let text = self.node_text(function);
+            text.split('.').next_back().unwrap_or(text)
+        });
+        match constraint_name {
+            Some("UniqueConstraint") => ConstraintType::Unique,
+            Some("CheckConstraint") => ConstraintType::Check,
+            Some("ExclusionConstraint") => ConstraintType::Exclusion,
+            _ => ConstraintType::Unknown,
         }
-        ConstraintType::Unknown
     }
 
     /// Extract RunSQL operation data.
@@ -492,9 +509,11 @@ impl<'a> MigrationExtractor<'a> {
             .or_else(|| self.get_nth_positional_value(args, 1));
 
         let database_operations = database_operations_node
+            .and_then(|node| self.resolve_list_node(node))
             .map(|node| self.extract_operations_from_list(node))
             .unwrap_or_default();
         let state_operations = state_operations_node
+            .and_then(|node| self.resolve_list_node(node))
             .map(|node| self.extract_operations_from_list(node))
             .unwrap_or_default();
         let has_database_operations =
@@ -525,7 +544,24 @@ impl<'a> MigrationExtractor<'a> {
                         .named_children(&mut arm.walk())
                         .any(|child| child.kind() != "comment")
             }
+            "identifier" => self
+                .resolve_module_list_binding(self.node_text(arm))
+                .map(|list| {
+                    !extracted_operations.is_empty()
+                        || list
+                            .named_children(&mut list.walk())
+                            .any(|child| child.kind() != "comment")
+                })
+                .unwrap_or(true),
             _ => true,
+        }
+    }
+
+    fn resolve_list_node(&self, node: Node<'a>) -> Option<Node<'a>> {
+        match node.kind() {
+            "list" => Some(node),
+            "identifier" => self.resolve_module_list_binding(self.node_text(node)),
+            _ => None,
         }
     }
 
@@ -617,6 +653,29 @@ impl<'a> MigrationExtractor<'a> {
         None
     }
 
+    fn get_keyword_or_positional_string(
+        &self,
+        args: Node<'a>,
+        key: &str,
+        position: usize,
+    ) -> Option<String> {
+        self.get_keyword_arg_string(args, key)
+            .or_else(|| self.get_nth_positional_string(args, position))
+    }
+
+    fn get_nth_positional_string(&self, args: Node<'a>, n: usize) -> Option<String> {
+        self.get_nth_positional_value(args, n)
+            .map(|node| self.extract_string_value(node))
+    }
+
+    fn extract_inner_call_string_kwarg(&self, call: Node<'a>, key: &str) -> Option<String> {
+        if call.kind() != "call" {
+            return None;
+        }
+        let args = call.child_by_field_name("arguments")?;
+        self.get_keyword_arg_string(args, key)
+    }
+
     /// Get the value node of a keyword argument, if present.
     fn get_keyword_arg_value(&self, args: Node<'a>, key: &str) -> Option<Node<'a>> {
         for child in args.children(&mut args.walk()) {
@@ -662,7 +721,7 @@ impl<'a> MigrationExtractor<'a> {
             "list" | "tuple" => self.resolve_sql_sequence_value(node),
             "identifier" => {
                 let name = self.node_text(node).to_string();
-                self.resolve_module_string_binding(&name)
+                self.resolve_module_sql_binding(&name)
             }
             "attribute" => self.is_run_sql_noop(node).then(String::new),
             _ => None,
@@ -718,10 +777,15 @@ impl<'a> MigrationExtractor<'a> {
         )
     }
 
-    /// Find a module-level `name = "string-literal"` assignment and return
-    /// its right-hand side. Only one level of indirection: chains like
-    /// `A = B; B = "..."` are not followed.
-    fn resolve_module_string_binding(&self, name: &str) -> Option<String> {
+    /// The right-hand side of the first module-level `name = <rhs>` assignment
+    /// whose `rhs` satisfies `accept`. Assignments whose rhs is rejected are
+    /// skipped (matching the original per-resolver scans). Only one level of
+    /// indirection: chains like `A = B; B = "..."` are not followed.
+    fn find_module_assignment_rhs(
+        &self,
+        name: &str,
+        accept: impl Fn(Node<'a>) -> bool,
+    ) -> Option<Node<'a>> {
         let root = self.parsed.root_node();
         let source = self.parsed.source_bytes();
         for child in root.children(&mut root.walk()) {
@@ -740,14 +804,31 @@ impl<'a> MigrationExtractor<'a> {
             if left.utf8_text(source).ok() != Some(name) {
                 continue;
             }
-            let Some(right) = assignment.child_by_field_name("right") else {
-                continue;
-            };
-            if matches!(right.kind(), "string" | "concatenated_string") {
-                return Some(self.extract_string_value(right));
+            if let Some(right) = assignment.child_by_field_name("right") {
+                if accept(right) {
+                    return Some(right);
+                }
             }
         }
         None
+    }
+
+    fn resolve_module_sql_binding(&self, name: &str) -> Option<String> {
+        let right = self.find_module_assignment_rhs(name, |r| {
+            matches!(
+                r.kind(),
+                "string" | "concatenated_string" | "list" | "tuple"
+            )
+        })?;
+        match right.kind() {
+            "string" | "concatenated_string" => Some(self.extract_string_value(right)),
+            // `accept` only admits the kinds above, so this is list | tuple.
+            _ => self.resolve_sql_sequence_value(right),
+        }
+    }
+
+    fn resolve_module_list_binding(&self, name: &str) -> Option<Node<'a>> {
+        self.find_module_assignment_rhs(name, |r| r.kind() == "list")
     }
 
     /// Extract the actual string content from a tree-sitter `string`
@@ -790,9 +871,17 @@ impl<'a> MigrationExtractor<'a> {
         match node.kind() {
             "string" => {
                 let mut out = String::new();
+                let is_raw = self.string_has_raw_prefix(node);
                 for child in node.children(&mut node.walk()) {
                     match child.kind() {
-                        "string_content" => out.push_str(self.node_text(child)),
+                        "string_content" if is_raw => out.push_str(self.node_text(child)),
+                        "string_content" => {
+                            out.push_str(&decode_python_escapes_in_text(self.node_text(child)))
+                        }
+                        "escape_sequence" if is_raw => out.push_str(self.node_text(child)),
+                        "escape_sequence" => {
+                            out.push_str(&decode_python_escape(self.node_text(child)))
+                        }
                         "interpolation" => return String::new(),
                         _ => {}
                     }
@@ -818,10 +907,107 @@ impl<'a> MigrationExtractor<'a> {
         }
     }
 
+    fn string_has_raw_prefix(&self, node: Node<'_>) -> bool {
+        node.children(&mut node.walk()).any(|child| {
+            child.kind() == "string_start"
+                && self
+                    .node_text(child)
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphabetic())
+                    .any(|c| matches!(c, 'r' | 'R'))
+        })
+    }
+
     /// Get the text of a node.
     fn node_text(&self, node: Node) -> &str {
         self.parsed.node_text(node)
     }
+}
+
+fn decode_python_escape(raw: &str) -> String {
+    let escape = raw.strip_prefix('\\').unwrap_or(raw);
+    match escape {
+        "n" => "\n".to_string(),
+        "r" => "\r".to_string(),
+        "t" => "\t".to_string(),
+        "a" => "\u{0007}".to_string(),
+        "b" => "\u{0008}".to_string(),
+        "f" => "\u{000c}".to_string(),
+        "v" => "\u{000b}".to_string(),
+        "\\" => "\\".to_string(),
+        "\"" => "\"".to_string(),
+        "'" => "'".to_string(),
+        _ => decode_numeric_python_escape(escape).unwrap_or_else(|| raw.to_string()),
+    }
+}
+
+fn decode_python_escapes_in_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+
+        let Some(next) = chars.next() else {
+            out.push('\\');
+            break;
+        };
+        let mut raw = String::from("\\");
+        raw.push(next);
+        match next {
+            'x' => raw.extend(chars.by_ref().take(2)),
+            'u' => raw.extend(chars.by_ref().take(4)),
+            'U' => raw.extend(chars.by_ref().take(8)),
+            '0'..='7' => {
+                for _ in 0..2 {
+                    if chars.peek().is_some_and(|c| matches!(c, '0'..='7')) {
+                        raw.push(chars.next().expect("peeked"));
+                    } else {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+        out.push_str(&decode_python_escape(&raw));
+    }
+    out
+}
+
+fn decode_numeric_python_escape(escape: &str) -> Option<String> {
+    if let Some(hex) = escape.strip_prefix('x') {
+        return decode_codepoint_escape(hex, 2);
+    }
+    if let Some(hex) = escape.strip_prefix('u') {
+        return decode_codepoint_escape(hex, 4);
+    }
+    if let Some(hex) = escape.strip_prefix('U') {
+        return decode_codepoint_escape(hex, 8);
+    }
+    if escape
+        .chars()
+        .next()
+        .is_some_and(|c| matches!(c, '0'..='7'))
+    {
+        let octal: String = escape
+            .chars()
+            .take(3)
+            .take_while(|c| matches!(c, '0'..='7'))
+            .collect();
+        let value = u32::from_str_radix(&octal, 8).ok()?;
+        return char::from_u32(value).map(|c| c.to_string());
+    }
+    None
+}
+
+fn decode_codepoint_escape(hex: &str, digits: usize) -> Option<String> {
+    if hex.len() != digits {
+        return None;
+    }
+    let value = u32::from_str_radix(hex, 16).ok()?;
+    char::from_u32(value).map(|c| c.to_string())
 }
 
 #[cfg(test)]
@@ -935,7 +1121,7 @@ class Migration(migrations.Migration):
             assert!(data.field.is_some());
 
             let field = data.field.as_ref().unwrap();
-            assert_eq!(field.field_type, "ForeignKey");
+            assert_eq!(field.field_type, FieldType::ForeignKey);
             assert!(field.is_nullable);
         } else {
             panic!("Expected Field data");
@@ -1012,6 +1198,52 @@ class Migration(migrations.Migration):
         if let OperationData::RunSQL(data) = &migration.operations[0].data {
             assert_eq!(data.sql, "CREATE INDEX CONCURRENTLY a ON tbl (c);");
             assert_eq!(data.reverse_sql.as_deref(), Some("DROP INDEX a;"));
+        } else {
+            panic!("Expected RunSQL data");
+        }
+    }
+
+    const RUN_SQL_NUMERIC_ESCAPES: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+    operations = [
+        migrations.RunSQL("CREATE\x20INDEX\u0020idx ON t (c);"),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_run_sql_decodes_python_numeric_escapes() {
+        let parsed = ParsedMigration::parse(RUN_SQL_NUMERIC_ESCAPES).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        if let OperationData::RunSQL(data) = &migration.operations[0].data {
+            assert_eq!(data.sql, "CREATE INDEX idx ON t (c);");
+        } else {
+            panic!("Expected RunSQL data");
+        }
+    }
+
+    const RUN_SQL_RAW_ESCAPES: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+    operations = [
+        migrations.RunSQL(r"CREATE\nINDEX idx ON t (c);"),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_run_sql_preserves_raw_string_escapes() {
+        let parsed = ParsedMigration::parse(RUN_SQL_RAW_ESCAPES).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        if let OperationData::RunSQL(data) = &migration.operations[0].data {
+            assert_eq!(data.sql, r"CREATE\nINDEX idx ON t (c);");
         } else {
             panic!("Expected RunSQL data");
         }
@@ -1291,8 +1523,8 @@ class Migration(migrations.Migration):
             panic!("Expected Field data");
         };
         assert_eq!(
-            data.field.as_ref().map(|field| field.field_type.as_str()),
-            Some("Unknown"),
+            data.field.as_ref().map(|field| field.field_type),
+            Some(FieldType::Unknown),
         );
     }
 
@@ -1335,9 +1567,12 @@ class Migration(migrations.Migration):
             OperationType::SeparateDatabaseAndState
         );
 
-        // database_operations are extracted into the parallel collection.
-        let kinds: Vec<_> = migration
-            .wrapped_database_ops
+        // database_operations are retained on the wrapper op.
+        let OperationData::SeparateDatabaseAndState(data) = &migration.operations[0].data else {
+            panic!("Expected SeparateDatabaseAndState data");
+        };
+        let kinds: Vec<_> = data
+            .database_operations
             .iter()
             .map(|op| op.op_type)
             .collect();
@@ -1352,12 +1587,14 @@ class Migration(migrations.Migration):
         let extractor = MigrationExtractor::new(&parsed);
         let migration = extractor.extract(Path::new("test.py")).unwrap();
 
+        let OperationData::SeparateDatabaseAndState(data) = &migration.operations[0].data else {
+            panic!("Expected SeparateDatabaseAndState data");
+        };
         assert!(
-            migration
-                .wrapped_database_ops
+            data.database_operations
                 .iter()
                 .all(|op| op.op_type != OperationType::RemoveField),
-            "RemoveField is in state_operations only and must not appear in wrapped_database_ops"
+            "RemoveField is in state_operations only and must not appear in database_operations"
         );
     }
 
@@ -1383,7 +1620,10 @@ class Migration(migrations.Migration):
         let migration = extractor.extract(Path::new("test.py")).unwrap();
 
         assert_eq!(migration.operations.len(), 1);
-        assert!(migration.wrapped_database_ops.is_empty());
+        let OperationData::SeparateDatabaseAndState(data) = &migration.operations[0].data else {
+            panic!("Expected SeparateDatabaseAndState data");
+        };
+        assert!(data.database_operations.is_empty());
     }
 
     const SDAS_DB_OPS_POSITIONAL: &str = r#"
@@ -1415,8 +1655,11 @@ class Migration(migrations.Migration):
         let migration = extractor.extract(Path::new("test.py")).unwrap();
 
         assert_eq!(migration.operations.len(), 1);
-        let kinds: Vec<_> = migration
-            .wrapped_database_ops
+        let OperationData::SeparateDatabaseAndState(data) = &migration.operations[0].data else {
+            panic!("Expected SeparateDatabaseAndState data");
+        };
+        let kinds: Vec<_> = data
+            .database_operations
             .iter()
             .map(|op| op.op_type)
             .collect();
@@ -1448,7 +1691,10 @@ class Migration(migrations.Migration):
         let migration = extractor.extract(Path::new("test.py")).unwrap();
 
         assert_eq!(migration.operations.len(), 1);
-        assert!(migration.wrapped_database_ops.is_empty());
+        let OperationData::SeparateDatabaseAndState(data) = &migration.operations[0].data else {
+            panic!("Expected SeparateDatabaseAndState data");
+        };
+        assert!(data.database_operations.is_empty());
     }
 
     const SDAS_DB_OPS_EMPTY_LIST: &str = r#"
@@ -1472,10 +1718,10 @@ class Migration(migrations.Migration):
         let migration = extractor.extract(Path::new("test.py")).unwrap();
 
         assert_eq!(migration.operations.len(), 1);
-        assert!(migration.wrapped_database_ops.is_empty());
         let OperationData::SeparateDatabaseAndState(data) = &migration.operations[0].data else {
             panic!("Expected SeparateDatabaseAndState data");
         };
+        assert!(data.database_operations.is_empty());
         assert!(!data.has_database_operations);
         assert!(!data.has_state_operations);
     }
@@ -1503,19 +1749,18 @@ class Migration(migrations.Migration):
 "#;
 
     #[test]
-    fn test_sdas_non_literal_arms_count_as_present_but_are_not_expanded() {
+    fn test_sdas_module_list_arms_are_extracted_and_count_as_present() {
         let parsed = ParsedMigration::parse(SDAS_NON_LITERAL_ARMS).unwrap();
         let extractor = MigrationExtractor::new(&parsed);
         let migration = extractor.extract(Path::new("test.py")).unwrap();
 
         assert_eq!(migration.operations.len(), 1);
-        assert!(migration.wrapped_database_ops.is_empty());
         let OperationData::SeparateDatabaseAndState(data) = &migration.operations[0].data else {
             panic!("Expected SeparateDatabaseAndState data");
         };
         assert!(data.has_database_operations);
         assert!(data.has_state_operations);
-        assert!(data.database_operations.is_empty());
+        assert_eq!(data.database_operations.len(), 1);
     }
 
     const SDAS_NON_EMPTY_UNEXPANDED_LIST_ARMS: &str = r#"
@@ -1545,7 +1790,6 @@ class Migration(migrations.Migration):
         let migration = extractor.extract(Path::new("test.py")).unwrap();
 
         assert_eq!(migration.operations.len(), 1);
-        assert!(migration.wrapped_database_ops.is_empty());
         let OperationData::SeparateDatabaseAndState(data) = &migration.operations[0].data else {
             panic!("Expected SeparateDatabaseAndState data");
         };
@@ -1688,11 +1932,34 @@ class Migration(migrations.Migration):
         let OperationData::Index(data) = &migration.operations[0].data else {
             panic!("Expected Index data");
         };
-        // model_name kwarg parsing remains kwarg-only, so we don't
-        // assert it here — the column extraction is what this commit
-        // is about.
+        assert_eq!(data.model_name, "product");
         assert_eq!(data.index_name.as_deref(), Some("product_name_idx"));
         assert_eq!(data.columns, vec!["name".to_string()]);
+    }
+
+    const REMOVE_INDEX_POSITIONAL: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.RemoveIndex('product', 'product_name_idx'),
+    ]
+"#;
+
+    #[test]
+    fn test_extract_remove_index_positional_args() {
+        let parsed = ParsedMigration::parse(REMOVE_INDEX_POSITIONAL).unwrap();
+        let extractor = MigrationExtractor::new(&parsed);
+        let migration = extractor.extract(Path::new("test.py")).unwrap();
+
+        let OperationData::Index(data) = &migration.operations[0].data else {
+            panic!("Expected Index data");
+        };
+        assert_eq!(data.model_name, "product");
+        assert_eq!(data.index_name.as_deref(), Some("product_name_idx"));
+        assert!(data.columns.is_empty());
     }
 
     const ADD_INDEX_BARE_NAME: &str = r#"
@@ -1822,18 +2089,20 @@ class Migration(migrations.Migration):
 
     #[test]
     fn test_sdas_nested_does_not_recurse() {
-        // Doubly-nested SDaS is exotic enough that we deliberately do
-        // not recurse: the outer call surfaces the inner SDaS as one op
-        // in `wrapped_database_ops`, but the inner call's own
-        // `database_operations` are not hoisted further. A rule that
-        // wants to flag nested SDaS can inspect the surfaced op.
+        // The outer wrapper's `database_operations` surfaces the inner SDaS
+        // as one op; the inner call's own `database_operations` are not
+        // hoisted into the outer wrapper (the recursive expansion lives in
+        // `database_effective_operations`). A rule can inspect the surfaced op.
         let parsed = ParsedMigration::parse(SDAS_NESTED).unwrap();
         let extractor = MigrationExtractor::new(&parsed);
         let migration = extractor.extract(Path::new("test.py")).unwrap();
 
         assert_eq!(migration.operations.len(), 1);
-        let kinds: Vec<_> = migration
-            .wrapped_database_ops
+        let OperationData::SeparateDatabaseAndState(data) = &migration.operations[0].data else {
+            panic!("Expected SeparateDatabaseAndState data");
+        };
+        let kinds: Vec<_> = data
+            .database_operations
             .iter()
             .map(|op| op.op_type)
             .collect();
