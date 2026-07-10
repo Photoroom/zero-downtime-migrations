@@ -7,7 +7,6 @@
 
 use std::path::PathBuf;
 
-use miette::Diagnostic;
 use thiserror::Error;
 
 /// A specialized Result type for zdm operations.
@@ -17,12 +16,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// `#[non_exhaustive]` so downstream code that exhaustively
 /// matches on the variants doesn't break when we add a new error path.
-#[derive(Error, Debug, Diagnostic)]
+#[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
     /// File I/O error
     #[error("Failed to read file: {path}")]
-    #[diagnostic(code(zdm::io::read_error))]
     FileRead {
         path: PathBuf,
         #[source]
@@ -31,7 +29,6 @@ pub enum Error {
 
     /// Directory walk error
     #[error("Failed to walk directory: {path}")]
-    #[diagnostic(code(zdm::io::walk_error))]
     DirectoryWalk {
         path: PathBuf,
         #[source]
@@ -40,10 +37,6 @@ pub enum Error {
 
     /// File too large to process
     #[error("File too large: {path} ({size} bytes, max {max_size} bytes)")]
-    #[diagnostic(
-        code(zdm::io::file_too_large),
-        help("Migration files should be small; this may indicate malformed input")
-    )]
     FileTooLarge {
         path: PathBuf,
         size: u64,
@@ -52,15 +45,10 @@ pub enum Error {
 
     /// Tree-sitter parse error
     #[error("Failed to parse Python file: {path}: {message}")]
-    #[diagnostic(
-        code(zdm::parse::python_error),
-        help("Ensure the file is valid Python syntax")
-    )]
     ParseError { path: PathBuf, message: String },
 
     /// Tree-sitter parse error with location
     #[error("Parse error in {path} at line {line}, column {column}")]
-    #[diagnostic(code(zdm::parse::syntax_error))]
     ParseErrorWithLocation {
         path: PathBuf,
         line: usize,
@@ -73,7 +61,6 @@ pub enum Error {
     /// future major version of the underlying TOML library can be
     /// adopted without it being a breaking change for our consumers.
     #[error("Failed to parse configuration: {path}")]
-    #[diagnostic(code(zdm::config::parse_error))]
     ConfigParseError {
         path: PathBuf,
         #[source]
@@ -86,7 +73,6 @@ pub enum Error {
     /// reason as `ConfigParseError`: keeps git2 out of our
     /// public ABI.
     #[error("Git error: {message}")]
-    #[diagnostic(code(zdm::git::error))]
     GitError {
         message: String,
         #[source]
@@ -96,30 +82,20 @@ pub enum Error {
     /// The supplied `--diff` reference does not exist (libgit2's NotFound).
     /// Distinguished from generic git failures so the CLI can suggest a
     /// likely fix (e.g. fetching `origin/main` after a shallow clone).
-    #[error("Invalid git reference: {reference}")]
-    #[diagnostic(
-        code(zdm::git::invalid_ref),
-        help(
-            "Specify a valid branch, tag, or commit SHA. \
-             For `origin/*` refs, you may need `git fetch origin` first — \
-             shallow clones and fresh checkouts omit remote-tracking refs."
-        )
+    #[error(
+        "Invalid git reference: {reference}. Specify a valid branch, tag, or commit SHA; \
+         for origin/* refs, fetch the remote first (shallow checkouts may omit them)"
     )]
     InvalidGitReference { reference: String },
 
     /// Invalid command-line flag or argument combination.
     #[error("CLI usage error: {message}")]
-    #[diagnostic(code(zdm::cli::usage_error))]
     CliUsage { message: String },
 
     /// Unknown rule. Format is single-line because the top-level
     /// error sink runs the chain through `sanitize_single_line`,
     /// which would otherwise escape an embedded `\n` into `\x0a`.
     #[error("Unknown rule: {rule_id} (available rules: {})", available.join(", "))]
-    #[diagnostic(
-        code(zdm::rule::unknown),
-        help("Run 'zdm rule <id>' to see documentation for a specific rule")
-    )]
     UnknownRule {
         rule_id: String,
         /// All rule IDs the binary knows about, sorted, for the
@@ -131,7 +107,6 @@ pub enum Error {
 
     /// Invalid path
     #[error("Invalid path: {path}")]
-    #[diagnostic(code(zdm::io::invalid_path))]
     InvalidPath { path: PathBuf },
 
     /// A glob pattern from `exclude` or `allowed-file-patterns` could
@@ -139,13 +114,6 @@ pub enum Error {
     /// patterns fail loudly rather than being silently ignored at the
     /// match site.
     #[error("Invalid glob pattern '{pattern}': {message}")]
-    #[diagnostic(
-        code(zdm::config::invalid_glob),
-        help(
-            "Glob patterns use the `glob` crate's syntax: `**` matches any number \
-             of path segments, `*` matches any characters except `/`"
-        )
-    )]
     InvalidGlobPattern { pattern: String, message: String },
 }
 
@@ -278,5 +246,21 @@ impl std::error::Error for GitSource {}
 impl From<git2::Error> for GitSource {
     fn from(e: git2::Error) -> Self {
         Self(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_git_reference_display_includes_recovery_hint() {
+        let message = Error::InvalidGitReference {
+            reference: "origin/main".to_string(),
+        }
+        .to_string();
+
+        assert!(message.contains("fetch the remote"));
+        assert!(message.contains("shallow checkouts"));
     }
 }

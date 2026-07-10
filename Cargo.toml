@@ -33,7 +33,6 @@ glob = "0.3"
 
 # Error handling & diagnostics
 thiserror = "1"
-miette = { version = "7", features = ["fancy"] }
 
 # Git integration (vendored-openssl for cross-compilation)
 git2 = { version = "0.21", features = ["vendored-openssl"] }
