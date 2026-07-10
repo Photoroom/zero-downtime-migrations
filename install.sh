@@ -34,6 +34,28 @@ error() {
     exit 1
 }
 
+verify_checksum() {
+    local file="$1" checksum_file="$2" asset_name="$3" expected actual
+
+    expected=$(awk -v name="$asset_name" '$2 == name { print $1 }' "$checksum_file")
+    if [[ ! "$expected" =~ ^[[:xdigit:]]{64}$ ]]; then
+        error "No valid checksum found for $asset_name"
+    fi
+
+    if command -v sha256sum &> /dev/null; then
+        actual=$(sha256sum "$file")
+    elif command -v shasum &> /dev/null; then
+        actual=$(shasum -a 256 "$file")
+    else
+        error "A SHA-256 tool is required (sha256sum or shasum)"
+    fi
+    actual="${actual%% *}"
+
+    if [[ "$actual" != "$expected" ]]; then
+        error "Checksum verification failed for $asset_name"
+    fi
+}
+
 # Detect OS and architecture
 detect_platform() {
     local os arch
@@ -82,7 +104,7 @@ get_latest_version() {
 
 # Download and install
 install() {
-    local platform version install_dir download_url temp_dir
+    local platform version install_dir asset_name download_url checksum_url temp_dir
 
     platform=$(detect_platform)
     version="${ZDM_VERSION:-$(get_latest_version)}"
@@ -102,18 +124,24 @@ install() {
     fi
 
     # Build download URL
-    download_url="https://github.com/Photoroom/zero-downtime-migrations/releases/download/${version}/zdm-${platform}${ext}"
+    asset_name="zdm-${platform}${ext}"
+    download_url="https://github.com/Photoroom/zero-downtime-migrations/releases/download/${version}/${asset_name}"
+    checksum_url="https://github.com/Photoroom/zero-downtime-migrations/releases/download/${version}/SHA256SUMS"
 
     info "Downloading from: $download_url"
 
     # Create temp directory
     temp_dir=$(mktemp -d)
-    trap "rm -rf $temp_dir" EXIT
+    trap 'rm -rf -- "$temp_dir"' EXIT
 
     # Download binary
     if ! curl -fsSL "$download_url" -o "$temp_dir/zdm${ext}"; then
         error "Failed to download zdm. Please check that version $version exists."
     fi
+    if ! curl -fsSL "$checksum_url" -o "$temp_dir/SHA256SUMS"; then
+        error "Failed to download release checksums for $version."
+    fi
+    verify_checksum "$temp_dir/zdm${ext}" "$temp_dir/SHA256SUMS" "$asset_name"
 
     # Make executable (not needed on Windows)
     if [[ "$platform" != *"windows"* ]]; then
@@ -122,6 +150,8 @@ install() {
 
     # Move to install directory
     mv "$temp_dir/zdm${ext}" "$install_dir/zdm${ext}"
+    rm -rf -- "$temp_dir"
+    trap - EXIT
 
     success "Installed zdm to $install_dir/zdm${ext}"
 
@@ -162,4 +192,6 @@ main() {
     install
 }
 
-main
+if [[ "${ZDM_INSTALLER_SOURCE_ONLY:-}" != "1" ]]; then
+    main
+fi

@@ -51,7 +51,10 @@ impl ChangesetRule for R008DisallowedFileChanges {
         let patterns: Vec<Pattern> = config
             .allowed_file_patterns
             .iter()
-            .map(|p| Pattern::new(p).expect("allowed_file_patterns are validated at config load"))
+            // Public Config fields can be mutated without going through the
+            // loader. Invalid patterns fail closed instead of panicking or
+            // accidentally allowing a changed file.
+            .filter_map(|p| Pattern::new(p).ok())
             .collect();
 
         for file in other_changed_files {
@@ -290,5 +293,26 @@ class Migration(migrations.Migration):
         );
 
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_invalid_programmatic_pattern_fails_closed() {
+        let migration = create_migration();
+        let migrations = vec![&migration];
+        let other_files = vec![Path::new("app/models.py")];
+        let config = Config {
+            allowed_file_patterns: vec!["[".to_string()],
+            ..Default::default()
+        };
+
+        let diagnostics = crate::rules::test_support::check_changeset_rule(
+            &R008DisallowedFileChanges,
+            &migrations,
+            &other_files,
+            &config,
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("app/models.py"));
     }
 }

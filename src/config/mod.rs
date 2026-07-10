@@ -41,7 +41,7 @@ pub struct Config {
     pub exclude: Vec<String>,
     /// For R008: file patterns allowed to change alongside
     /// migrations. Files NOT matching these patterns will trigger a
-    /// warning.
+    /// error.
     pub allowed_file_patterns: Vec<String>,
 }
 

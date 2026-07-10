@@ -1,6 +1,6 @@
 //! Extracts typed migration operations from tree-sitter nodes.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use tree_sitter::Node;
@@ -117,12 +117,56 @@ fn parse_ignore_directive(comment: &str) -> Option<Vec<String>> {
 /// Extracts migration operations from a parsed Python file.
 pub struct MigrationExtractor<'a> {
     parsed: &'a ParsedMigration,
+    module_bindings: HashMap<String, Node<'a>>,
 }
 
 impl<'a> MigrationExtractor<'a> {
     /// Create a new extractor for the given parsed migration.
     pub fn new(parsed: &'a ParsedMigration) -> Self {
-        Self { parsed }
+        Self {
+            parsed,
+            module_bindings: Self::collect_module_bindings(parsed),
+        }
+    }
+
+    /// Index the final module assignment before the first Migration class.
+    /// Operation identifiers live inside that class, so later top-level
+    /// assignments cannot affect them. Keeping dynamic right-hand sides in the
+    /// map is intentional: a later `SQL = build_sql()` invalidates an earlier
+    /// literal instead of falling back to stale SQL.
+    fn collect_module_bindings(parsed: &'a ParsedMigration) -> HashMap<String, Node<'a>> {
+        let Some(class) = parsed.find_migration_class() else {
+            return HashMap::new();
+        };
+        let root = parsed.root_node();
+        let source = parsed.source_bytes();
+        let mut bindings = HashMap::new();
+        for child in root.children(&mut root.walk()) {
+            if child.start_byte() >= class.start_byte() {
+                break;
+            }
+            if child.kind() != "expression_statement" {
+                continue;
+            }
+            let Some(assignment) = child.named_child(0) else {
+                continue;
+            };
+            if assignment.kind() != "assignment" {
+                continue;
+            }
+            let (Some(left), Some(right)) = (
+                assignment.child_by_field_name("left"),
+                assignment.child_by_field_name("right"),
+            ) else {
+                continue;
+            };
+            if left.kind() == "identifier" {
+                if let Ok(name) = left.utf8_text(source) {
+                    bindings.insert(name.to_string(), right);
+                }
+            }
+        }
+        bindings
     }
 
     /// Extract a complete Migration from the parsed file.
@@ -459,7 +503,7 @@ impl<'a> MigrationExtractor<'a> {
                         .any(|child| child.kind() != "comment")
             }
             "identifier" => self
-                .resolve_module_list_binding(self.node_text(arm), arm.start_byte())
+                .resolve_module_list_binding(self.node_text(arm))
                 .map(|list| {
                     !extracted_operations.is_empty()
                         || list
@@ -474,9 +518,7 @@ impl<'a> MigrationExtractor<'a> {
     fn resolve_list_node(&self, node: Node<'a>) -> Option<Node<'a>> {
         match node.kind() {
             "list" => Some(node),
-            "identifier" => {
-                self.resolve_module_list_binding(self.node_text(node), node.start_byte())
-            }
+            "identifier" => self.resolve_module_list_binding(self.node_text(node)),
             _ => None,
         }
     }
@@ -629,7 +671,7 @@ impl<'a> MigrationExtractor<'a> {
             "list" | "tuple" => self.resolve_sql_sequence_value(node),
             "identifier" => {
                 let name = self.node_text(node).to_string();
-                self.resolve_module_sql_binding(&name, node.start_byte())
+                self.resolve_module_sql_binding(&name)
             }
             "attribute" => self.is_run_sql_noop(node).then(String::new),
             _ => None,
@@ -685,38 +727,8 @@ impl<'a> MigrationExtractor<'a> {
         )
     }
 
-    /// The final module-level assignment to `name` before the identifier use.
-    /// Only one level of indirection is followed.
-    fn find_module_assignment_rhs(&self, name: &str, before_byte: usize) -> Option<Node<'a>> {
-        let root = self.parsed.root_node();
-        let source = self.parsed.source_bytes();
-        let mut latest = None;
-        for child in root.children(&mut root.walk()) {
-            if child.start_byte() >= before_byte {
-                break;
-            }
-            if child.kind() != "expression_statement" {
-                continue;
-            }
-            let Some(assignment) = child.named_child(0) else {
-                continue;
-            };
-            if assignment.kind() != "assignment" {
-                continue;
-            }
-            let Some(left) = assignment.child_by_field_name("left") else {
-                continue;
-            };
-            if left.utf8_text(source).ok() != Some(name) {
-                continue;
-            }
-            latest = assignment.child_by_field_name("right");
-        }
-        latest
-    }
-
-    fn resolve_module_sql_binding(&self, name: &str, before_byte: usize) -> Option<String> {
-        let right = self.find_module_assignment_rhs(name, before_byte)?;
+    fn resolve_module_sql_binding(&self, name: &str) -> Option<String> {
+        let right = *self.module_bindings.get(name)?;
         match right.kind() {
             "string" | "concatenated_string" => Some(self.extract_string_value(right)),
             "list" | "tuple" => self.resolve_sql_sequence_value(right),
@@ -724,8 +736,10 @@ impl<'a> MigrationExtractor<'a> {
         }
     }
 
-    fn resolve_module_list_binding(&self, name: &str, before_byte: usize) -> Option<Node<'a>> {
-        self.find_module_assignment_rhs(name, before_byte)
+    fn resolve_module_list_binding(&self, name: &str) -> Option<Node<'a>> {
+        self.module_bindings
+            .get(name)
+            .copied()
             .filter(|right| right.kind() == "list")
     }
 
@@ -1090,6 +1104,10 @@ class Migration(migrations.Migration):
         migrations.RunSQL(SAFE_LATEST),
         migrations.RunSQL(DYNAMIC_LATEST),
     ]
+
+
+# Assignments after the Migration class cannot affect identifiers used inside it.
+SAFE_LATEST = "CREATE INDEX late_idx ON tbl (col)"
 "#;
 
     #[test]

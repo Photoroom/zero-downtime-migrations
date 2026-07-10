@@ -1,6 +1,6 @@
 [package]
 name = "zero-downtime-migrations"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
 description = "A PostgreSQL migration safety linter for Django"
 license = "MIT"
@@ -33,7 +33,6 @@ glob = "0.3"
 
 # Error handling & diagnostics
 thiserror = "1"
-miette = { version = "7", features = ["fancy"] }
 
 # Git integration (vendored-openssl for cross-compilation)
 git2 = { version = "0.21", features = ["vendored-openssl"] }
