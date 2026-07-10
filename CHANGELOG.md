@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 - Unreleased
+## 0.4.0 - 2026-07-10
 
 Changes since 0.3.2:
 
@@ -44,6 +44,8 @@ Changes since 0.3.2:
   exempt under its new model name.
 - **R008** now treats deleted application files as changes alongside a
   migration instead of silently dropping them from the changeset.
+- Programmatic R008 configurations with an invalid allowed-file glob now fail
+  closed instead of panicking.
 
 ### CLI / output
 
@@ -68,6 +70,11 @@ Changes since 0.3.2:
 - `--diff` reads migration content from the tree at `HEAD`; unstaged working
   tree edits cannot hide a violation in the commit being compared. Staged mode
   continues to read the index.
+- Pathologically deep Python ASTs are rejected before extraction, bounding
+  stack use for untrusted migration files. Module-level SQL bindings are
+  indexed once, avoiding quadratic rescans in identifier-heavy migrations.
+- Invalid git references include the fetch/shallow-checkout recovery hint in
+  normal CLI output.
 
 ### Configuration
 
@@ -87,6 +94,16 @@ Changes since 0.3.2:
   untrusted, and config files must be regular UTF-8 files no larger than
   1 MiB. Upward discovery fails closed on Windows until ACL ownership can be
   validated; current-directory config remains supported.
+
+### Distribution
+
+- Release tags must point to a commit on `main` and pass the locked RustSec
+  audit before any artifacts are built.
+- Wheels and source distributions are installed and smoke-tested before
+  publication. Standalone binaries are extracted from the same platform wheels,
+  so Linux downloads inherit the declared manylinux 2.28 compatibility floor.
+- GitHub releases include `SHA256SUMS`, and `install.sh` verifies the selected
+  standalone binary before installing or executing it.
 
 ### JSON output schema
 
@@ -127,6 +144,10 @@ be present on every diagnostic.
   (`r"..."`), triple-quoted, and Python's adjacent-literal
   concatenation. F-strings with interpolations return an empty
   string rather than fabricate a plausible-but-wrong identifier.
+- Normal directory scans release each parsed migration immediately instead of
+  retaining the entire repository in memory. The unused `miette/fancy`
+  rendering stack was removed; user-facing recovery guidance now lives in the
+  errors the CLI actually prints.
 
 ### Migration notes
 
