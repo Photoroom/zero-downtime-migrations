@@ -141,11 +141,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let migration_paths = discover_migrations(&cli.paths, diff.as_ref(), &config.exclude)?;
     let changed_migration_paths = match diff.as_ref() {
         Some(diff) => discover_migration_changes(diff, &cli.paths, &config.exclude)?,
-        None => migration_paths.clone(),
+        None => Vec::new(),
     };
 
     // If no migrations found, that's OK
-    if changed_migration_paths.is_empty() {
+    if migration_paths.is_empty() && changed_migration_paths.is_empty() {
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -160,7 +160,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         match parse_and_check_file(path, &rule_registry, &config, diff.as_ref()) {
             Ok((migration, diagnostics)) => {
                 all_diagnostics.extend(diagnostics);
-                migrations.push(migration);
+                if diff.is_some() {
+                    migrations.push(migration);
+                }
             }
             Err(e) => {
                 eprintln!(
