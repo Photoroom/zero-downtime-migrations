@@ -17,6 +17,14 @@ use crate::file_io::{read_bounded_regular_file, ReadFileError};
 /// processing untrusted input. Currently a hard-coded 10 MiB.
 pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
+/// Maximum tree-sitter nesting accepted from a migration.
+///
+/// `ponytail:` this deliberately rejects pathologically deep Python so the
+/// existing recursive extraction paths stay stack-bounded. If real Django
+/// migrations approach this ceiling, replace those consumers with iterative
+/// walkers before raising it.
+const MAX_AST_DEPTH: usize = 256;
+
 /// Returns `Err(Error::FileTooLarge)` if the given byte count exceeds
 /// `MAX_FILE_SIZE`. Callers that already hold a source string should pass
 /// `source.len() as u64`; callers reading from disk can stat the file first.
@@ -43,14 +51,7 @@ impl ParsedMigration {
     /// Parse a migration file from source code.
     pub fn parse(source: impl Into<String>) -> Result<Self> {
         let source = source.into();
-        let mut parser = Parser::new();
-        parser
-            .set_language(&PYTHON_LANGUAGE)
-            .expect("Failed to set Python language");
-
-        let tree = parser
-            .parse(&source, None)
-            .ok_or_else(|| Error::parse("<source>", "tree-sitter failed to parse"))?;
+        let tree = parse_tree(&source, Path::new("<source>"))?;
 
         Ok(Self { source, tree })
     }
@@ -65,14 +66,7 @@ impl ParsedMigration {
             }
         };
 
-        let mut parser = Parser::new();
-        parser
-            .set_language(&PYTHON_LANGUAGE)
-            .expect("Failed to set Python language");
-
-        let tree = parser
-            .parse(&source, None)
-            .ok_or_else(|| Error::parse(path, "tree-sitter failed to parse"))?;
+        let tree = parse_tree(&source, path)?;
 
         // Check for parse errors
         if tree.root_node().has_error() {
@@ -218,6 +212,36 @@ impl ParsedMigration {
         collect_imports(root, &mut imports);
         imports
     }
+}
+
+fn parse_tree(source: &str, path: &Path) -> Result<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&PYTHON_LANGUAGE)
+        .expect("Failed to set Python language");
+
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| Error::parse(path, "tree-sitter failed to parse"))?;
+    validate_ast_depth(tree.root_node(), path)?;
+    Ok(tree)
+}
+
+fn validate_ast_depth(root: Node<'_>, path: &Path) -> Result<()> {
+    let mut stack = vec![(root, 1usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth > MAX_AST_DEPTH {
+            return Err(Error::parse(
+                path,
+                format!("AST nesting exceeds the maximum depth of {MAX_AST_DEPTH}"),
+            ));
+        }
+        stack.extend(
+            node.children(&mut node.walk())
+                .map(|child| (child, depth + 1)),
+        );
+    }
+    Ok(())
 }
 
 fn collect_imports<'tree>(node: Node<'tree>, imports: &mut Vec<Node<'tree>>) {
@@ -517,6 +541,19 @@ class Migration:
             }
             other => panic!("expected FileTooLarge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_parse_rejects_pathological_ast_depth() {
+        let nesting = MAX_AST_DEPTH + 1;
+        let source = format!(
+            "class Migration:\n    operations = [{}None{}]\n",
+            "(".repeat(nesting),
+            ")".repeat(nesting),
+        );
+
+        let err = ParsedMigration::parse(source).unwrap_err();
+        assert!(err.to_string().contains("AST nesting exceeds"));
     }
 
     // Module-boundary edge cases for `find_migration_class`. Each test
