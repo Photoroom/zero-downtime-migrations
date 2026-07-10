@@ -81,7 +81,7 @@ jobs:
             asset: zdm-x86_64-unknown-linux-gnu
             script: zdm
             native: true
-            before_script_linux: dnf -y install perl-IPC-Cmd
+            before_script_linux: dnf -y install perl-IPC-Cmd perl-Time-Piece
           # Linux ARM64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
