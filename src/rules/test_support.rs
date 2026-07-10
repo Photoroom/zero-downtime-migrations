@@ -35,17 +35,13 @@ pub(crate) fn check_rule<R: Rule>(rule: &R, source: &str) -> Vec<Diagnostic> {
 
 /// Run a changeset rule against pre-built migration slices and
 /// other-changed-files. The caller owns Migration and Path
-/// allocation; this helper just packages the boilerplate
-/// RuleContext at the path-less "." root.
+/// allocation; changeset rules take the `Config` directly.
 pub(crate) fn check_changeset_rule<R: ChangesetRule>(
     rule: &R,
     migrations: &[&Migration],
     other_files: &[&Path],
     config: &Config,
 ) -> Vec<Diagnostic> {
-    let ctx = RuleContext {
-        config,
-        path: Path::new("."),
-    };
-    rule.check(migrations, other_files, &ctx)
+    let migration_paths: Vec<&Path> = migrations.iter().map(|m| m.path.as_path()).collect();
+    rule.check(migrations, &migration_paths, other_files, config)
 }

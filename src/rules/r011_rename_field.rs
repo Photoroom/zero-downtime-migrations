@@ -31,20 +31,21 @@ impl Rule for R011RenameField {
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        for op in migration.top_level_operations_of_type(OperationType::RenameField) {
-            diagnostics.push(Diagnostic {
-                rule_id: self.id(),
-                rule_name: self.name(),
-                message: "RenameField requires simultaneous application deployment".to_string(),
-                severity: self.severity(),
-                path: ctx.path.to_path_buf(),
-                span: op.span,
-                help: Some(
+        for op in migration.database_effective_operations_of_type(OperationType::RenameField) {
+            diagnostics.push(
+                Diagnostic::new(
+                    self.id(),
+                    self.name(),
+                    self.severity(),
+                    "RenameField requires simultaneous application deployment",
+                    ctx.path.to_path_buf(),
+                    op.span,
+                )
+                .with_help(
                     "Consider: 1) Add new field, 2) Copy data, 3) Update app to use new field, \
-                     4) Remove old field. This allows gradual rollout."
-                        .to_string(),
+                     4) Remove old field. This allows gradual rollout.",
                 ),
-            });
+            );
         }
 
         diagnostics
@@ -74,11 +75,39 @@ class Migration(migrations.Migration):
         crate::rules::test_support::check_rule(&R011RenameField, source)
     }
 
+    const WRAPPED_RENAME_FIELD_BAD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.RenameField(
+                    model_name='product',
+                    old_name='old_name',
+                    new_name='new_name',
+                ),
+            ],
+        ),
+    ]
+"#;
+
     #[test]
     fn test_renamefield_is_flagged() {
         let diagnostics = check_migration(RENAME_FIELD_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R011");
         assert_eq!(diagnostics[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn test_wrapped_renamefield_is_flagged() {
+        // A RenameField inside SeparateDatabaseAndState(database_operations=[...])
+        // is still a database-effective rename, consistent with R010/R016/R017.
+        let diagnostics = check_migration(WRAPPED_RENAME_FIELD_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R011");
     }
 }

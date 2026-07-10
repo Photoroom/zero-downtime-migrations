@@ -5,11 +5,12 @@
 //! into typed Rust structures.
 
 use std::path::Path;
+use std::sync::LazyLock;
 
-use once_cell::sync::Lazy;
 use tree_sitter::{Language, Node, Parser, Tree};
 
 use crate::error::{Error, Result};
+use crate::file_io::{read_bounded_regular_file, ReadFileError};
 
 /// Maximum size (in bytes) of a single migration file the
 /// parser will accept. Bounds memory use and parse time when
@@ -27,7 +28,7 @@ pub(crate) fn check_size(path: &Path, size: u64) -> Result<()> {
 }
 
 /// Global Python language instance.
-static PYTHON_LANGUAGE: Lazy<Language> = Lazy::new(|| tree_sitter_python::LANGUAGE.into());
+static PYTHON_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_python::LANGUAGE.into());
 
 /// A parsed Python migration file.
 #[derive(Debug)]
@@ -56,31 +57,13 @@ impl ParsedMigration {
 
     /// Parse a migration file from a path.
     pub fn parse_file(path: &Path) -> Result<Self> {
-        // Cap on-disk size before reading to bound memory.
-        //
-        // `std::fs::metadata` follows symlinks, so a symlink to
-        // `/dev/zero` or `/dev/random` would report length 0 here,
-        // skip `check_size`, then OOM the process at
-        // `read_to_string`. Use `symlink_metadata` to stat the link
-        // itself, then reject any non-regular file outright — the
-        // size cap only meaningfully applies to regular files. A
-        // legitimate symlink-to-regular-file gets rejected too,
-        // mirroring the discovery walk's symlink policy (see
-        // src/discovery.rs:75) and giving the binary a single,
-        // consistent answer to "we don't open links".
-        let metadata = std::fs::symlink_metadata(path).map_err(|e| Error::file_read(path, e))?;
-        if !metadata.file_type().is_file() {
-            return Err(Error::file_read(
-                path,
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "refusing to read non-regular file (symlink, fifo, device, etc.)",
-                ),
-            ));
-        }
-        check_size(path, metadata.len())?;
-
-        let source = std::fs::read_to_string(path).map_err(|e| Error::file_read(path, e))?;
+        let source = match read_bounded_regular_file(path, MAX_FILE_SIZE) {
+            Ok(source) => source,
+            Err(ReadFileError::Io(error)) => return Err(Error::file_read(path, error)),
+            Err(ReadFileError::TooLarge { size, max }) => {
+                return Err(Error::file_too_large(path, size, max));
+            }
+        };
 
         let mut parser = Parser::new();
         parser
@@ -232,16 +215,21 @@ impl ParsedMigration {
     pub(crate) fn get_imports(&self) -> Vec<Node<'_>> {
         let root = self.root_node();
         let mut imports = Vec::new();
-
-        for child in root.children(&mut root.walk()) {
-            if child.kind() == "import_statement" || child.kind() == "import_from_statement" {
-                imports.push(child);
-            }
-        }
-
+        collect_imports(root, &mut imports);
         imports
     }
+}
 
+fn collect_imports<'tree>(node: Node<'tree>, imports: &mut Vec<Node<'tree>>) {
+    if node.kind() == "import_statement" || node.kind() == "import_from_statement" {
+        imports.push(node);
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_imports(child, imports);
+    }
+}
+
+impl ParsedMigration {
     /// Get the text of a node.
     pub(crate) fn node_text(&self, node: Node<'_>) -> &str {
         node.utf8_text(self.source_bytes()).unwrap_or("")

@@ -9,8 +9,9 @@ use std::path::Path;
 use glob::Pattern;
 
 use crate::ast::Migration;
+use crate::config::Config;
 use crate::diagnostics::{Diagnostic, Severity, Span};
-use crate::rules::{ChangesetRule, RuleContext};
+use crate::rules::ChangesetRule;
 
 /// Rule that detects disallowed file changes alongside migrations.
 pub struct R008DisallowedFileChanges;
@@ -35,19 +36,19 @@ impl ChangesetRule for R008DisallowedFileChanges {
 
     fn check(
         &self,
-        migrations: &[&Migration],
+        _migrations: &[&Migration],
+        changed_migration_paths: &[&Path],
         other_changed_files: &[&Path],
-        ctx: &RuleContext,
+        config: &Config,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
         // If no migrations are changed, nothing to check
-        if migrations.is_empty() {
+        if changed_migration_paths.is_empty() {
             return diagnostics;
         }
 
-        let patterns: Vec<Pattern> = ctx
-            .config
+        let patterns: Vec<Pattern> = config
             .allowed_file_patterns
             .iter()
             .map(|p| Pattern::new(p).expect("allowed_file_patterns are validated at config load"))
@@ -56,22 +57,23 @@ impl ChangesetRule for R008DisallowedFileChanges {
         for file in other_changed_files {
             let is_allowed = !patterns.is_empty() && allowed_by_patterns(file, &patterns);
             if !is_allowed {
-                diagnostics.push(Diagnostic {
-                    rule_id: self.id(),
-                    rule_name: self.name(),
-                    message: format!(
-                        "File '{}' does not match any allowed pattern and changed alongside migrations",
-                        file.display(),
-                    ),
-                    severity: self.severity(),
-                    path: file.to_path_buf(),
-                    span: Span::default(),
-                    help: Some(
+                diagnostics.push(
+                    Diagnostic::new(
+                        self.id(),
+                        self.name(),
+                        self.severity(),
+                        format!(
+                            "File '{}' does not match any allowed pattern and changed alongside migrations",
+                            file.display(),
+                        ),
+                        file.to_path_buf(),
+                        Span::default(),
+                    )
+                    .with_help(
                         "Database migrations and application code should be deployed separately. \
-                         Split this PR into separate changes or add the pattern to allowed-file-patterns."
-                            .to_string(),
+                         Split this PR into separate changes or add the pattern to allowed-file-patterns.",
                     ),
-                });
+                );
             }
         }
 

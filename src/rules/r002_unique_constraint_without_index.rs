@@ -51,17 +51,17 @@ impl Rule for R002UniqueConstraintWithoutIndex {
                 return;
             }
 
-            diagnostics.push(Diagnostic {
-                rule_id: self.id(),
-                rule_name: self.name(),
-                message:
-                    "AddConstraint with UniqueConstraint locks the table while it builds the index"
-                        .to_string(),
-                severity: self.severity(),
-                path: ctx.path.to_path_buf(),
-                span: op.span,
-                help: Some(include_str!("help/r002_unique_constraint.txt").to_string()),
-            });
+            diagnostics.push(
+                Diagnostic::new(
+                    self.id(),
+                    self.name(),
+                    self.severity(),
+                    "AddConstraint with UniqueConstraint locks the table while it builds the index",
+                    ctx.path.to_path_buf(),
+                    op.span,
+                )
+                .with_help(include_str!("help/r002_unique_constraint.txt")),
+            );
         });
 
         diagnostics
@@ -128,6 +128,27 @@ class Migration(migrations.Migration):
     #[test]
     fn test_addconstraint_unique_on_existing_model_is_flagged() {
         let diagnostics = check_migration(UNIQUE_CONSTRAINT_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R002");
+    }
+
+    const POSITIONAL_UNIQUE_CONSTRAINT_BAD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.AddConstraint(
+            'product',
+            models.UniqueConstraint(fields=['sku'], name='unique_sku'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_positional_unique_constraint_is_flagged() {
+        let diagnostics = check_migration(POSITIONAL_UNIQUE_CONSTRAINT_BAD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R002");
     }

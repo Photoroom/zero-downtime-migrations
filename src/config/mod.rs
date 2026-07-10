@@ -17,6 +17,9 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
+use crate::file_io::{read_bounded_regular_file, ReadFileError};
+
+const MAX_CONFIG_FILE_SIZE: u64 = 1024 * 1024;
 
 /// Configuration for zdm.
 ///
@@ -43,11 +46,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// Create a new config with defaults.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Check if a rule is enabled.
     pub fn is_rule_enabled(&self, rule_id: &str) -> bool {
         // If select is empty, all rules are enabled by default
@@ -73,9 +71,7 @@ impl Config {
     /// `Error::InvalidGlobPattern` instead of being silently dropped
     /// at the match site.
     pub fn load_from_directory(dir: &Path) -> Result<Self> {
-        let config_dir = Self::find_config_dir(dir)?;
-        let search_dir = config_dir.as_deref().unwrap_or(dir);
-        Self::load_from_single_dir(search_dir)
+        Ok(Self::find_config(dir)?.unwrap_or_default())
     }
 
     /// Load configuration from exactly `dir`, without walking upward.
@@ -83,7 +79,7 @@ impl Config {
     /// Standalone config still overrides `pyproject.toml [tool.zdm]` within
     /// that one directory, and glob patterns are still validated.
     pub fn load_from_exact_directory(dir: &Path) -> Result<Self> {
-        Self::load_from_single_dir(dir)
+        Ok(Self::load_from_single_dir(dir)?.unwrap_or_default())
     }
 
     /// Walk upward from `start` looking for the first directory that
@@ -101,34 +97,14 @@ impl Config {
     /// movement to within a confirmed repo closes that escalation
     /// path.
     ///
-    /// Returns `None` if no config file is found within those
-    /// bounds.
-    fn find_config_dir(start: &Path) -> Result<Option<std::path::PathBuf>> {
-        // Four structural rules, in order:
-        //
-        //   (1) A config in `start` always wins — no walk-up needed.
-        //   (2) If `start` is itself the repo root (has its own
-        //       `.git`), we never climb. Otherwise a world-writable
-        //       `/tmp/zero-downtime-migrations.toml` next to a
-        //       temp-dir repo would be adopted as "the project
-        //       config". On Unix this case is also caught by
-        //       `anchor_dir_is_trusted`, but on Windows the trust
-        //       check is a no-op, so we need a structural guard
-        //       too.
-        //   (3) Otherwise, the walk-up only runs *inside* a
-        //       trusted git repository: there must be a `.git`-
-        //       bearing ancestor we own, strictly *above* `start`.
-        //       This authorises upward movement and pins its bounds.
-        //   (4) Walk upward from `start`, stopping at the first
-        //       directory that holds a config file, or at the
-        //       trusted anchor itself if no config is found before
-        //       reaching it.
-        //
-        // The trust check on the anchor is the security-critical
-        // piece — see `anchor_dir_is_trusted` for the world-
-        // writable `/tmp` threat model.
-        if has_zdm_config_file(start)? {
-            return Ok(Some(start.to_path_buf()));
+    /// Returns `None` if no config file is found within those bounds.
+    fn find_config(start: &Path) -> Result<Option<Self>> {
+        // Config in `start` wins; if `start` is itself the repo root we never
+        // climb (a structural guard that also covers Windows, where
+        // `anchor_dir_is_trusted` is a no-op); otherwise walk up only inside a
+        // trusted git repo, stopping at the first config found or at the anchor.
+        if let Some(config) = Self::load_from_single_dir(start)? {
+            return Ok(Some(config));
         }
         if start.join(".git").exists() {
             return Ok(None);
@@ -141,8 +117,8 @@ impl Config {
         let mut current = start;
         while let Some(parent) = current.parent() {
             current = parent;
-            if has_zdm_config_file(current)? {
-                return Ok(Some(current.to_path_buf()));
+            if let Some(config) = Self::load_from_single_dir(current)? {
+                return Ok(Some(config));
             }
             if current == anchor {
                 return Ok(None);
@@ -154,13 +130,15 @@ impl Config {
     /// Load whichever config files exist in a single directory,
     /// merging them with the documented precedence (standalone
     /// overrides pyproject) and validating glob patterns.
-    fn load_from_single_dir(dir: &Path) -> Result<Self> {
+    fn load_from_single_dir(dir: &Path) -> Result<Option<Self>> {
         let mut config = Config::default();
+        let mut found = false;
 
         // Try pyproject.toml first (lowest precedence of file configs)
         let pyproject_path = dir.join("pyproject.toml");
         if pyproject_path.exists() {
             if let Some(file_config) = Self::load_pyproject(&pyproject_path)? {
+                found = true;
                 config.merge(file_config);
             }
         }
@@ -168,12 +146,16 @@ impl Config {
         // Try standalone config (higher precedence)
         let standalone_path = dir.join("zero-downtime-migrations.toml");
         if standalone_path.exists() {
+            found = true;
             let file_config = Self::load_standalone(&standalone_path)?;
             config.merge(file_config);
         }
 
+        if !found {
+            return Ok(None);
+        }
         config.validate_glob_patterns()?;
-        Ok(config)
+        Ok(Some(config))
     }
 
     /// Compile every glob pattern in this config to surface syntax errors
@@ -191,7 +173,7 @@ impl Config {
 
     /// Load from pyproject.toml.
     fn load_pyproject(path: &Path) -> Result<Option<FileConfig>> {
-        let content = std::fs::read_to_string(path).map_err(|e| Error::file_read(path, e))?;
+        let content = read_config_file(path)?;
 
         let pyproject: PyProjectToml =
             toml::from_str(&content).map_err(|e| Error::config_parse_error(path, e))?;
@@ -201,7 +183,7 @@ impl Config {
 
     /// Load from standalone zero-downtime-migrations.toml.
     fn load_standalone(path: &Path) -> Result<FileConfig> {
-        let content = std::fs::read_to_string(path).map_err(|e| Error::file_read(path, e))?;
+        let content = read_config_file(path)?;
 
         toml::from_str(&content).map_err(|e| Error::config_parse_error(path, e))
     }
@@ -245,58 +227,33 @@ impl Config {
     }
 }
 
-/// `true` iff a zdm config file lives directly in `dir`.
-///
-/// A bare `pyproject.toml` for another tool does not count; otherwise it
-/// would shadow a repo-level zdm config while contributing only defaults.
-fn has_zdm_config_file(dir: &Path) -> Result<bool> {
-    if dir.join("zero-downtime-migrations.toml").exists() {
-        return Ok(true);
+fn read_config_file(path: &Path) -> Result<String> {
+    match read_bounded_regular_file(path, MAX_CONFIG_FILE_SIZE) {
+        Ok(content) => Ok(content),
+        Err(ReadFileError::Io(error)) => Err(Error::file_read(path, error)),
+        Err(ReadFileError::TooLarge { size, max }) => Err(Error::file_too_large(path, size, max)),
     }
-    let pyproject_path = dir.join("pyproject.toml");
-    if !pyproject_path.exists() {
-        return Ok(false);
-    }
-    Config::load_pyproject(&pyproject_path).map(|config| config.is_some())
 }
 
-/// The closest directory *strictly above* `start` that holds a
-/// `.git` entry AND passes the trust check (see
-/// `anchor_dir_is_trusted`). `None` means the walk-up is not
-/// authorised — either we're not inside a git repo or the only
-/// `.git` we can see was planted by another user.
-///
-/// "Strictly above" is the important bit. If `start` itself holds
-/// `.git`, the function returns `None`: a config file next to a
-/// `.git`-bearing `start` was already handled by `find_config_dir`'s
-/// rule (1), so reaching this helper means we should not climb
-/// further. A world-writable `/tmp/zero-downtime-migrations.toml`
-/// next to a temp-dir repo would otherwise be adopted as "the
-/// project config" via `start.parent()`.
-///
-/// `.git` can be a directory (regular repo) or a file (worktree /
-/// submodule gitdir pointer); both forms count.
+/// The closest directory *strictly above* `start` that holds a trusted `.git`
+/// entry. The first `.git` is always the repository boundary; an untrusted
+/// boundary stops discovery rather than allowing a config from an outer repo.
 fn trusted_git_anchor_strictly_above(start: &Path) -> Option<std::path::PathBuf> {
     let mut probe = start;
     while let Some(parent) = probe.parent() {
-        if parent.join(".git").exists() && anchor_dir_is_trusted(parent) {
-            return Some(parent.to_path_buf());
+        if parent.join(".git").exists() {
+            return anchor_dir_is_trusted(parent).then(|| parent.to_path_buf());
         }
         probe = parent;
     }
     None
 }
 
-/// On Unix: `true` iff `dir` exists and its owner uid matches the
-/// current effective uid. Used by `Config::find_config_dir` to
-/// reject a `.git` ancestor that an attacker could plant in a
-/// shared parent (classic `/tmp` sticky-bit scenario). A directory
-/// we own — or that's owned by root in a system-managed location
-/// — passes; one owned by an arbitrary other user fails.
-///
-/// On Windows: always `true` because ownership semantics differ
-/// (ACL-based, no simple uid comparison). The same attack would
-/// need a Windows-specific guard; not implemented yet.
+/// Rejects a `.git` ancestor an attacker could plant in a shared parent
+/// (classic `/tmp` sticky-bit scenario) before we trust it as the walk-up
+/// anchor. On Unix: `true` iff `dir` is not group/other-writable and is
+/// owned by the effective uid (or root). Other platforms fail closed until
+/// their ownership/ACL model can be validated.
 #[cfg(unix)]
 fn anchor_dir_is_trusted(dir: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -313,7 +270,7 @@ fn anchor_dir_is_trusted(dir: &Path) -> bool {
 
 #[cfg(not(unix))]
 fn anchor_dir_is_trusted(_dir: &Path) -> bool {
-    true
+    false
 }
 
 /// pyproject.toml structure.
@@ -593,6 +550,7 @@ exclude = ["**/test_migrations/**", "**/fixtures/**"]
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_load_walks_up_to_find_config() {
         // Drop a config in the repo root, then invoke load from a
@@ -662,6 +620,7 @@ exclude = ["**/test_migrations/**", "**/fixtures/**"]
         assert!(!config.ignore.contains("R003"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_walk_picks_nearest_config() {
         // When configs exist at multiple levels, the nearest one
@@ -697,6 +656,7 @@ exclude = ["**/test_migrations/**", "**/fixtures/**"]
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_nested_pyproject_without_zdm_does_not_shadow_parent_config() {
         let temp = TempDir::new().unwrap();
@@ -800,7 +760,7 @@ line-length = 88
     #[test]
     fn test_no_config_no_git_returns_defaults() {
         // Both no config and no `.git` anywhere: the loop must
-        // terminate by returning `None` from `find_config_dir`
+        // terminate by returning `None` from `find_config`
         // rather than walking all the way to the filesystem root.
         let temp = TempDir::new().unwrap();
         let nested = temp.path().join("a/b/c/d");
@@ -810,6 +770,58 @@ line-length = 88
         assert!(config.select.is_empty());
         assert!(config.ignore.is_empty());
         assert!(config.exclude.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_untrusted_nearest_repo_blocks_outer_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join(".git")).unwrap();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"ignore = ["R001"]"#,
+        )
+        .unwrap();
+
+        let nested_repo = temp.path().join("nested");
+        fs::create_dir_all(nested_repo.join(".git")).unwrap();
+        let start = nested_repo.join("app/migrations");
+        fs::create_dir_all(&start).unwrap();
+        fs::set_permissions(&nested_repo, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let config = Config::load_from_directory(&start).unwrap();
+        fs::set_permissions(&nested_repo, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(config.ignore.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_config_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target.toml");
+        fs::write(&target, r#"ignore = ["R001"]"#).unwrap();
+        symlink(&target, temp.path().join("zero-downtime-migrations.toml")).unwrap();
+
+        assert!(Config::load_from_exact_directory(temp.path()).is_err());
+    }
+
+    #[test]
+    fn test_oversized_config_is_rejected() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            vec![b' '; MAX_CONFIG_FILE_SIZE as usize + 1],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Config::load_from_exact_directory(temp.path()),
+            Err(Error::FileTooLarge { .. })
+        ));
     }
 
     #[cfg(unix)]

@@ -4,7 +4,7 @@
 //! Regular `AddIndex` takes an exclusive lock on the table, blocking all reads
 //! and writes until the index is built.
 
-use crate::ast::{Migration, OperationData, OperationType};
+use crate::ast::{Migration, OperationType};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::rules::{walk_with_created_models, Rule, RuleContext};
 
@@ -35,25 +35,23 @@ impl Rule for R001NonConcurrentAddIndex {
             if op.op_type != OperationType::AddIndex {
                 return;
             }
-            if let OperationData::Index(index_op) = &op.data {
-                if created.contains(&index_op.model_name) {
-                    return;
-                }
+            if op.model_name().is_some_and(|m| created.contains(m)) {
+                return;
             }
-            diagnostics.push(Diagnostic {
-                rule_id: self.id(),
-                rule_name: self.name(),
-                message: "Use AddIndexConcurrently instead of AddIndex to avoid table locks"
-                    .to_string(),
-                severity: self.severity(),
-                path: ctx.path.to_path_buf(),
-                span: op.span,
-                help: Some(
+            diagnostics.push(
+                Diagnostic::new(
+                    self.id(),
+                    self.name(),
+                    self.severity(),
+                    "Use AddIndexConcurrently instead of AddIndex to avoid table locks",
+                    ctx.path.to_path_buf(),
+                    op.span,
+                )
+                .with_help(
                     "Replace migrations.AddIndex with AddIndexConcurrently from \
-                     django.contrib.postgres.operations"
-                        .to_string(),
+                     django.contrib.postgres.operations",
                 ),
-            });
+            );
         });
 
         diagnostics
@@ -236,6 +234,59 @@ class Migration(migrations.Migration):
         assert!(
             diagnostics.is_empty(),
             "AddIndex on a model created earlier in the same migration should not fire R001, got: {diagnostics:?}",
+        );
+    }
+
+    #[test]
+    fn test_renamed_fresh_model_remains_exempt() {
+        let diagnostics = check_migration(
+            r#"
+from django.db import migrations, models
+
+class Migration(migrations.Migration):
+    operations = [
+        migrations.CreateModel(
+            name='Product',
+            fields=[('id', models.AutoField(primary_key=True))],
+        ),
+        migrations.RenameModel(old_name='Product', new_name='Item'),
+        migrations.AddIndex(
+            model_name='item',
+            index=models.Index(fields=['name'], name='item_name_idx'),
+        ),
+    ]
+"#,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    const CREATEMODEL_BEFORE_POSITIONAL_ADDINDEX_GOOD: &str = r#"
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.CreateModel(
+            name='Product',
+            fields=[
+                ('id', models.AutoField(primary_key=True)),
+                ('name', models.CharField(max_length=255)),
+            ],
+        ),
+        migrations.AddIndex(
+            'product',
+            models.Index(fields=['name'], name='product_name_idx'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_createmodel_before_positional_addindex_is_exempted() {
+        let diagnostics = check_migration(CREATEMODEL_BEFORE_POSITIONAL_ADDINDEX_GOOD);
+        assert!(
+            diagnostics.is_empty(),
+            "positional AddIndex on a fresh model should not fire R001, got: {diagnostics:?}",
         );
     }
 }

@@ -1,9 +1,8 @@
 # Changelog
 
-## 0.4.0 - 2026-05-20
+## 0.4.0 - Unreleased
 
-Accumulating changes since 0.3.2. The notes below describe the
-user-visible behaviour shifts in the 0.4.0 release.
+Changes since 0.3.2:
 
 ### Rules
 
@@ -38,6 +37,13 @@ user-visible behaviour shifts in the 0.4.0 release.
   index exemptions. Even a matching `AddIndexConcurrently` does not
   silence a one-step `AddField(ForeignKey)` on an existing table;
   split the column, index, backfill, and constraint work explicitly.
+- **R003** resolves the final module-level SQL assignment that appears before
+  the migration class. Later dynamic assignments no longer fall back to stale
+  earlier literals, preventing reassignment from hiding a blocking index.
+- Fresh-model exemptions follow `RenameModel`, so an empty table remains
+  exempt under its new model name.
+- **R008** now treats deleted application files as changes alongside a
+  migration instead of silently dropping them from the changeset.
 
 ### CLI / output
 
@@ -53,11 +59,15 @@ user-visible behaviour shifts in the 0.4.0 release.
   Newlines and tabs are escaped in paths, error chain strings,
   and rule messages (single-line by convention); help text
   preserves newlines for multi-line layout.
+- C1 Unicode control characters are escaped as well.
 - File discovery rejects symlinked migration files. A
   `0001.py -> /etc/passwd` symlink inside a migrations directory
   is no longer followed.
 - Oversized migration inputs (>10 MiB) are rejected with exit
   code 2 and a `File too large:` error instead of being parsed.
+- `--diff` reads migration content from the tree at `HEAD`; unstaged working
+  tree edits cannot hide a violation in the commit being compared. Staged mode
+  continues to read the index.
 
 ### Configuration
 
@@ -73,6 +83,10 @@ user-visible behaviour shifts in the 0.4.0 release.
 - `Config.exclude` and `Config.allowed_file_patterns` are validated
   at load time; an invalid glob now surfaces as
   `Error::InvalidGlobPattern` instead of being silently dropped.
+- Config discovery stops at the nearest `.git` even when that boundary is
+  untrusted, and config files must be regular UTF-8 files no larger than
+  1 MiB. Upward discovery fails closed on Windows until ACL ownership can be
+  validated; current-directory config remains supported.
 
 ### JSON output schema
 
@@ -108,8 +122,6 @@ be present on every diagnostic.
   `SeparateDatabaseAndState(database_operations=[...])` so rules can
   inspect them in execution order while preserving each operation's
   source span.
-- AST extractor captures index column lists and names on
-  `IndexOperation` for future index-shape analysis.
 - `extract_string_value` now decomposes tree-sitter `string` /
   `concatenated_string` nodes correctly, including raw-prefixed
   (`r"..."`), triple-quoted, and Python's adjacent-literal
@@ -117,6 +129,14 @@ be present on every diagnostic.
   string rather than fabricate a plausible-but-wrong identifier.
 
 ### Migration notes
+
+- **Rust library API:** v0.4 deliberately replaces the broad experimental
+  v0.3 surface with a smaller one. Programmatic consumers should parse through
+  `Migration::from_path` / `Migration::from_source`, configure through
+  `Config`, and run built-in rules through `RuleRegistry` or
+  `ChangesetRuleRegistry`. Low-level parser, extractor, diagnostic-builder,
+  discovery, and git convenience APIs are no longer compatibility promises
+  during the 0.x series.
 
 - Upgrade in a non-git workspace? You may see "config not loaded"
   if you relied on the walk-up; the walk now requires a `.git`

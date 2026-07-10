@@ -32,23 +32,26 @@ impl Rule for R013IrreversibleRunSQL {
         let mut diagnostics = Vec::new();
 
         for op in migration.database_effective_operations_of_type(OperationType::RunSQL) {
-            if let OperationData::RunSQL(data) = &op.data {
-                if data.reverse_sql.is_none() {
-                    diagnostics.push(Diagnostic {
-                        rule_id: self.id(),
-                        rule_name: self.name(),
-                        message: "RunSQL has no reverse_sql".to_string(),
-                        severity: self.severity(),
-                        path: ctx.path.to_path_buf(),
-                        span: op.span,
-                        help: Some(
-                            "Add reverse_sql parameter: RunSQL(sql, reverse_sql) or use \
-                             RunSQL(sql, migrations.RunSQL.noop) if no reverse is needed"
-                                .to_string(),
-                        ),
-                    });
-                }
+            let OperationData::RunSQL(data) = &op.data else {
+                continue;
+            };
+            if data.reverse_sql.is_some() {
+                continue;
             }
+            diagnostics.push(
+                Diagnostic::new(
+                    self.id(),
+                    self.name(),
+                    self.severity(),
+                    "RunSQL has no reverse_sql",
+                    ctx.path.to_path_buf(),
+                    op.span,
+                )
+                .with_help(
+                    "Add reverse_sql parameter: RunSQL(sql, reverse_sql) or use \
+                     RunSQL(sql, migrations.RunSQL.noop) if no reverse is needed",
+                ),
+            );
         }
 
         diagnostics
@@ -121,5 +124,31 @@ class Migration(migrations.Migration):
     fn test_runsql_noop_reverse_is_reversible() {
         let diagnostics = check_migration(NOOP_REVERSE_GOOD);
         assert!(diagnostics.is_empty());
+    }
+
+    const WRAPPED_IRREVERSIBLE_BAD: &str = r#"
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.RunSQL(
+                    sql='UPDATE table SET column = value;',
+                ),
+            ],
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_wrapped_irreversible_run_sql_warns() {
+        // RunSQL wrapped in SeparateDatabaseAndState(database_operations=[...])
+        // is database-effective and must still be flagged when irreversible.
+        let diagnostics = check_migration(WRAPPED_IRREVERSIBLE_BAD);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R013");
     }
 }

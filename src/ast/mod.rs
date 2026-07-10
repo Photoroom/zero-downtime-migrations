@@ -7,16 +7,19 @@ pub(crate) mod extractor;
 mod operations;
 
 pub(crate) use extractor::MigrationExtractor;
-pub(crate) use operations::strip_sql_noise;
-pub(crate) use operations::FieldInfo;
+pub(crate) use operations::{
+    any_sql_statement, sql_statement_contains_concurrently, sql_statement_contains_create_index,
+    sql_statement_contains_drop_index, sql_statement_contains_reindex,
+};
 pub use operations::{
-    ConstraintOperation, ConstraintType, FieldOperation, IndexOperation, ModelOperation, Operation,
-    OperationData, OperationType, RunPythonOperation, RunSQLOperation,
+    ConstraintOperation, ConstraintType, FieldInfo, FieldOperation, IndexOperation, ModelOperation,
+    Operation, OperationData, OperationType, RunPythonOperation, RunSQLOperation,
     SeparateDatabaseAndStateOperation,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::slice;
 
 use crate::diagnostics::Span;
 
@@ -35,13 +38,6 @@ pub struct Migration {
     pub operations: Vec<Operation>,
     /// Import statements that may be relevant for linting.
     pub imports: Vec<Import>,
-    /// Operations extracted from
-    /// `SeparateDatabaseAndState(database_operations=[...])` arms in this
-    /// migration. Kept as a compatibility projection; new rule code should
-    /// prefer [`Self::database_effective_operations`] so wrapped operations
-    /// are traversed in database execution order while retaining their
-    /// original operation spans.
-    pub wrapped_database_ops: Vec<Operation>,
     /// Span of the `class Migration(...)` definition, when present. Used
     /// as the anchor for class-level diagnostics (e.g. R004's missing
     /// `atomic = False`) so a `# zdm: ignore` on or above the class line
@@ -54,13 +50,9 @@ pub struct Migration {
 }
 
 impl Migration {
-    /// Load and extract a migration from a file on disk. Enforces
-    /// the size cap, parses with tree-sitter, surfaces syntax
-    /// errors with line/column, and returns the typed
-    /// `Migration`. This is the one-stop entry point for
-    /// programmatic consumers; out-of-tree rule authors writing
-    /// tests should reach for this rather than the lower-level
-    /// `ParsedMigration` / extractor pipeline.
+    /// Load and extract a migration from a file on disk: enforces the
+    /// size cap, parses with tree-sitter, and returns the typed
+    /// `Migration`. The recommended entry point for programmatic consumers.
     pub fn from_path(path: &std::path::Path) -> crate::error::Result<Self> {
         let parsed = crate::parser::ParsedMigration::parse_file(path)?;
         MigrationExtractor::new(&parsed)
@@ -98,15 +90,6 @@ impl Migration {
             .filter(move |op| op.op_type == op_type)
     }
 
-    /// Get top-level operations of a specific type.
-    ///
-    /// Prefer [`Self::top_level_operations_of_type`] when the distinction
-    /// matters. This compatibility shim preserves the pre-existing public
-    /// API and intentionally keeps its top-level semantics.
-    pub fn operations_of_type(&self, op_type: OperationType) -> impl Iterator<Item = &Operation> {
-        self.top_level_operations_of_type(op_type)
-    }
-
     /// Get database-effective operations in execution order.
     ///
     /// Top-level `SeparateDatabaseAndState` wrappers are expanded in place to
@@ -114,21 +97,7 @@ impl Migration {
     /// original spans. State-side operations are metadata-only and are
     /// deliberately omitted.
     pub fn database_effective_operations(&self) -> impl Iterator<Item = &Operation> {
-        let mut top_level = self.operations.iter();
-        let mut wrapped = [].iter();
-
-        std::iter::from_fn(move || loop {
-            if let Some(op) = wrapped.next() {
-                return Some(op);
-            }
-            let op = top_level.next()?;
-            match &op.data {
-                OperationData::SeparateDatabaseAndState(data) => {
-                    wrapped = data.database_operations.iter();
-                }
-                _ => return Some(op),
-            }
-        })
+        DatabaseEffectiveOperations::new(&self.operations)
     }
 
     /// Get database-effective operations of a specific type in execution order.
@@ -145,15 +114,49 @@ impl Migration {
     /// `# zdm: ignore <id>` comment counts when it appears anywhere
     /// within that range, or on the line immediately preceding it.
     pub fn is_rule_suppressed_at(&self, rule_id: &str, start_line: usize, end_line: usize) -> bool {
-        // `start_line` is 1-indexed (tree-sitter rows + 1), so the
-        // saturating_sub clamps to 1 on the off chance a default span
-        // produces `start_line == 0`.
+        // Also honour an ignore on the line immediately above the span.
+        // `start_line` is 1-indexed; clamp to 1 so we never probe line 0.
         let lookup_start = start_line.saturating_sub(1).max(1);
         (lookup_start..=end_line).any(|line| {
             self.line_ignores
                 .get(&line)
                 .is_some_and(|set| set.contains(rule_id))
         })
+    }
+}
+
+/// Stack-based DFS iterator that expands `SeparateDatabaseAndState`
+/// wrappers in place while preserving each operation's original span.
+struct DatabaseEffectiveOperations<'a> {
+    stack: Vec<slice::Iter<'a, Operation>>,
+}
+
+impl<'a> DatabaseEffectiveOperations<'a> {
+    fn new(operations: &'a [Operation]) -> Self {
+        Self {
+            stack: vec![operations.iter()],
+        }
+    }
+}
+
+impl<'a> Iterator for DatabaseEffectiveOperations<'a> {
+    type Item = &'a Operation;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let iter = self.stack.last_mut()?;
+            let Some(op) = iter.next() else {
+                self.stack.pop();
+                continue;
+            };
+
+            if let OperationData::SeparateDatabaseAndState(data) = &op.data {
+                self.stack.push(data.database_operations.iter());
+                continue;
+            }
+
+            return Some(op);
+        }
     }
 }
 
