@@ -78,22 +78,40 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             manylinux: 2_28
+            asset: zdm-x86_64-unknown-linux-gnu
+            script: zdm
+            native: true
           # Linux ARM64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             manylinux: 2_28
+            asset: zdm-aarch64-unknown-linux-gnu
+            script: zdm
+            native: false
           # macOS x86_64 (Intel)
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
+            asset: zdm-x86_64-apple-darwin
+            script: zdm
+            native: true
           # macOS ARM64 (Apple Silicon)
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
+            asset: zdm-aarch64-apple-darwin
+            script: zdm
+            native: true
           # Windows x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            asset: zdm-x86_64-pc-windows-msvc.exe
+            script: zdm.exe
+            native: true
           # Windows ARM64
           - os: windows-latest
             target: aarch64-pc-windows-msvc
+            asset: zdm-aarch64-pc-windows-msvc.exe
+            script: zdm.exe
+            native: false
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -112,25 +130,86 @@ jobs:
           args: --locked --release --out dist
           manylinux: ${{ matrix.manylinux || '' }}
 
-      - name: Smoke test wheel
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+      - name: Extract standalone binary from wheel
+        shell: bash
+        env:
+          ASSET: ${{ matrix.asset }}
+          SCRIPT: ${{ matrix.script }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob
+          import os
+          import shutil
+          import zipfile
+
+          wheels = glob.glob("dist/*.whl")
+          if len(wheels) != 1:
+              raise SystemExit(f"expected one wheel, found {wheels}")
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              suffix = f".data/scripts/{os.environ['SCRIPT']}"
+              scripts = [name for name in wheel.namelist() if name.endswith(suffix)]
+              if len(scripts) != 1:
+                  raise SystemExit(f"expected one {suffix} entry, found {scripts}")
+              with wheel.open(scripts[0]) as source, open(os.environ["ASSET"], "wb") as target:
+                  shutil.copyfileobj(source, target)
+          PY
+          if [[ "$ASSET" != *.exe ]]; then chmod +x "$ASSET"; fi
+
+      - name: Smoke test wheel and binary (Unix)
+        if: matrix.native && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           python -m venv .venv-wheel
           .venv-wheel/bin/pip install dist/*.whl
           test "$(.venv-wheel/bin/zdm --version)" = "zdm ${GITHUB_REF_NAME#v}"
+          test "$(./${{ matrix.asset }} --version)" = "zdm ${GITHUB_REF_NAME#v}"
           set +e
           .venv-wheel/bin/zdm tests/fixtures/rules/R001/fail_non_concurrent_add_index.py --select R001
           status=$?
           set -e
           test "$status" -eq 1
 
+      - name: Smoke test manylinux baseline
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(docker run --rm -v "$PWD:/io" quay.io/pypa/manylinux_2_28_x86_64 "/io/${{ matrix.asset }}" --version)" = "zdm ${GITHUB_REF_NAME#v}"
+
+      - name: Smoke test wheel and binary (Windows)
+        if: matrix.native && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m venv .venv-wheel
+          $wheel = (Get-ChildItem dist/*.whl).FullName
+          & .venv-wheel/Scripts/python -m pip install $wheel
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          if ((& .venv-wheel/Scripts/zdm.exe --version).Trim() -ne "zdm $version") {
+            throw "installed wheel has the wrong version"
+          }
+          if ((& ./${{ matrix.asset }} --version).Trim() -ne "zdm $version") {
+            throw "standalone binary has the wrong version"
+          }
+          & .venv-wheel/Scripts/zdm.exe tests/fixtures/rules/R001/fail_non_concurrent_add_index.py --select R001
+          $status = $LASTEXITCODE
+          if ($status -ne 1) {
+            throw "known R001 violation returned $status instead of 1"
+          }
+          $global:LASTEXITCODE = 0
+
       - name: Upload wheel
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: wheel-${{ matrix.target }}
           path: dist/*.whl
+
+      - name: Upload standalone binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: binary-${{ matrix.target }}
+          path: ${{ matrix.asset }}
 
   build-sdist:
     name: Build source distribution
@@ -169,84 +248,65 @@ jobs:
           name: sdist
           path: dist/*.tar.gz
 
-  build-binaries:
-    name: Build binary (${{ matrix.target }})
-    needs: verify
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
+  verify-release-artifacts:
+    name: Verify release artifacts
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          persist-credentials: false
+          path: artifacts
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install cross-compilation tools (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Prepare and verify release assets
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          set -euo pipefail
+          mkdir -p release pypi
+          find artifacts -name "*.whl" -exec mv {} release/ \;
+          find artifacts -name "*.tar.gz" -exec mv {} release/ \;
+          find artifacts -name "zdm-*" -exec mv {} release/ \;
+          test "$(find release -maxdepth 1 -name '*.whl' | wc -l)" -eq 6
+          test "$(find release -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 1
+          test "$(find release -maxdepth 1 -name 'zdm-*' | wc -l)" -eq 6
+          for asset in \
+            zdm-x86_64-unknown-linux-gnu \
+            zdm-aarch64-unknown-linux-gnu \
+            zdm-x86_64-apple-darwin \
+            zdm-aarch64-apple-darwin \
+            zdm-x86_64-pc-windows-msvc.exe \
+            zdm-aarch64-pc-windows-msvc.exe; do
+            test -f "release/$asset"
+          done
+          cp release/*.whl release/*.tar.gz pypi/
+          (cd release && sha256sum * > SHA256SUMS)
+          ls -la release/ pypi/
 
-      - name: Build
-        run: cargo build --locked --release --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-
-      - name: Rename binary (unix)
-        if: runner.os != 'Windows'
-        run: mv target/${{ matrix.target }}/release/zdm zdm-${{ matrix.target }}
-
-      - name: Rename binary (windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: mv target/${{ matrix.target }}/release/zdm.exe zdm-${{ matrix.target }}.exe
-
-      - name: Upload artifact
+      - name: Upload verified PyPI distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: binary-${{ matrix.target }}
-          path: zdm-${{ matrix.target }}*
+          name: pypi-distributions
+          path: pypi/
+
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-assets
+          path: release/
 
   publish:
     name: Publish to PyPI
-    needs: [build-wheels, build-sdist, build-binaries]
+    needs: verify-release-artifacts
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       contents: read
       id-token: write  # For trusted publishing
     steps:
-      - name: Download wheels
+      - name: Download verified distributions
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           path: dist
-          pattern: wheel-*
-          merge-multiple: true
-
-      - name: Download sdist
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          path: dist
-          pattern: sdist
-          merge-multiple: true
+          name: pypi-distributions
 
       - name: List artifacts
         run: ls -la dist/
@@ -258,29 +318,16 @@ jobs:
 
   github-release:
     name: Create GitHub Release
-    needs: publish
+    needs: [verify-release-artifacts, publish]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-        with:
-          persist-credentials: false
-
-      - name: Download all artifacts
+      - name: Download verified release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          path: artifacts
-
-      - name: Prepare release assets
-        run: |
-          mkdir -p release
-          # Move wheels and sdist
-          find artifacts -name "*.whl" -exec mv {} release/ \;
-          find artifacts -name "*.tar.gz" -exec mv {} release/ \;
-          # Move standalone binaries
-          find artifacts -name "zdm-*" -exec mv {} release/ \;
-          ls -la release/
+          path: release
+          name: release-assets
 
       - name: Create Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
