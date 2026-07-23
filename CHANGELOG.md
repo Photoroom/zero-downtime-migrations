@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Rules
+
+- **R008 (disallowed-file-changes)** now allows `models.py` alongside
+  migrations by default. `allowed-file-patterns` defaults to
+  `["models.py"]` instead of `[]`, matching how `makemigrations` always
+  changes a model definition together with the migration it generates.
+  Previously an unconfigured project rejected *every* file changed
+  alongside a migration — including the `models.py` change the migration
+  came from. Setting `allowed-file-patterns` in config replaces the
+  default; an explicit `allowed-file-patterns = []` restores the old
+  reject-everything behaviour.
+
 ## 0.4.0 - 2026-07-10
 
 Changes since 0.3.2:

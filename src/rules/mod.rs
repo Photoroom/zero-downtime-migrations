@@ -510,8 +510,8 @@ class Migration(migrations.Migration):
         use std::path::Path;
 
         // R008's diagnostic fires on the non-migration changed file
-        // (`models.py`), not on a migration. The user can't put a
-        // `# zdm: ignore R008` directive in `models.py` because the
+        // (`views.py`), not on a migration. The user can't put a
+        // `# zdm: ignore R008` directive in `views.py` because the
         // suppression machinery only inspects migration files. So a
         // `# zdm: ignore R008` placed anywhere in any of the changeset's
         // migrations counts as a changeset-wide opt-out for that rule.
@@ -533,10 +533,9 @@ class Migration(migrations.Migration):
         let migrations = vec![&migration];
         let migration_paths = vec![migration.path.as_path()];
         // The non-migration changed file would normally trigger R008
-        // (no allowed-file-patterns configured, so all non-migration
-        // files are flagged).
-        let models = Path::new("app/models.py");
-        let other_files: Vec<&Path> = vec![models];
+        // (views.py does not match the default allowed-file-patterns).
+        let views = Path::new("app/views.py");
+        let other_files: Vec<&Path> = vec![views];
         let diagnostics = registry.check(&migrations, &migration_paths, &other_files, &config);
 
         assert!(
@@ -572,8 +571,8 @@ class Migration(migrations.Migration):
         let config = Config::default();
         let migrations = vec![&migration];
         let migration_paths = vec![migration.path.as_path()];
-        let models = Path::new("app/models.py");
-        let other_files: Vec<&Path> = vec![models];
+        let views = Path::new("app/views.py");
+        let other_files: Vec<&Path> = vec![views];
         let diagnostics = registry.check(&migrations, &migration_paths, &other_files, &config);
 
         // R008 still fires because the directive targets a different rule.
