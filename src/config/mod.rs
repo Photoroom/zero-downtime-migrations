@@ -21,6 +21,17 @@ use crate::file_io::{read_bounded_regular_file, ReadFileError};
 
 const MAX_CONFIG_FILE_SIZE: u64 = 1024 * 1024;
 
+/// Default value for `allowed_file_patterns`.
+///
+/// `makemigrations` always changes a model definition alongside the
+/// migration it generates, so the canonical Django layout (`models.py`)
+/// is allowed out of the box. Matched against both the repo-relative
+/// path and the basename, so `app/models.py` and `backend/app/models.py`
+/// are both covered. Projects using a `models/` package (or wanting a
+/// stricter changeset) can override — an explicit
+/// `allowed-file-patterns = []` restores the reject-everything behaviour.
+pub const DEFAULT_ALLOWED_FILE_PATTERNS: &[&str] = &["models.py"];
+
 /// Configuration for zdm.
 ///
 /// `exclude` and `allowed_file_patterns` are validated at config
@@ -28,7 +39,7 @@ const MAX_CONFIG_FILE_SIZE: u64 = 1024 * 1024;
 /// Library consumers that mutate these fields directly can call
 /// `validate_glob_patterns` to surface invalid glob syntax before
 /// running discovery or changeset rules.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Config {
     /// Rules to select (if empty, all rules are selected).
@@ -41,8 +52,24 @@ pub struct Config {
     pub exclude: Vec<String>,
     /// For R008: file patterns allowed to change alongside
     /// migrations. Files NOT matching these patterns will trigger a
-    /// error.
+    /// error. Defaults to [`DEFAULT_ALLOWED_FILE_PATTERNS`]; a config
+    /// file value replaces the default entirely.
     pub allowed_file_patterns: Vec<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            select: HashSet::new(),
+            ignore: HashSet::new(),
+            warnings_as_errors: false,
+            exclude: Vec::new(),
+            allowed_file_patterns: DEFAULT_ALLOWED_FILE_PATTERNS
+                .iter()
+                .map(|pattern| (*pattern).to_string())
+                .collect(),
+        }
+    }
 }
 
 impl Config {
@@ -313,6 +340,38 @@ mod tests {
         assert!(config.select.is_empty());
         assert!(config.ignore.is_empty());
         assert!(!config.warnings_as_errors);
+        assert_eq!(config.allowed_file_patterns, vec!["models.py".to_string()]);
+    }
+
+    #[test]
+    fn test_explicit_empty_allowed_file_patterns_overrides_default() {
+        // An explicit empty list is an opt-out of the models.py
+        // default, not a "nothing configured" no-op — strict projects
+        // rely on it to reject every file changed alongside migrations.
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"allowed-file-patterns = []"#,
+        )
+        .unwrap();
+
+        let config = Config::load_from_directory(temp.path()).unwrap();
+        assert!(config.allowed_file_patterns.is_empty());
+    }
+
+    #[test]
+    fn test_config_without_allowed_file_patterns_keeps_default() {
+        // A config file that sets unrelated keys must not silently
+        // clear the models.py default.
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("zero-downtime-migrations.toml"),
+            r#"ignore = ["R001"]"#,
+        )
+        .unwrap();
+
+        let config = Config::load_from_directory(temp.path()).unwrap();
+        assert_eq!(config.allowed_file_patterns, vec!["models.py".to_string()]);
     }
 
     #[test]

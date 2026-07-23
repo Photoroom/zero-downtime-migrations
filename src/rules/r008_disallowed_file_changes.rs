@@ -27,7 +27,9 @@ impl ChangesetRule for R008DisallowedFileChanges {
 
     fn description(&self) -> &'static str {
         "Migrations should not be changed alongside certain file types. \
-         Use allowed-file-patterns to specify which files may change alongside migrations."
+         Use allowed-file-patterns to specify which files may change alongside migrations. \
+         By default only `models.py` is allowed, since makemigrations changes it together \
+         with the migration it generates."
     }
 
     fn severity(&self) -> Severity {
@@ -122,7 +124,7 @@ class Migration(migrations.Migration):
     }
 
     #[test]
-    fn test_no_allowed_patterns_rejects_all() {
+    fn test_default_config_allows_models_py() {
         let migration = create_migration();
         let migrations = vec![&migration];
         let other_files = vec![Path::new("app/models.py"), Path::new("app/views.py")];
@@ -134,7 +136,29 @@ class Migration(migrations.Migration):
             &config,
         );
 
-        // No allowed patterns configured, all non-migration files are rejected
+        // The default allowed-file-patterns covers models.py, so only
+        // views.py is rejected.
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("views.py"));
+    }
+
+    #[test]
+    fn test_explicit_empty_patterns_reject_all() {
+        let migration = create_migration();
+        let migrations = vec![&migration];
+        let other_files = vec![Path::new("app/models.py"), Path::new("app/views.py")];
+        let config = Config {
+            allowed_file_patterns: vec![],
+            ..Default::default()
+        };
+        let diagnostics = crate::rules::test_support::check_changeset_rule(
+            &R008DisallowedFileChanges,
+            &migrations,
+            &other_files,
+            &config,
+        );
+
+        // Explicitly empty allowed patterns reject every non-migration file
         assert_eq!(diagnostics.len(), 2);
     }
 

@@ -110,7 +110,7 @@ test suite — every field above is guaranteed on every diagnostic.
 | R004 | missing-atomic-false | Error | Non-atomic migrations require `atomic = False` |
 | R005 | remove-field-without-separate | Error | Use `SeparateDatabaseAndState` to remove fields safely |
 | R006 | add-field-foreign-key | Error | Adding FK creates index and validates constraint (merged R007) |
-| R008 | disallowed-file-changes | Error | Don't change app code alongside migrations |
+| R008 | disallowed-file-changes | Error | Don't change app code (except `models.py` by default) alongside migrations |
 | R009 | separate-db-state-same-pr | Error | Don't deploy both steps of `SeparateDatabaseAndState` together |
 | R010 | add-field-not-null | Error | Adding NOT NULL field without default rewrites table |
 | R011 | rename-field | Error | Renaming fields can break running code |
@@ -180,6 +180,14 @@ warnings-as-errors = false
 allowed-file-patterns = ["*.txt", "*.md", "models.py"]
 exclude = ["**/test_migrations/**"]
 ```
+
+`allowed-file-patterns` (used by R008) defaults to `["models.py"]`, because
+`makemigrations` always changes a model definition alongside the migration it
+generates. Patterns are matched against both the repo-relative path and the
+basename, so the default covers `app/models.py` at any depth. Setting the key
+replaces the default entirely — projects that use a `models/` package should
+add e.g. `"**/models/*.py"`, and strict projects can set
+`allowed-file-patterns = []` to flag every file changed alongside migrations.
 
 ### Configuration Precedence
 
