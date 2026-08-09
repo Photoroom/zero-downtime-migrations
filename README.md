@@ -1,6 +1,6 @@
 # zero-downtime-migrations (zdm)
 
-A PostgreSQL migration safety linter for Django.
+A PostgreSQL migration safety linter for Django and Alembic.
 
 ## Why
 
@@ -8,9 +8,27 @@ Deploying database migrations without downtime requires careful attention to how
 
 ## What
 
-A standalone Rust CLI tool that statically analyzes Django migration files to catch unsafe patterns that cause table locks, outages, and data loss on large PostgreSQL databases. Distributed like ruff/uv — a single fast binary, installable via `pip`, `uvx`, or standalone download.
+A standalone Rust CLI tool that statically analyzes Django and Alembic migration files to catch unsafe patterns that cause table locks, outages, and data loss on large PostgreSQL databases. Distributed like ruff/uv — a single fast binary, installable via `pip`, `uvx`, or standalone download.
 
 **Supports Django 3.2+** — zdm parses migration files directly without importing Django, so it works with any Django version and doesn't require Django to be installed.
+
+### Alembic support
+
+zdm also discovers Alembic revision scripts directly under `alembic/versions/*.py`. It statically supports direct `op.*` calls in `upgrade()`:
+
+- `create_table`, `create_index`, `drop_index`
+- `create_foreign_key`, `create_check_constraint`, `create_exclude_constraint`
+- `alter_column(nullable=False)` and `alter_column(new_column_name=...)`
+- `drop_column` and `execute("<static SQL>")`
+
+Use `postgresql_concurrently=True` only inside the canonical boundary:
+
+```python
+with op.get_context().autocommit_block():
+    op.create_index("jobs_state_idx", "jobs", ["state"], postgresql_concurrently=True)
+```
+
+The Alembic path is intentionally static: zdm does not import or execute revision scripts, connect to a database, inspect SQLAlchemy models, resolve aliases/custom operations, or evaluate dynamic SQL. `op.execute` is inspected only when its first argument is a string literal; use explicit SQL when you want it checked.
 
 ## Installation
 
@@ -32,6 +50,7 @@ pipx install django-zdm
 ```bash
 # Lint a single migration
 zdm app/migrations/0042_add_index.py
+zdm alembic/versions/20260809_add_jobs.py
 
 # Lint all migrations in a directory
 zdm app/migrations/

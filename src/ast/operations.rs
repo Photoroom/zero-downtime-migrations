@@ -12,6 +12,20 @@ pub struct Operation {
     pub span: Span,
     /// Operation-specific data.
     pub data: OperationData,
+    /// Exact Alembic table identity when this operation targets a statically
+    /// known table. Django uses model names instead.
+    pub table_identity: Option<TableIdentity>,
+    /// Whether an Alembic operation is nested in its required
+    /// `op.get_context().autocommit_block()` boundary. Django operations leave
+    /// this false and use migration-level `atomic = False` instead.
+    pub in_autocommit_block: bool,
+}
+
+/// A schema-qualified Alembic table identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableIdentity {
+    pub schema: Option<String>,
+    pub name: String,
 }
 
 impl Operation {
@@ -57,6 +71,8 @@ pub enum OperationType {
 
     // Data operations
     RunSQL,
+    /// A static SQL statement passed to Alembic's `op.execute`.
+    ExecuteSql,
     RunPython,
 
     // Special operations
@@ -198,6 +214,8 @@ pub struct ConstraintOperation {
     pub model_name: String,
     /// The constraint type.
     pub constraint_type: ConstraintType,
+    /// Whether Alembic creates this constraint as `NOT VALID`.
+    pub not_valid: bool,
 }
 
 /// Type of database constraint added via `migrations.AddConstraint`.
@@ -209,6 +227,7 @@ pub struct ConstraintOperation {
 #[non_exhaustive]
 pub enum ConstraintType {
     Unique,
+    ForeignKey,
     Check,
     Exclusion,
     Unknown,

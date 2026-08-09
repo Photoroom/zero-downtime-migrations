@@ -35,6 +35,10 @@ fn fixtures_root() -> &'static Path {
     Path::new("tests/fixtures")
 }
 
+fn alembic_fixtures_dir() -> PathBuf {
+    fixtures_root().join("alembic")
+}
+
 /// Lint `fixture` with `--output-format json` and assert that
 /// exactly `expected_count` diagnostics with rule_id `rule_id`
 /// fired on a file whose path's last segment matches the
@@ -157,6 +161,47 @@ fn e2e_r001_pass_concurrent_add_index() {
 fn e2e_r001_pass_add_index_on_new_model() {
     let pass_fixture = fixtures_dir().join("R001/pass_add_index_on_new_model.py");
     assert_pass_fixture(&pass_fixture);
+}
+
+// =============================================================================
+// Alembic tests
+// =============================================================================
+
+#[test]
+fn e2e_alembic_unsafe_revision_reports_the_supported_rule_set() {
+    let fixture = alembic_fixtures_dir();
+    let output = zdm()
+        .arg(&fixture)
+        .arg("--output-format")
+        .arg("json")
+        .assert()
+        .failure()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let diagnostics = json["diagnostics"].as_array().unwrap();
+    let ids: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic["rule_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["R001", "R016", "R017", "R017", "R017", "R015", "R011", "R005", "R003", "R004"]
+    );
+    assert!(diagnostics.iter().all(|diagnostic| {
+        diagnostic["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("20260809_unsafe_jobs.py"))
+            && diagnostic["line"].as_u64().is_some()
+    }));
+}
+
+#[test]
+fn e2e_alembic_new_table_and_autocommit_revision_is_safe() {
+    let fixture = alembic_fixtures_dir().join("versions/20260809_safe_new_jobs.py");
+    assert_pass_fixture(&fixture);
 }
 
 // =============================================================================

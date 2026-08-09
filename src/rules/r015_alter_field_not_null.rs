@@ -76,11 +76,18 @@ impl Rule for R015AlterFieldNotNull {
                     self.id(),
                     self.name(),
                     self.severity(),
-                    format!(
-                        "AlterField '{}' results in a NOT NULL column \
-                         (may require a full table scan)",
-                        data.field_name
-                    ),
+                    if migration.framework == crate::discovery::MigrationFramework::Alembic {
+                        format!(
+                            "Changing '{}' to NOT NULL may require a full table scan",
+                            data.field_name
+                        )
+                    } else {
+                        format!(
+                            "AlterField '{}' results in a NOT NULL column \
+                             (may require a full table scan)",
+                            data.field_name
+                        )
+                    },
                     ctx.path.to_path_buf(),
                     op.span,
                 )

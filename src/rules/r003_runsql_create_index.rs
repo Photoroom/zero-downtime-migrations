@@ -34,7 +34,12 @@ impl Rule for R003RunSQLCreateIndex {
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        for op in migration.database_effective_operations_of_type(OperationType::RunSQL) {
+        for op in migration.database_effective_operations().filter(|op| {
+            matches!(
+                op.op_type,
+                OperationType::RunSQL | OperationType::ExecuteSql
+            )
+        }) {
             if let OperationData::RunSQL(data) = &op.data {
                 // Check each statement independently: a non-concurrent
                 // CREATE INDEX sharing a RunSQL with a concurrent one must
@@ -50,14 +55,19 @@ impl Rule for R003RunSQLCreateIndex {
                             self.id(),
                             self.name(),
                             self.severity(),
-                            "RunSQL contains CREATE INDEX without CONCURRENTLY",
+                            if migration.framework == crate::discovery::MigrationFramework::Alembic
+                            {
+                                "Alembic op.execute contains CREATE INDEX without CONCURRENTLY"
+                            } else {
+                                "RunSQL contains CREATE INDEX without CONCURRENTLY"
+                            },
                             ctx.path.to_path_buf(),
                             op.span,
                         )
                         .with_help(
                             "Use CREATE INDEX CONCURRENTLY to avoid table locks. Each \
                              CREATE INDEX statement is checked independently — splitting \
-                             a non-concurrent CREATE INDEX into the same RunSQL as a \
+                             a non-concurrent CREATE INDEX into the same SQL operation as a \
                              concurrent one does not exempt it.",
                         ),
                     );

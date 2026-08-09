@@ -3,6 +3,7 @@
 //! This module provides typed Rust representations of Django migration
 //! operations extracted from tree-sitter Python AST nodes.
 
+mod alembic;
 pub(crate) mod extractor;
 mod operations;
 
@@ -14,7 +15,7 @@ pub(crate) use operations::{
 pub use operations::{
     ConstraintOperation, ConstraintType, FieldInfo, FieldOperation, IndexOperation, ModelOperation,
     Operation, OperationData, OperationType, RunPythonOperation, RunSQLOperation,
-    SeparateDatabaseAndStateOperation,
+    SeparateDatabaseAndStateOperation, TableIdentity,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,6 +23,7 @@ use std::path::PathBuf;
 use std::slice;
 
 use crate::diagnostics::Span;
+use crate::discovery::{migration_framework, MigrationFramework};
 
 /// A parsed Django migration file with extracted operations.
 ///
@@ -32,6 +34,8 @@ use crate::diagnostics::Span;
 pub struct Migration {
     /// The file path of the migration.
     pub path: PathBuf,
+    /// The framework represented by this migration file.
+    pub framework: MigrationFramework,
     /// Whether the migration has `atomic = False`.
     pub is_non_atomic: bool,
     /// The list of operations in this migration.
@@ -55,9 +59,7 @@ impl Migration {
     /// `Migration`. The recommended entry point for programmatic consumers.
     pub fn from_path(path: &std::path::Path) -> crate::error::Result<Self> {
         let parsed = crate::parser::ParsedMigration::parse_file(path)?;
-        MigrationExtractor::new(&parsed)
-            .extract(path)
-            .map_err(|e| crate::error::Error::parse(path.to_path_buf(), e.to_string()))
+        Self::from_parsed(path, &parsed)
     }
 
     /// Extract a migration from in-memory source. Same pipeline
@@ -75,9 +77,20 @@ impl Migration {
                 "syntax error in migration file".to_string(),
             ));
         }
-        MigrationExtractor::new(&parsed)
-            .extract(path)
-            .map_err(|e| crate::error::Error::parse(path.to_path_buf(), e.to_string()))
+        Self::from_parsed(path, &parsed)
+    }
+
+    fn from_parsed(
+        path: &std::path::Path,
+        parsed: &crate::parser::ParsedMigration,
+    ) -> crate::error::Result<Self> {
+        let extracted = match migration_framework(path) {
+            Some(MigrationFramework::Alembic) => {
+                alembic::AlembicMigrationExtractor::new(parsed).extract(path)
+            }
+            _ => MigrationExtractor::new(parsed).extract(path),
+        };
+        extracted.map_err(|e| crate::error::Error::parse(path.to_path_buf(), e.to_string()))
     }
 
     /// Get top-level operations of a specific type.

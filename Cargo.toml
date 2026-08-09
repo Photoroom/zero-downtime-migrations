@@ -2,7 +2,7 @@
 name = "zero-downtime-migrations"
 version = "0.4.0"
 edition = "2021"
-description = "A PostgreSQL migration safety linter for Django"
+description = "A PostgreSQL migration safety linter for Django and Alembic"
 license = "MIT"
 repository = "https://github.com/Photoroom/zero-downtime-migrations"
 readme = "README.md"

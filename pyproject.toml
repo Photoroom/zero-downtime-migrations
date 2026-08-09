@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "django-zdm"
 version = "0.4.0"
-description = "A PostgreSQL migration safety linter for Django"
+description = "A PostgreSQL migration safety linter for Django and Alembic"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.8"

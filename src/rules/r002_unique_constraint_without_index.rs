@@ -47,7 +47,7 @@ impl Rule for R002UniqueConstraintWithoutIndex {
             if data.constraint_type != ConstraintType::Unique {
                 return;
             }
-            if created.contains(&data.model_name) {
+            if created.contains_operation(migration, op) {
                 return;
             }
 
