@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.0 - 2026-08-11
+
+### Added
+
+- Alembic revision scripts under `alembic/versions/` are now checked for the
+  supported zero-downtime migration rules alongside Django migrations.
+- Alembic support covers direct, unconditional `op.*` calls in `upgrade()`;
+  `postgresql_not_valid=True` constraints and `autocommit_block()` are handled
+  as safe PostgreSQL migration patterns.
+
+### Documentation
+
+- Document Alembic usage, supported scope, and pre-commit discovery.
+
 ## 0.4.0 - 2026-07-10
 
 Changes since 0.3.2:
