@@ -35,7 +35,7 @@ impl Rule for R001NonConcurrentAddIndex {
             if op.op_type != OperationType::AddIndex {
                 return;
             }
-            if op.model_name().is_some_and(|m| created.contains(m)) {
+            if created.contains_operation(migration, op) {
                 return;
             }
             diagnostics.push(
@@ -43,14 +43,19 @@ impl Rule for R001NonConcurrentAddIndex {
                     self.id(),
                     self.name(),
                     self.severity(),
-                    "Use AddIndexConcurrently instead of AddIndex to avoid table locks",
+                    if migration.framework == crate::discovery::MigrationFramework::Alembic {
+                        "Alembic create_index is missing postgresql_concurrently=True"
+                    } else {
+                        "Use AddIndexConcurrently instead of AddIndex to avoid table locks"
+                    },
                     ctx.path.to_path_buf(),
                     op.span,
                 )
-                .with_help(
-                    "Replace migrations.AddIndex with AddIndexConcurrently from \
-                     django.contrib.postgres.operations",
-                ),
+                .with_help(if migration.framework == crate::discovery::MigrationFramework::Alembic {
+                    "Use postgresql_concurrently=True inside op.get_context().autocommit_block()."
+                } else {
+                    "Replace migrations.AddIndex with AddIndexConcurrently from django.contrib.postgres.operations"
+                }),
             );
         });
 

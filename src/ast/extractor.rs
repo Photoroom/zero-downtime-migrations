@@ -92,7 +92,7 @@ fn field_call_kwargs(value: Node<'_>) -> impl Iterator<Item = Node<'_>> {
 /// returning `None` if the comment does not match the suppression form.
 /// Accepts both `# zdm: ignore RXXX` and the slightly lax `# zdm:ignore RXXX`.
 /// Rule IDs are returned in their normalised upper-case form.
-fn parse_ignore_directive(comment: &str) -> Option<Vec<String>> {
+pub(crate) fn parse_ignore_directive(comment: &str) -> Option<Vec<String>> {
     let body = comment.trim_start_matches('#').trim_start();
     let body = body.strip_prefix("zdm")?.trim_start();
     let body = body.strip_prefix(':')?.trim_start();
@@ -182,6 +182,7 @@ impl<'a> MigrationExtractor<'a> {
 
         Ok(Migration {
             path: path.to_path_buf(),
+            framework: crate::discovery::MigrationFramework::Django,
             is_non_atomic,
             operations,
             imports,
@@ -264,6 +265,8 @@ impl<'a> MigrationExtractor<'a> {
             op_type,
             span,
             data,
+            table_identity: None,
+            in_autocommit_block: false,
         })
     }
 
@@ -391,6 +394,7 @@ impl<'a> MigrationExtractor<'a> {
         ConstraintOperation {
             model_name: model_name.unwrap_or_default(),
             constraint_type,
+            not_valid: false,
         }
     }
 
@@ -779,7 +783,7 @@ impl<'a> MigrationExtractor<'a> {
     /// concatenation): tree-sitter wraps these in a
     /// `concatenated_string` parent containing two `string` children.
     /// Recurse into the children so callers see the joined content.
-    fn extract_string_value(&self, node: Node) -> String {
+    pub(crate) fn extract_string_value(&self, node: Node) -> String {
         match node.kind() {
             "string" => {
                 let mut out = String::new();

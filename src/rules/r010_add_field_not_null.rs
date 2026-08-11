@@ -37,7 +37,7 @@ impl Rule for R010AddFieldNotNull {
             let OperationData::Field(data) = &op.data else {
                 return;
             };
-            if created.contains(&data.model_name) {
+            if created.contains_operation(migration, op) {
                 return;
             }
             let Some(field) = &data.field else { return };

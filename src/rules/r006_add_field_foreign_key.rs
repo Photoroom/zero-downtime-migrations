@@ -52,7 +52,7 @@ impl Rule for R006AddFieldForeignKey {
                 return;
             }
 
-            if created.contains(&data.model_name) {
+            if created.contains_operation(migration, op) {
                 return;
             }
 

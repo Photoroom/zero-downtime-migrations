@@ -1,4 +1,4 @@
-//! File discovery for Django migration files.
+//! File discovery for Django and Alembic migration files.
 //!
 //! This module handles finding migration files in directories,
 //! following the pattern `**/migrations/*.py`.
@@ -9,6 +9,13 @@ use glob::Pattern;
 use walkdir::WalkDir;
 
 use crate::error::{Error, Result};
+
+/// The migration framework implied by a discovered path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationFramework {
+    Django,
+    Alembic,
+}
 
 /// Discovers Django migration files in the given paths, excluding those matching patterns.
 ///
@@ -161,8 +168,22 @@ pub fn is_migration_file(path: &Path) -> bool {
         }
     }
 
-    // Must be in a migrations directory
-    is_in_migrations_directory(path)
+    // Must use one of the supported migration layouts.
+    migration_framework(path).is_some()
+}
+
+/// Identify the supported migration layout for a path.
+pub fn migration_framework(path: &Path) -> Option<MigrationFramework> {
+    if path.extension().is_none_or(|ext| ext != "py") || path.file_name()? == "__init__.py" {
+        return None;
+    }
+    if is_in_migrations_directory(path) {
+        Some(MigrationFramework::Django)
+    } else if is_in_alembic_versions_directory(path) {
+        Some(MigrationFramework::Alembic)
+    } else {
+        None
+    }
 }
 
 /// Check if a path is inside a `migrations` directory.
@@ -170,6 +191,14 @@ fn is_in_migrations_directory(path: &Path) -> bool {
     path.parent()
         .and_then(|p| p.file_name())
         .is_some_and(|name| name == "migrations")
+}
+
+/// Check whether a path is directly inside `alembic/versions`.
+fn is_in_alembic_versions_directory(path: &Path) -> bool {
+    path.parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "versions"))
+        .and_then(Path::parent)
+        .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "alembic"))
 }
 
 #[cfg(test)]
@@ -222,6 +251,9 @@ mod tests {
         assert!(is_migration_file(Path::new(
             "some/nested/app/migrations/0001_test.py"
         )));
+        assert!(is_migration_file(Path::new(
+            "service/alembic/versions/20260809_add_jobs.py"
+        )));
 
         // Invalid: __init__.py
         assert!(!is_migration_file(Path::new("app/migrations/__init__.py")));
@@ -234,6 +266,10 @@ mod tests {
         assert!(!is_migration_file(Path::new("migrations.py")));
         // Singular `migration/` directory does not count.
         assert!(!is_migration_file(Path::new("app/migration/0001.py")));
+        assert!(!is_migration_file(Path::new("alembic/0001.py")));
+        assert!(!is_migration_file(Path::new(
+            "alembic/versions/__init__.py"
+        )));
 
         // Invalid: not a .py file
         assert!(!is_migration_file(Path::new(

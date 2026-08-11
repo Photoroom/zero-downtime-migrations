@@ -41,15 +41,19 @@ impl Rule for R005RemoveFieldWithoutSeparate {
                     self.id(),
                     self.name(),
                     self.severity(),
-                    "RemoveField without SeparateDatabaseAndState can cause errors",
+                    if migration.framework == crate::discovery::MigrationFramework::Alembic {
+                        "Dropping a column can break running application code"
+                    } else {
+                        "RemoveField without SeparateDatabaseAndState can cause errors"
+                    },
                     ctx.path.to_path_buf(),
                     op.span,
                 )
-                .with_help(
-                    "Wrap RemoveField in SeparateDatabaseAndState. First migration removes \
-                     from state (state_operations), deploy the app, then second migration \
-                     drops the column (database_operations).",
-                ),
+                .with_help(if migration.framework == crate::discovery::MigrationFramework::Alembic {
+                    "Deploy code that no longer reads the column before a later op.drop_column migration."
+                } else {
+                    "Wrap RemoveField in SeparateDatabaseAndState. First migration removes from state (state_operations), deploy the app, then second migration drops the column (database_operations)."
+                }),
             );
         }
 

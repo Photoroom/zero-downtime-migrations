@@ -6,9 +6,10 @@
 use crate::ast::{
     any_sql_statement, sql_statement_contains_concurrently, sql_statement_contains_create_index,
     sql_statement_contains_drop_index, sql_statement_contains_reindex, Migration, Operation,
-    OperationData,
+    OperationData, OperationType,
 };
 use crate::diagnostics::{Diagnostic, Severity};
+use crate::discovery::MigrationFramework;
 use crate::rules::{Rule, RuleContext};
 
 /// Rule that detects concurrent operations without atomic=False.
@@ -33,6 +34,25 @@ impl Rule for R004MissingAtomicFalse {
     }
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
+        if migration.framework == MigrationFramework::Alembic {
+            return migration
+                .database_effective_operations()
+                .filter(|op| operation_requires_non_atomic(op) && !op.in_autocommit_block)
+                .map(|op| {
+                    Diagnostic::new(
+                        self.id(),
+                        self.name(),
+                        self.severity(),
+                        "Alembic concurrent operation is outside an autocommit block",
+                        ctx.path.to_path_buf(),
+                        op.span,
+                    )
+                    .with_help(
+                        "Wrap the concurrent operation in `with op.get_context().autocommit_block():`.",
+                    )
+                })
+                .collect();
+        }
         let mut diagnostics = Vec::new();
 
         // Two paths to "this migration needs `atomic = False`":
@@ -78,6 +98,12 @@ impl Rule for R004MissingAtomicFalse {
 fn operation_requires_non_atomic(op: &Operation) -> bool {
     if op.op_type.is_concurrent() {
         return true;
+    }
+    if !matches!(
+        op.op_type,
+        OperationType::RunSQL | OperationType::ExecuteSql
+    ) {
+        return false;
     }
     if let OperationData::RunSQL(data) = &op.data {
         return any_sql_statement(&data.sql, |stmt| {

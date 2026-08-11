@@ -48,7 +48,9 @@ pub use r017_non_concurrent_add_constraint::R017NonConcurrentAddConstraint;
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::ast::{Migration, ModelOperation, Operation, OperationData, OperationType};
+use crate::ast::{
+    Migration, ModelOperation, Operation, OperationData, OperationType, TableIdentity,
+};
 use crate::config::Config;
 use crate::diagnostics::{Diagnostic, Severity};
 
@@ -77,12 +79,14 @@ impl<'a> RuleContext<'a> {
 /// on both sides so callers can pass `model_name` as-is.
 pub struct CreatedModels {
     names: HashSet<String>,
+    alembic_tables: HashSet<TableIdentity>,
 }
 
 impl CreatedModels {
     fn new() -> Self {
         Self {
             names: HashSet::new(),
+            alembic_tables: HashSet::new(),
         }
     }
 
@@ -92,6 +96,25 @@ impl CreatedModels {
 
     fn remove(&mut self, name: &str) {
         self.names.remove(&name.to_lowercase());
+    }
+
+    fn insert_alembic(&mut self, table: TableIdentity) {
+        self.alembic_tables.insert(table);
+    }
+
+    fn clear_alembic(&mut self) {
+        self.alembic_tables.clear();
+    }
+
+    /// Checks the appropriate identity scheme for the operation's framework.
+    pub fn contains_operation(&self, migration: &Migration, op: &Operation) -> bool {
+        if migration.framework == crate::discovery::MigrationFramework::Alembic {
+            return op
+                .table_identity
+                .as_ref()
+                .is_some_and(|table| self.alembic_tables.contains(table));
+        }
+        op.model_name().is_some_and(|name| self.contains(name))
     }
 
     /// Is `name` in the set? Comparison is case-insensitive on
@@ -115,11 +138,12 @@ pub(crate) fn walk_with_created_models(
 ) {
     let mut created = CreatedModels::new();
     for op in &migration.operations {
-        walk_database_effective_operation(op, &mut created, &mut handle);
+        walk_database_effective_operation(migration, op, &mut created, &mut handle);
     }
 }
 
 fn walk_database_effective_operation(
+    migration: &Migration,
     op: &Operation,
     created: &mut CreatedModels,
     handle: &mut impl FnMut(&Operation, &CreatedModels),
@@ -127,13 +151,24 @@ fn walk_database_effective_operation(
     match &op.data {
         OperationData::SeparateDatabaseAndState(data) => {
             for db_op in &data.database_operations {
-                walk_database_effective_operation(db_op, created, handle);
+                walk_database_effective_operation(migration, db_op, created, handle);
             }
         }
         _ => {
+            if migration.framework == crate::discovery::MigrationFramework::Alembic
+                && op.op_type == OperationType::ExecuteSql
+            {
+                created.clear_alembic();
+            }
             if let OperationData::Model(ModelOperation { name, old_name }) = &op.data {
                 if op.op_type == OperationType::CreateModel {
-                    created.insert(name);
+                    if migration.framework == crate::discovery::MigrationFramework::Alembic {
+                        if let Some(table) = op.table_identity.clone() {
+                            created.insert_alembic(table);
+                        }
+                    } else {
+                        created.insert(name);
+                    }
                 } else if op.op_type == OperationType::RenameModel {
                     if let Some(old_name) = old_name {
                         created.remove(old_name);
