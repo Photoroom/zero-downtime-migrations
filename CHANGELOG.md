@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.0 - 2026-08-24
+
+### Added
+
+- zdm now analyses PostgreSQL migrations from Django, Alembic/SQLAlchemy, and
+  Aerich/Tortoise.
+- Aerich support analyses supported static DDL, including locally defined
+  helper callbacks and literal `execute_statement(...)` calls. It detects
+  unsafe indexes, destructive changes, type changes, foreign keys, and
+  constraints, while recognising concurrent indexes and `NOT VALID`
+  constraints.
+
+### Packaging
+
+- The PyPI distribution is now `zdm`.
+
 ## 0.5.0 - 2026-08-11
 
 ### Added

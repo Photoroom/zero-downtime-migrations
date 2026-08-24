@@ -3,8 +3,8 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "django-zdm"
-version = "0.5.0"
+name = "zdm"
+version = "0.6.0"
 description = "A PostgreSQL migration safety linter for Django, Alembic, and Aerich"
 readme = "README.md"
 license = { text = "MIT" }
