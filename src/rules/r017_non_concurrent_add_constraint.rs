@@ -55,7 +55,7 @@ impl Rule for R017NonConcurrentAddConstraint {
             if created.contains_operation(migration, op) {
                 return;
             }
-            if migration.framework == crate::discovery::MigrationFramework::Alembic
+            if migration.framework.uses_sql_table_identity()
                 && data.not_valid
                 && matches!(
                     data.constraint_type,
@@ -65,29 +65,29 @@ impl Rule for R017NonConcurrentAddConstraint {
                 return;
             }
 
-            // Django FKs go through AddField (covered by R006); Alembic
-            // represents one directly as a constraint. UniqueConstraint
+            // Django FKs go through AddField (covered by R006); SQL-returning
+            // migration frameworks represent one directly as a constraint. UniqueConstraint
             // is covered by R002 with USING INDEX guidance.
             let (message, help) = match data.constraint_type {
                 ConstraintType::Check => (
-                    if migration.framework == crate::discovery::MigrationFramework::Alembic {
+                    if migration.framework.uses_sql_table_identity() {
                         "Adding a CHECK constraint validates all existing rows".to_string()
                     } else {
                         "AddConstraint with a CHECK constraint validates all rows".to_string()
                     },
-                    if migration.framework == crate::discovery::MigrationFramework::Alembic {
-                        "Use op.execute to add the constraint as NOT VALID, then validate it in a later revision.".to_string()
+                    if migration.framework.uses_sql_table_identity() {
+                        "Add the constraint as NOT VALID, then validate it in a later revision.".to_string()
                     } else {
                         include_str!("help/r017_check_constraint.txt").to_string()
                     },
                 ),
                 ConstraintType::Exclusion => (
-                    if migration.framework == crate::discovery::MigrationFramework::Alembic {
+                    if migration.framework.uses_sql_table_identity() {
                         "Adding an EXCLUDE constraint builds its index non-concurrently, locking the table".to_string()
                     } else {
                         "AddConstraint with an EXCLUDE constraint builds its index non-concurrently, locking the table".to_string()
                     },
-                    if migration.framework == crate::discovery::MigrationFramework::Alembic {
+                    if migration.framework.uses_sql_table_identity() {
                         "PostgreSQL has no fully-online EXCLUDE constraint path; create it with a new table or use a low-traffic window.".to_string()
                     } else {
                         include_str!("help/r017_exclusion_constraint.txt").to_string()

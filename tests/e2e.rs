@@ -39,6 +39,10 @@ fn alembic_fixtures_dir() -> PathBuf {
     fixtures_root().join("alembic")
 }
 
+fn aerich_fixtures_dir() -> PathBuf {
+    fixtures_root().join("aerich")
+}
+
 /// Lint `fixture` with `--output-format json` and assert that
 /// exactly `expected_count` diagnostics with rule_id `rule_id`
 /// fired on a file whose path's last segment matches the
@@ -201,6 +205,41 @@ fn e2e_alembic_unsafe_revision_reports_the_supported_rule_set() {
 #[test]
 fn e2e_alembic_new_table_and_autocommit_revision_is_safe() {
     let fixture = alembic_fixtures_dir().join("versions/20260809_safe_new_jobs.py");
+    assert_pass_fixture(&fixture);
+}
+
+// =============================================================================
+// Aerich tests
+// =============================================================================
+
+#[test]
+fn e2e_aerich_unsafe_revision_reports_the_supported_rule_set() {
+    let output = zdm()
+        .arg(aerich_fixtures_dir())
+        .arg("--output-format")
+        .arg("json")
+        .assert()
+        .failure()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let ids: Vec<_> = json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|diagnostic| diagnostic["rule_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["R001", "R016", "R005", "R011", "R015", "R006", "R010", "R002", "R017", "R017"]
+    );
+}
+
+#[test]
+fn e2e_aerich_new_table_revision_is_safe() {
+    let fixture = aerich_fixtures_dir().join("migrations/models/0_20260823_safe_jobs.py");
     assert_pass_fixture(&fixture);
 }
 

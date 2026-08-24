@@ -43,18 +43,30 @@ impl Rule for R001NonConcurrentAddIndex {
                     self.id(),
                     self.name(),
                     self.severity(),
-                    if migration.framework == crate::discovery::MigrationFramework::Alembic {
-                        "Alembic create_index is missing postgresql_concurrently=True"
-                    } else {
-                        "Use AddIndexConcurrently instead of AddIndex to avoid table locks"
+                    match migration.framework {
+                        crate::discovery::MigrationFramework::Alembic => {
+                            "Alembic create_index is missing postgresql_concurrently=True"
+                        }
+                        crate::discovery::MigrationFramework::Aerich => {
+                            "Aerich CREATE INDEX is missing CONCURRENTLY"
+                        }
+                        crate::discovery::MigrationFramework::Django => {
+                            "Use AddIndexConcurrently instead of AddIndex to avoid table locks"
+                        }
                     },
                     ctx.path.to_path_buf(),
                     op.span,
                 )
-                .with_help(if migration.framework == crate::discovery::MigrationFramework::Alembic {
-                    "Use postgresql_concurrently=True inside op.get_context().autocommit_block()."
-                } else {
-                    "Replace migrations.AddIndex with AddIndexConcurrently from django.contrib.postgres.operations"
+                .with_help(match migration.framework {
+                    crate::discovery::MigrationFramework::Alembic => {
+                        "Use postgresql_concurrently=True inside op.get_context().autocommit_block()."
+                    }
+                    crate::discovery::MigrationFramework::Aerich => {
+                        "Return CREATE INDEX CONCURRENTLY from upgrade() to avoid table locks."
+                    }
+                    crate::discovery::MigrationFramework::Django => {
+                        "Replace migrations.AddIndex with AddIndexConcurrently from django.contrib.postgres.operations"
+                    }
                 }),
             );
         });

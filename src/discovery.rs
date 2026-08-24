@@ -1,4 +1,4 @@
-//! File discovery for Django and Alembic migration files.
+//! File discovery for Django, Alembic, and Aerich migration files.
 //!
 //! This module handles finding migration files in directories,
 //! following the pattern `**/migrations/*.py`.
@@ -15,6 +15,14 @@ use crate::error::{Error, Result};
 pub enum MigrationFramework {
     Django,
     Alembic,
+    Aerich,
+}
+
+impl MigrationFramework {
+    /// Whether this framework represents tables by exact SQL identifiers.
+    pub(crate) fn uses_sql_table_identity(self) -> bool {
+        matches!(self, Self::Alembic | Self::Aerich)
+    }
 }
 
 /// Discovers Django migration files in the given paths, excluding those matching patterns.
@@ -181,6 +189,8 @@ pub fn migration_framework(path: &Path) -> Option<MigrationFramework> {
         Some(MigrationFramework::Django)
     } else if is_in_alembic_versions_directory(path) {
         Some(MigrationFramework::Alembic)
+    } else if is_in_aerich_migrations_directory(path) {
+        Some(MigrationFramework::Aerich)
     } else {
         None
     }
@@ -199,6 +209,26 @@ fn is_in_alembic_versions_directory(path: &Path) -> bool {
         .filter(|parent| parent.file_name().is_some_and(|name| name == "versions"))
         .and_then(Path::parent)
         .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "alembic"))
+}
+
+/// Check whether a file uses Aerich's `migrations/<app>/<number>_*.py` layout.
+fn is_in_aerich_migrations_directory(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(migrations) = parent.parent() else {
+        return false;
+    };
+    migrations
+        .file_name()
+        .is_some_and(|name| name == "migrations")
+        && path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| {
+                stem.split_once('_')
+                    .is_some_and(|(number, name)| !name.is_empty() && number.parse::<u64>().is_ok())
+            })
 }
 
 #[cfg(test)]
@@ -254,6 +284,9 @@ mod tests {
         assert!(is_migration_file(Path::new(
             "service/alembic/versions/20260809_add_jobs.py"
         )));
+        assert!(is_migration_file(Path::new(
+            "service/migrations/models/1_20260823_add_jobs.py"
+        )));
 
         // Invalid: __init__.py
         assert!(!is_migration_file(Path::new("app/migrations/__init__.py")));
@@ -267,6 +300,9 @@ mod tests {
         // Singular `migration/` directory does not count.
         assert!(!is_migration_file(Path::new("app/migration/0001.py")));
         assert!(!is_migration_file(Path::new("alembic/0001.py")));
+        assert!(!is_migration_file(Path::new(
+            "migrations/models/add_jobs.py"
+        )));
         assert!(!is_migration_file(Path::new(
             "alembic/versions/__init__.py"
         )));

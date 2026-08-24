@@ -55,11 +55,16 @@ impl Rule for R003RunSQLCreateIndex {
                             self.id(),
                             self.name(),
                             self.severity(),
-                            if migration.framework == crate::discovery::MigrationFramework::Alembic
-                            {
-                                "Alembic op.execute contains CREATE INDEX without CONCURRENTLY"
-                            } else {
-                                "RunSQL contains CREATE INDEX without CONCURRENTLY"
+                            match migration.framework {
+                                crate::discovery::MigrationFramework::Alembic => {
+                                    "Alembic op.execute contains CREATE INDEX without CONCURRENTLY"
+                                }
+                                crate::discovery::MigrationFramework::Aerich => {
+                                    "Aerich upgrade SQL contains CREATE INDEX without CONCURRENTLY"
+                                }
+                                crate::discovery::MigrationFramework::Django => {
+                                    "RunSQL contains CREATE INDEX without CONCURRENTLY"
+                                }
                             },
                             ctx.path.to_path_buf(),
                             op.span,

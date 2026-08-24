@@ -1,6 +1,7 @@
-//! R015: AlterField possibly changing to NOT NULL
+//! R015: AlterField possibly changing to NOT NULL or a new type
 //!
-//! Detects `AlterField` operations whose new field is NOT NULL. The
+//! Detects `AlterField` operations whose new field is NOT NULL or whose
+//! column type changes. The
 //! diagnostic flags both genuine nullable→NOT NULL transitions and
 //! benign re-stipulations of an already-NOT-NULL column (changing
 //! `max_length`, `help_text`, etc., where the new field still happens
@@ -48,8 +49,8 @@ impl Rule for R015AlterFieldNotNull {
     }
 
     fn description(&self) -> &'static str {
-        "AlterField on a field that ends up NOT NULL may scan every row to validate \
-         the constraint. Verify the column was already NOT NULL, or migrate via \
+        "AlterField that ends up NOT NULL may scan every row, and a type change may \
+         rewrite the table. Verify the column was already NOT NULL, or migrate via \
          a four-step pattern: NOT VALID CHECK, VALIDATE CONSTRAINT, SET NOT NULL, \
          DROP CONSTRAINT."
     }
@@ -68,7 +69,7 @@ impl Rule for R015AlterFieldNotNull {
             let Some(field) = &data.field else {
                 continue;
             };
-            if field.is_nullable {
+            if field.is_nullable && !field.is_type_change {
                 continue;
             }
             diagnostics.push(
@@ -76,7 +77,12 @@ impl Rule for R015AlterFieldNotNull {
                     self.id(),
                     self.name(),
                     self.severity(),
-                    if migration.framework == crate::discovery::MigrationFramework::Alembic {
+                    if field.is_type_change {
+                        format!(
+                            "Changing '{}' column type may require a table rewrite",
+                            data.field_name
+                        )
+                    } else if migration.framework.uses_sql_table_identity() {
                         format!(
                             "Changing '{}' to NOT NULL may require a full table scan",
                             data.field_name
@@ -91,7 +97,11 @@ impl Rule for R015AlterFieldNotNull {
                     ctx.path.to_path_buf(),
                     op.span,
                 )
-                .with_help(include_str!("help/r015_alter_field_not_null.txt")),
+                .with_help(if field.is_type_change {
+                    "Use an additive column, backfill it, and switch application reads before removing the old column."
+                } else {
+                    include_str!("help/r015_alter_field_not_null.txt")
+                }),
             );
         }
 

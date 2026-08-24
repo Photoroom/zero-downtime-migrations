@@ -1,14 +1,14 @@
 # zero-downtime-migrations (zdm)
 
-A PostgreSQL migration safety linter for Django and Alembic.
+A PostgreSQL migration safety linter for Django, Alembic, and Aerich/Tortoise.
 
 ## Why
 
-Deploying database migrations without downtime requires careful attention to how PostgreSQL acquires locks. Operations like adding an index, altering a column to NOT NULL, or adding a foreign key can lock tables for extended periods on large datasets, blocking reads and writes and causing outages. zdm statically analyzes Django migrations and supported Alembic revisions to catch these unsafe patterns before they reach production, helping teams ship schema changes safely during normal deployments.
+Deploying database migrations without downtime requires careful attention to how PostgreSQL acquires locks. Operations like adding an index, altering a column to NOT NULL, or adding a foreign key can lock tables for extended periods on large datasets, blocking reads and writes and causing outages. zdm statically analyzes Django migrations and supported Alembic and Aerich revisions to catch these unsafe patterns before they reach production, helping teams ship schema changes safely during normal deployments.
 
 ## What
 
-A standalone Rust CLI tool that statically analyzes Django and Alembic migration files to catch unsafe patterns that cause table locks, outages, and data loss on large PostgreSQL databases. Distributed like ruff/uv — a single fast binary, installable via `pip`, `uvx`, or standalone download.
+A standalone Rust CLI tool that statically analyzes Django, Alembic, and Aerich migration files to catch unsafe patterns that cause table locks, outages, and data loss on large PostgreSQL databases. Distributed like ruff/uv — a single fast binary, installable via `pip`, `uvx`, or standalone download.
 
 **Supports Django 3.2+** — zdm parses migration files directly without importing Django, so it works with any Django version and doesn't require Django to be installed.
 
@@ -29,6 +29,12 @@ with op.get_context().autocommit_block():
 ```
 
 The Alembic path is intentionally static: zdm does not import or execute revision scripts, connect to a database, inspect SQLAlchemy models, resolve aliases/custom operations, or evaluate dynamic SQL. `op.execute` is inspected only when its first positional argument or `sqltext` keyword is a string literal; use explicit SQL when you want it checked.
+
+### Aerich/Tortoise support
+
+zdm discovers Aerich revisions under `migrations/<app>/<number>_*.py`. It inspects literal SQL returned by `upgrade()` and literal SQL passed to `execute_statement(connection, sql)` from local helpers reached by `upgrade()`, including callbacks such as `run_with_lock_timeout(db, _upgrade_attempt)`. It maps PostgreSQL `CREATE/DROP INDEX`, `CREATE TABLE`, and `ALTER TABLE` column and constraint statements to the same safety rules used for Django and Alembic.
+
+The Aerich path is static: zdm does not import Tortoise, execute migrations, connect to a database, resolve imports, or evaluate variables and f-strings. It follows only local helper names and literal positional `execute_statement` SQL, so qualified calls, keyword arguments and dynamically assembled SQL are not checked. `CREATE TABLE IF NOT EXISTS` is not considered a fresh-table exemption. `CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY` are accepted, while R004 does not apply because Aerich exposes no equivalent to Django's `atomic = False` or Alembic's autocommit block.
 
 ## Installation
 
@@ -51,6 +57,7 @@ pipx install django-zdm
 # Lint a single migration
 zdm app/migrations/0042_add_index.py
 zdm alembic/versions/20260809_add_jobs.py
+zdm migrations/models/1_20260823_add_jobs.py
 
 # Lint all migrations in a directory
 zdm app/migrations/
@@ -136,11 +143,11 @@ test suite — every field above is guaranteed on every diagnostic.
 | R012 | irreversible-run-python | Warning | `RunPython` should have a reverse function |
 | R013 | irreversible-run-sql | Warning | `RunSQL` should have a reverse SQL |
 | R014 | model-imports | Error | Don't import models in `RunPython` |
-| R015 | alter-field-not-null | Warning | `AlterField` whose result is NOT NULL may scan every row |
+| R015 | alter-field-not-null | Warning | `AlterField` that sets NOT NULL may scan rows, and type changes may rewrite the table |
 | R016 | non-concurrent-remove-index | Error | Use `RemoveIndexConcurrently` instead of `RemoveIndex` |
 | R017 | non-concurrent-add-constraint | Error | CHECK constraint validates all rows; EXCLUDE constraint builds an index non-concurrently |
 
-For Alembic revisions, zdm evaluates R001, R003-R005, R011, R015-R017 against direct `op.*` calls in `upgrade()`. In diff modes, changeset rule R008 also applies. The Django API references in this table apply only to Django; Alembic diagnostics name their equivalent operations.
+For Alembic revisions, zdm evaluates R001, R003-R005, R011, R015-R017 against direct `op.*` calls in `upgrade()`. For Aerich revisions, zdm evaluates R001-R002, R005-R006, R010-R011, and R015-R017 against supported literal PostgreSQL DDL reachable from `upgrade()`. In diff modes, changeset rule R008 also applies. The Django API references in this table apply only to Django; Alembic and Aerich diagnostics name their equivalent operations.
 
 ### CreateModel Exemption
 

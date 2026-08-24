@@ -2,11 +2,11 @@
 name = "zero-downtime-migrations"
 version = "0.5.0"
 edition = "2021"
-description = "A PostgreSQL migration safety linter for Django and Alembic"
+description = "A PostgreSQL migration safety linter for Django, Alembic, and Aerich"
 license = "MIT"
 repository = "https://github.com/Photoroom/zero-downtime-migrations"
 readme = "README.md"
-keywords = ["django", "postgresql", "migrations", "linter", "database"]
+keywords = ["django", "tortoise", "aerich", "postgresql", "migrations", "linter", "database"]
 categories = ["command-line-utilities", "development-tools"]
 default-run = "zdm"
 

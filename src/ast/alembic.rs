@@ -235,6 +235,7 @@ impl<'a> AlembicMigrationExtractor<'a> {
                                     is_relation: false,
                                     is_nullable: false,
                                     has_default: false,
+                                    is_type_change: false,
                                 }),
                             }),
                             table_identity.clone(),

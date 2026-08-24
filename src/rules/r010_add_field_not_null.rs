@@ -50,17 +50,26 @@ impl Rule for R010AddFieldNotNull {
                     self.id(),
                     self.name(),
                     self.severity(),
-                    format!(
-                        "AddField '{}' is NOT NULL without a default value",
-                        data.field_name
-                    ),
+                    if migration.framework == crate::discovery::MigrationFramework::Aerich {
+                        format!(
+                            "Adding '{}' as NOT NULL without a default can rewrite the table",
+                            data.field_name
+                        )
+                    } else {
+                        format!(
+                            "AddField '{}' is NOT NULL without a default value",
+                            data.field_name
+                        )
+                    },
                     ctx.path.to_path_buf(),
                     op.span,
                 )
-                .with_help(
+                .with_help(if migration.framework == crate::discovery::MigrationFramework::Aerich {
+                    "Add the column as nullable, backfill it, then set NOT NULL in a later Aerich migration."
+                } else {
                     "Either: 1) Add the field as nullable with null=True, backfill, then \
-                     remove null=True in a separate migration, or 2) Provide a default value",
-                ),
+                     remove null=True in a separate migration, or 2) Provide a default value"
+                }),
             );
         });
 

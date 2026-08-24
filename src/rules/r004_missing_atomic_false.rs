@@ -34,6 +34,12 @@ impl Rule for R004MissingAtomicFalse {
     }
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
+        // Aerich has no migration-level transaction control analogous to
+        // Django's `atomic = False` or Alembic's autocommit block, so R004
+        // cannot offer an actionable fix for its SQL-returning migrations.
+        if migration.framework == MigrationFramework::Aerich {
+            return Vec::new();
+        }
         if migration.framework == MigrationFramework::Alembic {
             return migration
                 .database_effective_operations()
