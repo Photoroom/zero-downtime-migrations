@@ -41,14 +41,14 @@ The Aerich path is static: zdm does not import Tortoise, execute migrations, con
 > **Breaking change:** the `zero-downtime-migrations` command alias has been removed. Use `zdm`. (`alias zero-downtime-migrations=zdm` in your shell is a one-line workaround if you depended on the old name.)
 
 ```bash
-# Install via pip (PyPI package is django-zdm; binary is `zdm`)
-pip install django-zdm
+# Install via pip
+pip install zdm
 
 # Or use uvx to run without installing
-uvx --from django-zdm zdm .
+uvx --from zdm zdm .
 
 # Or install with pipx
-pipx install django-zdm
+pipx install zdm
 ```
 
 ## Usage
@@ -271,7 +271,7 @@ Rust must be available in the pre-commit environment.
     fetch-depth: 0
 
 - name: Install zdm
-  run: pip install django-zdm
+  run: pip install zdm
 
 - name: Lint migrations
   run: zdm --diff origin/main
