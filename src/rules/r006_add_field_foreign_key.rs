@@ -61,14 +61,25 @@ impl Rule for R006AddFieldForeignKey {
                     self.id(),
                     self.name(),
                     self.severity(),
-                    format!(
-                        "AddField with ForeignKey on existing model '{}'",
-                        data.model_name
-                    ),
+                    if migration.framework == crate::discovery::MigrationFramework::Aerich {
+                        format!(
+                            "Adding a foreign-key column to existing table '{}' can lock it",
+                            data.model_name
+                        )
+                    } else {
+                        format!(
+                            "AddField with ForeignKey on existing model '{}'",
+                            data.model_name
+                        )
+                    },
                     ctx.path.to_path_buf(),
                     op.span,
                 )
-                .with_help(include_str!("help/r006_add_fk.txt")),
+                .with_help(if migration.framework == crate::discovery::MigrationFramework::Aerich {
+                    "Add the column as nullable, backfill it, then add the foreign key as NOT VALID and validate it in a later Aerich migration."
+                } else {
+                    include_str!("help/r006_add_fk.txt")
+                }),
             );
         });
 

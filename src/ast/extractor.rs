@@ -379,6 +379,7 @@ impl<'a> MigrationExtractor<'a> {
             is_relation: is_relation_field(value, self),
             is_nullable: field_kwarg_equals(self, value, "null", "True"),
             has_default: field_has_non_null_kwarg(self, value, "default"),
+            is_type_change: false,
         })
     }
 

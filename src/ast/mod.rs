@@ -3,6 +3,7 @@
 //! This module provides typed Rust representations of Django migration
 //! operations extracted from tree-sitter Python AST nodes.
 
+mod aerich;
 mod alembic;
 pub(crate) mod extractor;
 mod operations;
@@ -10,7 +11,7 @@ mod operations;
 pub(crate) use extractor::MigrationExtractor;
 pub(crate) use operations::{
     any_sql_statement, sql_statement_contains_concurrently, sql_statement_contains_create_index,
-    sql_statement_contains_drop_index, sql_statement_contains_reindex,
+    sql_statement_contains_drop_index, sql_statement_contains_reindex, strip_sql_noise,
 };
 pub use operations::{
     ConstraintOperation, ConstraintType, FieldInfo, FieldOperation, IndexOperation, ModelOperation,
@@ -87,6 +88,9 @@ impl Migration {
         let extracted = match migration_framework(path) {
             Some(MigrationFramework::Alembic) => {
                 alembic::AlembicMigrationExtractor::new(parsed).extract(path)
+            }
+            Some(MigrationFramework::Aerich) => {
+                aerich::AerichMigrationExtractor::new(parsed).extract(path)
             }
             _ => MigrationExtractor::new(parsed).extract(path),
         };

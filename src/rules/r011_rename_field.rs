@@ -37,7 +37,7 @@ impl Rule for R011RenameField {
                     self.id(),
                     self.name(),
                     self.severity(),
-                    if migration.framework == crate::discovery::MigrationFramework::Alembic {
+                    if migration.framework.uses_sql_table_identity() {
                         "Renaming a column requires simultaneous application deployment"
                     } else {
                         "RenameField requires simultaneous application deployment"

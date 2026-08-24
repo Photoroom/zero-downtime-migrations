@@ -79,14 +79,14 @@ impl<'a> RuleContext<'a> {
 /// on both sides so callers can pass `model_name` as-is.
 pub struct CreatedModels {
     names: HashSet<String>,
-    alembic_tables: HashSet<TableIdentity>,
+    sql_tables: HashSet<TableIdentity>,
 }
 
 impl CreatedModels {
     fn new() -> Self {
         Self {
             names: HashSet::new(),
-            alembic_tables: HashSet::new(),
+            sql_tables: HashSet::new(),
         }
     }
 
@@ -98,21 +98,21 @@ impl CreatedModels {
         self.names.remove(&name.to_lowercase());
     }
 
-    fn insert_alembic(&mut self, table: TableIdentity) {
-        self.alembic_tables.insert(table);
+    fn insert_sql_table(&mut self, table: TableIdentity) {
+        self.sql_tables.insert(table);
     }
 
-    fn clear_alembic(&mut self) {
-        self.alembic_tables.clear();
+    fn clear_sql_tables(&mut self) {
+        self.sql_tables.clear();
     }
 
     /// Checks the appropriate identity scheme for the operation's framework.
     pub fn contains_operation(&self, migration: &Migration, op: &Operation) -> bool {
-        if migration.framework == crate::discovery::MigrationFramework::Alembic {
+        if migration.framework.uses_sql_table_identity() {
             return op
                 .table_identity
                 .as_ref()
-                .is_some_and(|table| self.alembic_tables.contains(table));
+                .is_some_and(|table| self.sql_tables.contains(table));
         }
         op.model_name().is_some_and(|name| self.contains(name))
     }
@@ -155,16 +155,16 @@ fn walk_database_effective_operation(
             }
         }
         _ => {
-            if migration.framework == crate::discovery::MigrationFramework::Alembic
+            if migration.framework.uses_sql_table_identity()
                 && op.op_type == OperationType::ExecuteSql
             {
-                created.clear_alembic();
+                created.clear_sql_tables();
             }
             if let OperationData::Model(ModelOperation { name, old_name }) = &op.data {
                 if op.op_type == OperationType::CreateModel {
-                    if migration.framework == crate::discovery::MigrationFramework::Alembic {
+                    if migration.framework.uses_sql_table_identity() {
                         if let Some(table) = op.table_identity.clone() {
-                            created.insert_alembic(table);
+                            created.insert_sql_table(table);
                         }
                     } else {
                         created.insert(name);

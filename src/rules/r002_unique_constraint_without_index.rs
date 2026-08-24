@@ -56,11 +56,19 @@ impl Rule for R002UniqueConstraintWithoutIndex {
                     self.id(),
                     self.name(),
                     self.severity(),
-                    "AddConstraint with UniqueConstraint locks the table while it builds the index",
+                    if migration.framework == crate::discovery::MigrationFramework::Aerich {
+                        "Aerich UNIQUE constraint builds its index while locking the table"
+                    } else {
+                        "AddConstraint with UniqueConstraint locks the table while it builds the index"
+                    },
                     ctx.path.to_path_buf(),
                     op.span,
                 )
-                .with_help(include_str!("help/r002_unique_constraint.txt")),
+                .with_help(if migration.framework == crate::discovery::MigrationFramework::Aerich {
+                    "Create a UNIQUE INDEX CONCURRENTLY, then attach it with ALTER TABLE ... ADD CONSTRAINT ... UNIQUE USING INDEX in a later Aerich migration."
+                } else {
+                    include_str!("help/r002_unique_constraint.txt")
+                }),
             );
         });
 
