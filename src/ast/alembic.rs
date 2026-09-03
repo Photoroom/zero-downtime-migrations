@@ -235,6 +235,7 @@ impl<'a> AlembicMigrationExtractor<'a> {
                                     is_relation: false,
                                     is_nullable: false,
                                     has_default: false,
+                                    has_db_default: false,
                                     is_type_change: false,
                                 }),
                             }),

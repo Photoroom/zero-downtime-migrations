@@ -365,7 +365,7 @@ impl<'a> MigrationExtractor<'a> {
     /// The shape is `migrations.AddField(field=models.CharField(...))`
     /// (or `ForeignKey`, `IntegerField`, etc.). We find the
     /// `field=` kwarg, then descend the `models.<Type>(...)`
-    /// call to read its `null=` and `default=` kwargs from the
+    /// call to read its `null=`, `default=`, and `db_default=` kwargs from the
     /// AST directly — no raw-text scanning, no keyword-boundary
     /// gymnastics on a normalised byte buffer.
     fn extract_field_info(&self, args: Node) -> Option<FieldInfo> {
@@ -379,6 +379,7 @@ impl<'a> MigrationExtractor<'a> {
             is_relation: is_relation_field(value, self),
             is_nullable: field_kwarg_equals(self, value, "null", "True"),
             has_default: field_has_non_null_kwarg(self, value, "default"),
+            has_db_default: field_has_non_null_kwarg(self, value, "db_default"),
             is_type_change: false,
         })
     }

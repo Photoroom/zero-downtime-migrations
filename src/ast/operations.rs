@@ -204,6 +204,8 @@ pub struct FieldInfo {
     pub is_nullable: bool,
     /// Whether the field has a default value.
     pub has_default: bool,
+    /// Whether the field has a database default value.
+    pub has_db_default: bool,
     /// Whether the operation changes an existing column's type.
     pub is_type_change: bool,
 }

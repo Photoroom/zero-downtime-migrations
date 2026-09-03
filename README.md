@@ -138,7 +138,7 @@ test suite — every field above is guaranteed on every diagnostic.
 | R006 | add-field-foreign-key | Error | Adding FK creates index and validates constraint (merged R007) |
 | R008 | disallowed-file-changes | Error | Don't change app code alongside migrations |
 | R009 | separate-db-state-same-pr | Error | Don't deploy both steps of `SeparateDatabaseAndState` together |
-| R010 | add-field-not-null | Error | Adding NOT NULL field without default rewrites table |
+| R010 | add-field-not-null | Error | Adding NOT NULL field without a Python or database default rewrites table |
 | R011 | rename-field | Error | Renaming fields can break running code |
 | R012 | irreversible-run-python | Warning | `RunPython` should have a reverse function |
 | R013 | irreversible-run-sql | Warning | `RunSQL` should have a reverse SQL |
