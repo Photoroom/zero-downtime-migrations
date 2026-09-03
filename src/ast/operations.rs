@@ -30,9 +30,9 @@ pub struct TableIdentity {
 
 impl Operation {
     /// The target model this operation acts on, when it has a single one
-    /// (index, field, and constraint operations). Returns `None` for
-    /// operations without a target model — `CreateModel`, `RunSQL`,
-    /// `RunPython`, and `SeparateDatabaseAndState`. Used by the
+    /// (index, field, constraint, and model operations). Returns `None` for
+    /// operations without a target model — `RunSQL`, `RunPython`, and
+    /// `SeparateDatabaseAndState`. Used by the
     /// created-in-this-migration exemption shared across several rules.
     pub fn model_name(&self) -> Option<&str> {
         match &self.data {

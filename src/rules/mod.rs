@@ -1,7 +1,7 @@
 //! Rule definitions and implementations.
 //!
 //! Rules are organized into two categories:
-//! - Per-file rules (R001-R006, R010-R018): Analyze individual migration files
+//! - Per-file rules (R001-R006, R010-R019): Analyze individual migration files
 //! - Changeset rules (R008-R009): Analyze sets of changed files in a PR
 //!
 //! R007 was merged into R006 and retired; the ID is intentionally skipped.
@@ -28,6 +28,7 @@ mod r015_alter_field_not_null;
 mod r016_non_concurrent_remove_index;
 mod r017_non_concurrent_add_constraint;
 mod r018_implicit_django_index;
+mod r019_table_rename_or_drop;
 
 pub use r001_non_concurrent_add_index::R001NonConcurrentAddIndex;
 pub use r002_unique_constraint_without_index::R002UniqueConstraintWithoutIndex;
@@ -46,6 +47,7 @@ pub use r015_alter_field_not_null::R015AlterFieldNotNull;
 pub use r016_non_concurrent_remove_index::R016NonConcurrentRemoveIndex;
 pub use r017_non_concurrent_add_constraint::R017NonConcurrentAddConstraint;
 pub use r018_implicit_django_index::R018ImplicitDjangoIndex;
+pub use r019_table_rename_or_drop::R019TableRenameOrDrop;
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -173,11 +175,15 @@ fn walk_database_effective_operation(
                     }
                 } else if op.op_type == OperationType::RenameModel {
                     if let Some(old_name) = old_name {
-                        created.remove(old_name);
-                        created.insert(name);
+                        if created.contains(old_name) {
+                            created.remove(old_name);
+                            created.insert(name);
+                        }
                     }
                 } else if op.op_type == OperationType::DeleteModel {
+                    handle(op, created);
                     created.remove(name);
+                    return;
                 }
             }
             handle(op, created);
@@ -260,6 +266,7 @@ impl RuleRegistry {
                 Box::new(R016NonConcurrentRemoveIndex),
                 Box::new(R017NonConcurrentAddConstraint),
                 Box::new(R018ImplicitDjangoIndex),
+                Box::new(R019TableRenameOrDrop),
             ],
         }
     }
@@ -441,7 +448,7 @@ mod tests {
             ids,
             vec![
                 "R001", "R002", "R003", "R004", "R005", "R006", "R010", "R011", "R012", "R013",
-                "R014", "R015", "R016", "R017", "R018",
+                "R014", "R015", "R016", "R017", "R018", "R019",
             ],
         );
     }

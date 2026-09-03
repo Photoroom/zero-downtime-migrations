@@ -289,7 +289,8 @@ impl<'a> MigrationExtractor<'a> {
             }
             OperationType::CreateModel
             | OperationType::DeleteModel
-            | OperationType::RenameModel => {
+            | OperationType::RenameModel
+            | OperationType::AlterModelTable => {
                 OperationData::Model(self.extract_model_operation(op_type, args))
             }
             OperationType::AddField
