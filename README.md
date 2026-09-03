@@ -14,12 +14,14 @@ A standalone Rust CLI tool that statically analyzes Django, Alembic, and Aerich 
 
 ### Alembic support
 
-zdm also discovers Alembic revision scripts directly under `alembic/versions/*.py`. It statically supports direct `op.*` calls in `upgrade()`:
+zdm discovers Alembic revision scripts directly under `alembic/versions/*.py` and Flask-Migrate scripts under `migrations/versions/*.py`. It statically supports direct `op.*` calls in `upgrade()`:
 
-- `create_table`, `create_index`, `drop_index`
+- `create_table`, `rename_table`, `drop_table`
+- `add_column` with a direct `Column(...)`, `drop_column`
+- `create_index`, `drop_index`, `create_unique_constraint`
 - `create_foreign_key` and `create_check_constraint` (including `postgresql_not_valid=True`), plus `create_exclude_constraint`
-- `alter_column(nullable=False)` and `alter_column(new_column_name=...)`
-- `drop_column` and `execute("<static SQL>")`
+- `alter_column(nullable=False)`, type changes, and `alter_column(new_column_name=...)`
+- `execute("<static SQL>")`
 
 Use `postgresql_concurrently=True` only inside the canonical boundary:
 
@@ -28,7 +30,7 @@ with op.get_context().autocommit_block():
     op.create_index("jobs_state_idx", "jobs", ["state"], postgresql_concurrently=True)
 ```
 
-The Alembic path is intentionally static: zdm does not import or execute revision scripts, connect to a database, inspect SQLAlchemy models, resolve aliases/custom operations, or evaluate dynamic SQL. `op.execute` is inspected only when its first positional argument or `sqltext` keyword is a string literal; use explicit SQL when you want it checked.
+The Alembic path is intentionally static: only direct `op.*` calls in `upgrade()` are inspected. zdm does not import or execute revision scripts, connect to a database, inspect SQLAlchemy models, resolve aliases/custom operations, or evaluate dynamic SQL. `batch_alter_table()` is unsupported. `op.execute` is inspected only when its first positional argument or `sqltext` keyword is a string literal; use explicit SQL when you want it checked.
 
 ### Aerich/Tortoise support
 
@@ -149,7 +151,7 @@ test suite — every field above is guaranteed on every diagnostic.
 | R018 | implicit-django-index | Error | `AddField` and non-empty `AlterUniqueTogether`/`AlterIndexTogether` build indexes non-concurrently; `AlterField` warns |
 | R019 | table-rename-or-drop | Error | Renaming or dropping an existing table breaks running application code |
 
-For Alembic revisions, zdm evaluates R001, R003-R005, R011, R015-R017 against direct `op.*` calls in `upgrade()`. For Aerich revisions, zdm evaluates R001-R002, R005-R006, R010-R011, and R015-R017 against supported literal PostgreSQL DDL reachable from `upgrade()`. In diff modes, changeset rule R008 also applies. The Django API references in this table apply only to Django; Alembic and Aerich diagnostics name their equivalent operations.
+For Alembic revisions, zdm evaluates R001-R006, R010-R011, R015-R017, and R019 against direct `op.*` calls in `upgrade()`. For Aerich revisions, zdm evaluates R001-R002, R005-R006, R010-R011, and R015-R017 against supported literal PostgreSQL DDL reachable from `upgrade()`. In diff modes, changeset rule R008 also applies. The Django API references in this table apply only to Django; Alembic and Aerich diagnostics name their equivalent operations.
 
 ### CreateModel Exemption
 

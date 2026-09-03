@@ -187,7 +187,8 @@ pub fn migration_framework(path: &Path) -> Option<MigrationFramework> {
     }
     if is_in_migrations_directory(path) {
         Some(MigrationFramework::Django)
-    } else if is_in_alembic_versions_directory(path) {
+    } else if is_in_alembic_versions_directory(path) || is_in_flask_migrate_versions_directory(path)
+    {
         Some(MigrationFramework::Alembic)
     } else if is_in_aerich_migrations_directory(path) {
         Some(MigrationFramework::Aerich)
@@ -211,6 +212,20 @@ fn is_in_alembic_versions_directory(path: &Path) -> bool {
         .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "alembic"))
 }
 
+/// Check whether a file uses Flask-Migrate's `migrations/versions/` layout.
+fn is_in_flask_migrate_versions_directory(path: &Path) -> bool {
+    let Some(versions) = path.parent() else {
+        return false;
+    };
+    versions.file_name().is_some_and(|name| name == "versions")
+        && versions.parent().is_some_and(|migrations| {
+            migrations
+                .file_name()
+                .is_some_and(|name| name == "migrations")
+        })
+        && path.file_stem().is_some_and(|stem| stem != "__init__")
+}
+
 /// Check whether a file uses Aerich's `migrations/<app>/<number>_*.py` layout.
 fn is_in_aerich_migrations_directory(path: &Path) -> bool {
     let Some(parent) = path.parent() else {
@@ -222,13 +237,16 @@ fn is_in_aerich_migrations_directory(path: &Path) -> bool {
     migrations
         .file_name()
         .is_some_and(|name| name == "migrations")
-        && path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .is_some_and(|stem| {
-                stem.split_once('_')
-                    .is_some_and(|(number, name)| !name.is_empty() && number.parse::<u64>().is_ok())
-            })
+        && has_numeric_revision_prefix(path)
+}
+
+fn has_numeric_revision_prefix(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| {
+            stem.split_once('_')
+                .is_some_and(|(number, name)| !name.is_empty() && number.parse::<u64>().is_ok())
+        })
 }
 
 #[cfg(test)]
@@ -287,6 +305,18 @@ mod tests {
         assert!(is_migration_file(Path::new(
             "service/migrations/models/1_20260823_add_jobs.py"
         )));
+        assert_eq!(
+            migration_framework(Path::new(
+                "service/migrations/versions/a1b2c3d4_add_jobs.py"
+            )),
+            Some(MigrationFramework::Alembic),
+        );
+        assert_eq!(
+            migration_framework(Path::new(
+                "service/migrations/versions/release_2026_09_add_jobs.py"
+            )),
+            Some(MigrationFramework::Alembic),
+        );
 
         // Invalid: __init__.py
         assert!(!is_migration_file(Path::new("app/migrations/__init__.py")));
