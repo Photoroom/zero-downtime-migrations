@@ -135,7 +135,7 @@ test suite — every field above is guaranteed on every diagnostic.
 | R003 | runsql-create-index | Error | Use `AddIndexConcurrently` instead of raw SQL `CREATE INDEX` |
 | R004 | missing-atomic-false | Error | Non-atomic migrations require `atomic = False` |
 | R005 | remove-field-without-separate | Error | Use `SeparateDatabaseAndState` to remove fields safely |
-| R006 | add-field-foreign-key | Error | Adding FK creates index and validates constraint (merged R007) |
+| R006 | add-field-foreign-key | Error | Adding FK creates index and validates constraint, except plain FKs that disable both |
 | R008 | disallowed-file-changes | Error | Don't change app code alongside migrations |
 | R009 | separate-db-state-same-pr | Error | Don't deploy both steps of `SeparateDatabaseAndState` together |
 | R010 | add-field-not-null | Error | Adding NOT NULL field without a Python or database default rewrites table |

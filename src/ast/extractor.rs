@@ -16,15 +16,22 @@ use crate::parser::ParsedMigration;
 
 /// Whether a field constructor creates a database relation.
 fn is_relation_field(value: Node<'_>, ex: &MigrationExtractor<'_>) -> bool {
-    let Some(function) = value.child_by_field_name("function") else {
-        return false;
-    };
+    matches!(field_type(value, ex), Some("ForeignKey" | "OneToOneField"))
+}
+
+fn is_foreign_key_field(value: Node<'_>, ex: &MigrationExtractor<'_>) -> bool {
+    field_type(value, ex) == Some("ForeignKey")
+}
+
+fn field_type<'a>(value: Node<'a>, ex: &'a MigrationExtractor<'a>) -> Option<&'a str> {
+    let function = value.child_by_field_name("function")?;
     let function_text = ex.node_text(function);
-    let field_name = function_text
-        .split('.')
-        .next_back()
-        .unwrap_or(function_text);
-    matches!(field_name, "ForeignKey" | "OneToOneField")
+    Some(
+        function_text
+            .split('.')
+            .next_back()
+            .unwrap_or(function_text),
+    )
 }
 
 /// `true` if the `models.<Type>(...)` call rooted at `value` has
@@ -377,6 +384,12 @@ impl<'a> MigrationExtractor<'a> {
         }
         Some(FieldInfo {
             is_relation: is_relation_field(value, self),
+            is_foreign_key: is_foreign_key_field(value, self),
+            db_constraint: !field_kwarg_equals(self, value, "db_constraint", "False"),
+            db_index: field_kwarg_equals(self, value, "db_index", "True"),
+            db_index_disabled: field_kwarg_equals(self, value, "db_index", "False"),
+            is_unique: field_kwarg_equals(self, value, "unique", "True")
+                || field_kwarg_equals(self, value, "primary_key", "True"),
             is_nullable: field_kwarg_equals(self, value, "null", "True"),
             has_default: field_has_non_null_kwarg(self, value, "default"),
             has_db_default: field_has_non_null_kwarg(self, value, "db_default"),

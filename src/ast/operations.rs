@@ -200,6 +200,16 @@ pub struct FieldOperation {
 pub struct FieldInfo {
     /// Whether the field is a `ForeignKey` or `OneToOneField`.
     pub is_relation: bool,
+    /// Whether the field is specifically a `ForeignKey`.
+    pub is_foreign_key: bool,
+    /// Whether Django will create the database constraint.
+    pub db_constraint: bool,
+    /// Whether Django explicitly creates a database index.
+    pub db_index: bool,
+    /// Whether Django explicitly disables the implicit relation index.
+    pub db_index_disabled: bool,
+    /// Whether the field is unique.
+    pub is_unique: bool,
     /// Whether the field is nullable.
     pub is_nullable: bool,
     /// Whether the field has a default value.

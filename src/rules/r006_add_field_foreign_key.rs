@@ -52,6 +52,14 @@ impl Rule for R006AddFieldForeignKey {
                 return;
             }
 
+            if field.is_foreign_key
+                && !field.db_constraint
+                && field.db_index_disabled
+                && !field.is_unique
+            {
+                return;
+            }
+
             if created.contains_operation(migration, op) {
                 return;
             }
@@ -190,6 +198,114 @@ class Migration(migrations.Migration):
         let diagnostics = check_migration(ADD_FK_AFTER_CONCURRENT_INDEX_GOOD);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R006");
+    }
+
+    const PLAIN_FK_WITHOUT_DATABASE_WORK_GOOD: &str = r#"
+from django.db import migrations, models
+
+class Migration(migrations.Migration):
+    operations = [
+        migrations.AddField(
+            model_name='order', name='customer',
+            field=models.ForeignKey(
+                on_delete=models.CASCADE, to='app.customer',
+                db_constraint=False, db_index=False,
+            ),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_plain_fk_without_constraint_or_index_is_exempt() {
+        assert!(check_migration(PLAIN_FK_WITHOUT_DATABASE_WORK_GOOD).is_empty());
+    }
+
+    const FK_WITH_UNIQUE_BAD: &str = r#"
+from django.db import migrations, models
+
+class Migration(migrations.Migration):
+    operations = [
+        migrations.AddField(
+            model_name='order', name='customer',
+            field=models.ForeignKey(
+                on_delete=models.CASCADE, to='app.customer', unique=True,
+                db_constraint=False, db_index=False,
+            ),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_unique_fk_without_constraint_or_index_is_flagged() {
+        assert_eq!(check_migration(FK_WITH_UNIQUE_BAD)[0].rule_id, "R006");
+    }
+
+    const PRIMARY_KEY_FK_WITHOUT_DATABASE_WORK_BAD: &str = r#"
+from django.db import migrations, models
+
+class Migration(migrations.Migration):
+    operations = [
+        migrations.AddField(
+            model_name='order', name='customer',
+            field=models.ForeignKey(
+                on_delete=models.CASCADE, to='app.customer', primary_key=True,
+                db_constraint=False, db_index=False,
+            ),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_primary_key_fk_without_constraint_or_index_is_flagged() {
+        assert_eq!(
+            check_migration(PRIMARY_KEY_FK_WITHOUT_DATABASE_WORK_BAD)[0].rule_id,
+            "R006"
+        );
+    }
+
+    const ONE_TO_ONE_WITHOUT_DATABASE_WORK_BAD: &str = r#"
+from django.db import migrations, models
+
+class Migration(migrations.Migration):
+    operations = [
+        migrations.AddField(
+            model_name='order', name='customer',
+            field=models.OneToOneField(
+                on_delete=models.CASCADE, to='app.customer',
+                db_constraint=False, db_index=False,
+            ),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_one_to_one_without_constraint_or_index_is_flagged() {
+        assert_eq!(
+            check_migration(ONE_TO_ONE_WITHOUT_DATABASE_WORK_BAD)[0].rule_id,
+            "R006"
+        );
+    }
+
+    const FK_WITH_ONLY_INDEX_DISABLED_BAD: &str = r#"
+from django.db import migrations, models
+
+class Migration(migrations.Migration):
+    operations = [
+        migrations.AddField(
+            model_name='order', name='customer',
+            field=models.ForeignKey(
+                on_delete=models.CASCADE, to='app.customer', db_index=False,
+            ),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_fk_with_constraint_is_flagged() {
+        assert_eq!(
+            check_migration(FK_WITH_ONLY_INDEX_DISABLED_BAD)[0].rule_id,
+            "R006"
+        );
     }
 
     const ADDFIELD_FK_BEFORE_CREATEMODEL_BAD: &str = r#"
