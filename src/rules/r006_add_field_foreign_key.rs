@@ -27,10 +27,9 @@ impl Rule for R006AddFieldForeignKey {
     }
 
     fn description(&self) -> &'static str {
-        "AddField with a ForeignKey on an existing table creates an implicit \
+        "Adding a foreign-key column to an existing table creates an implicit \
          index (locking the table while it builds) and validates the FK \
-         constraint against every existing row. Split the work via \
-         SeparateDatabaseAndState."
+         constraint against every existing row. Split the rollout."
     }
 
     fn severity(&self) -> Severity {
@@ -69,24 +68,24 @@ impl Rule for R006AddFieldForeignKey {
                     self.id(),
                     self.name(),
                     self.severity(),
-                    if migration.framework == crate::discovery::MigrationFramework::Aerich {
+                    if migration.framework == crate::discovery::MigrationFramework::Django {
                         format!(
-                            "Adding a foreign-key column to existing table '{}' can lock it",
+                            "AddField with ForeignKey on existing model '{}'",
                             data.model_name
                         )
                     } else {
                         format!(
-                            "AddField with ForeignKey on existing model '{}'",
+                            "Adding a foreign-key column to existing table '{}' can lock it",
                             data.model_name
                         )
                     },
                     ctx.path.to_path_buf(),
                     op.span,
                 )
-                .with_help(if migration.framework == crate::discovery::MigrationFramework::Aerich {
-                    "Add the column as nullable, backfill it, then add the foreign key as NOT VALID and validate it in a later Aerich migration."
-                } else {
+                .with_help(if migration.framework == crate::discovery::MigrationFramework::Django {
                     include_str!("help/r006_add_fk.txt")
+                } else {
+                    "Add the column as nullable, backfill it, then add the foreign key as NOT VALID and validate it in a later migration."
                 }),
             );
         });
@@ -181,6 +180,10 @@ class Migration(migrations.Migration):
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].rule_id, "R006");
         assert_eq!(diagnostics[0].severity, Severity::Error);
+        assert!(diagnostics[0]
+            .help
+            .as_ref()
+            .is_some_and(|help| help.contains("SeparateDatabaseAndState")));
     }
 
     #[test]

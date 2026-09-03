@@ -110,6 +110,16 @@ impl CreatedModels {
         self.sql_tables.clear();
     }
 
+    fn rename_sql_table(&mut self, old: TableIdentity, new: TableIdentity) {
+        if self.sql_tables.remove(&old) {
+            self.sql_tables.insert(new);
+        }
+    }
+
+    fn remove_sql_table(&mut self, table: &TableIdentity) {
+        self.sql_tables.remove(table);
+    }
+
     /// Checks the appropriate identity scheme for the operation's framework.
     pub fn contains_operation(&self, migration: &Migration, op: &Operation) -> bool {
         if migration.framework.uses_sql_table_identity() {
@@ -175,14 +185,30 @@ fn walk_database_effective_operation(
                     }
                 } else if op.op_type == OperationType::RenameModel {
                     if let Some(old_name) = old_name {
-                        if created.contains(old_name) {
+                        if migration.framework.uses_sql_table_identity() {
+                            if let Some(new_table) = op.table_identity.clone() {
+                                created.rename_sql_table(
+                                    TableIdentity {
+                                        schema: new_table.schema.clone(),
+                                        name: old_name.clone(),
+                                    },
+                                    new_table,
+                                );
+                            }
+                        } else if created.contains(old_name) {
                             created.remove(old_name);
                             created.insert(name);
                         }
                     }
                 } else if op.op_type == OperationType::DeleteModel {
                     handle(op, created);
-                    created.remove(name);
+                    if migration.framework.uses_sql_table_identity() {
+                        if let Some(table) = &op.table_identity {
+                            created.remove_sql_table(table);
+                        }
+                    } else {
+                        created.remove(name);
+                    }
                     return;
                 }
             }
