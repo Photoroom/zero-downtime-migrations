@@ -65,7 +65,7 @@ impl Rule for R016NonConcurrentRemoveIndex {
                         "Use postgresql_concurrently=True inside op.get_context().autocommit_block()."
                     }
                     crate::discovery::MigrationFramework::Aerich => {
-                        "Return DROP INDEX CONCURRENTLY from upgrade() to avoid table locks."
+                        "Return DROP INDEX CONCURRENTLY from upgrade(); generated-format migrations also require RUN_IN_TRANSACTION = False."
                     }
                     crate::discovery::MigrationFramework::Django => {
                         "Replace migrations.RemoveIndex with RemoveIndexConcurrently from django.contrib.postgres.operations. The concurrent form takes SHARE UPDATE EXCLUSIVE instead of ACCESS EXCLUSIVE and must run outside a transaction (`atomic = False`)."
