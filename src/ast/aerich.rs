@@ -226,7 +226,31 @@ impl<'a> AerichMigrationExtractor<'a> {
                 create_table_is_unconditional,
                 multi_statement_script,
             ) {
+                let inline_unique = match &operation.data {
+                    OperationData::Field(field) => field
+                        .field
+                        .as_ref()
+                        .is_some_and(|field| field.is_unique)
+                        .then(|| field.model_name.clone()),
+                    _ => None,
+                };
+                let table_identity = operation.table_identity.clone();
+                let in_autocommit_block = operation.in_autocommit_block;
                 operations.push(operation);
+                if let Some(model_name) = inline_unique {
+                    operations.push(Operation {
+                        op_type: OperationType::AddConstraint,
+                        span,
+                        data: OperationData::Constraint(ConstraintOperation {
+                            model_name,
+                            constraint_type: ConstraintType::Unique,
+                            not_valid: false,
+                            requires_state_only: false,
+                        }),
+                        table_identity,
+                        in_autocommit_block,
+                    });
+                }
             }
         }
     }
@@ -384,8 +408,7 @@ impl<'a> AerichMigrationExtractor<'a> {
                 Some(table),
             ));
         }
-        if contains_words_in_order(statement, &["ADD", "COLUMN"]) {
-            let column = identifier_after_keyword(statement, "COLUMN")?.name;
+        if let Some(column) = add_column_identifier(statement) {
             return Some(operation(
                 OperationType::AddField,
                 OperationData::Field(FieldOperation {
@@ -399,7 +422,7 @@ impl<'a> AerichMigrationExtractor<'a> {
                         db_constraint: true,
                         db_index: false,
                         db_index_disabled: false,
-                        is_unique: false,
+                        is_unique: contains_word(statement, "UNIQUE"),
                         is_nullable: !contains_words_in_order(statement, &["NOT", "NULL"]),
                         has_default: contains_word(statement, "DEFAULT"),
                         has_db_default: false,
@@ -493,6 +516,30 @@ fn contains_words_in_order(statement: &str, words: &[&str]) -> bool {
 
 fn contains_word(statement: &str, word: &str) -> bool {
     sql_words(statement).any(|actual| actual == word)
+}
+
+/// Return the column named by `ADD [COLUMN] [IF NOT EXISTS] <definition>`.
+/// Table constraints begin with reserved words and must remain constraints.
+fn add_column_identifier(statement: &str) -> Option<String> {
+    let upper = statement.to_ascii_uppercase();
+    let start = upper.match_indices("ADD").find_map(|(start, _)| {
+        let before = upper.as_bytes().get(start.wrapping_sub(1)).copied();
+        let end = start + "ADD".len();
+        let after = upper.as_bytes().get(end).copied();
+        (before.is_none_or(|byte| !is_identifier_byte(byte))
+            && after.is_none_or(|byte| !is_identifier_byte(byte)))
+        .then_some(end)
+    })?;
+    let mut definition = statement[start..].trim_start();
+    if let Some(rest) = strip_leading_word(definition, "COLUMN") {
+        definition = rest.trim_start();
+    }
+    let column = parse_identifier(definition)?.name;
+    (!matches!(
+        column.to_ascii_uppercase().as_str(),
+        "CONSTRAINT" | "UNIQUE" | "PRIMARY" | "FOREIGN" | "CHECK" | "EXCLUDE"
+    ))
+    .then_some(column)
 }
 
 /// Aerich migrations sometimes use `DO $$ ... $$` to make adding a constraint
@@ -666,6 +713,72 @@ async def upgrade(db):
                 OperationData::Constraint(constraint) if constraint.not_valid
             )
         }));
+    }
+
+    #[test]
+    fn maps_generated_add_columns_but_not_table_constraints() {
+        let migration = migration(
+            r#"
+async def upgrade(db):
+    return '''
+        ALTER TABLE jobs ADD "column" TEXT DEFAULT 'new';
+        ALTER TABLE jobs ADD IF NOT EXISTS owner_id UUID NOT NULL REFERENCES owners (id);
+        ALTER TABLE jobs ADD UNIQUE (owner_id);
+        ALTER TABLE jobs ADD CONSTRAINT jobs_owner_check CHECK (owner_id IS NOT NULL);
+    '''
+"#,
+        );
+        assert_eq!(
+            migration
+                .operations
+                .iter()
+                .map(|operation| operation.op_type)
+                .collect::<Vec<_>>(),
+            vec![
+                OperationType::AddField,
+                OperationType::AddField,
+                OperationType::ExecuteSql,
+                OperationType::AddConstraint,
+            ]
+        );
+        let fields = migration
+            .operations
+            .iter()
+            .filter_map(|operation| match &operation.data {
+                OperationData::Field(field) => field.field.as_ref(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(fields[0].has_default && fields[0].is_nullable);
+        assert!(fields[1].is_relation && !fields[1].is_nullable);
+    }
+
+    #[test]
+    fn inline_unique_column_is_checked_on_existing_tables_only() {
+        let existing = migration(
+            r#"
+async def upgrade(db):
+    return 'ALTER TABLE "jobs" ADD "ref" VARCHAR(64) UNIQUE;'
+"#,
+        );
+        assert_eq!(
+            RuleRegistry::new()
+                .check(&existing, &Config::default())
+                .iter()
+                .map(|diagnostic| diagnostic.rule_id)
+                .collect::<Vec<_>>(),
+            vec!["R002"]
+        );
+
+        let fresh = migration(
+            r#"
+async def upgrade(db):
+    return 'CREATE TABLE "jobs" (id INT); ALTER TABLE "jobs" ADD "ref" VARCHAR(64) UNIQUE;'
+"#,
+        );
+        assert!(RuleRegistry::new()
+            .check(&fresh, &Config::default())
+            .is_empty());
     }
 
     #[test]
