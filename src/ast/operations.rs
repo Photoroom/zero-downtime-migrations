@@ -39,6 +39,9 @@ impl Operation {
             OperationData::Index(op) => Some(&op.model_name),
             OperationData::Field(op) => Some(&op.model_name),
             OperationData::Constraint(op) => Some(&op.model_name),
+            OperationData::AlterUniqueTogether(op) => Some(&op.model_name),
+            OperationData::AlterIndexTogether(op) => Some(&op.model_name),
+            OperationData::Model(op) => Some(&op.name),
             _ => None,
         }
     }
@@ -150,6 +153,10 @@ pub enum OperationData {
     Field(FieldOperation),
     /// Constraint operation data.
     Constraint(ConstraintOperation),
+    /// AlterUniqueTogether operation data.
+    AlterUniqueTogether(AlterUniqueTogetherOperation),
+    /// AlterIndexTogether operation data.
+    AlterIndexTogether(AlterIndexTogetherOperation),
     /// RunSQL operation data.
     RunSQL(RunSQLOperation),
     /// RunPython operation data.
@@ -230,6 +237,26 @@ pub struct ConstraintOperation {
     pub constraint_type: ConstraintType,
     /// Whether Alembic creates this constraint as `NOT VALID`.
     pub not_valid: bool,
+}
+
+/// Data for `AlterUniqueTogether` operations.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct AlterUniqueTogetherOperation {
+    /// The model name.
+    pub model_name: String,
+    /// Whether the operation adds a non-empty unique-together definition.
+    pub adds_unique_together: bool,
+}
+
+/// Data for `AlterIndexTogether` operations.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct AlterIndexTogetherOperation {
+    /// The model name.
+    pub model_name: String,
+    /// Whether the operation adds a non-empty index-together definition.
+    pub adds_index_together: bool,
 }
 
 /// Type of database constraint added via `migrations.AddConstraint`.

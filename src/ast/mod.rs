@@ -14,9 +14,10 @@ pub(crate) use operations::{
     sql_statement_contains_drop_index, sql_statement_contains_reindex, strip_sql_noise,
 };
 pub use operations::{
-    ConstraintOperation, ConstraintType, FieldInfo, FieldOperation, IndexOperation, ModelOperation,
-    Operation, OperationData, OperationType, RunPythonOperation, RunSQLOperation,
-    SeparateDatabaseAndStateOperation, TableIdentity,
+    AlterIndexTogetherOperation, AlterUniqueTogetherOperation, ConstraintOperation, ConstraintType,
+    FieldInfo, FieldOperation, IndexOperation, ModelOperation, Operation, OperationData,
+    OperationType, RunPythonOperation, RunSQLOperation, SeparateDatabaseAndStateOperation,
+    TableIdentity,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

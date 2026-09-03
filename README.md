@@ -146,6 +146,7 @@ test suite — every field above is guaranteed on every diagnostic.
 | R015 | alter-field-not-null | Warning | `AlterField` that sets NOT NULL may scan rows, and type changes may rewrite the table |
 | R016 | non-concurrent-remove-index | Error | Use `RemoveIndexConcurrently` instead of `RemoveIndex` |
 | R017 | non-concurrent-add-constraint | Error | CHECK constraint validates all rows; EXCLUDE constraint builds an index non-concurrently |
+| R018 | implicit-django-index | Error | `AddField` and non-empty `AlterUniqueTogether`/`AlterIndexTogether` build indexes non-concurrently; `AlterField` warns |
 
 For Alembic revisions, zdm evaluates R001, R003-R005, R011, R015-R017 against direct `op.*` calls in `upgrade()`. For Aerich revisions, zdm evaluates R001-R002, R005-R006, R010-R011, and R015-R017 against supported literal PostgreSQL DDL reachable from `upgrade()`. In diff modes, changeset rule R008 also applies. The Django API references in this table apply only to Django; Alembic and Aerich diagnostics name their equivalent operations.
 

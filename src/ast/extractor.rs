@@ -6,9 +6,10 @@ use std::path::Path;
 use tree_sitter::Node;
 
 use super::{
-    ConstraintOperation, ConstraintType, FieldInfo, FieldOperation, Import, IndexOperation,
-    Migration, ModelOperation, Operation, OperationData, OperationType, RunPythonOperation,
-    RunSQLOperation, SeparateDatabaseAndStateOperation,
+    AlterIndexTogetherOperation, AlterUniqueTogetherOperation, ConstraintOperation, ConstraintType,
+    FieldInfo, FieldOperation, Import, IndexOperation, Migration, ModelOperation, Operation,
+    OperationData, OperationType, RunPythonOperation, RunSQLOperation,
+    SeparateDatabaseAndStateOperation,
 };
 use crate::diagnostics::Span;
 use crate::error::Result;
@@ -300,6 +301,12 @@ impl<'a> MigrationExtractor<'a> {
             OperationType::AddConstraint | OperationType::RemoveConstraint => {
                 OperationData::Constraint(self.extract_constraint_operation(args))
             }
+            OperationType::AlterUniqueTogether => OperationData::AlterUniqueTogether(
+                self.extract_alter_unique_together_operation(args),
+            ),
+            OperationType::AlterIndexTogether => {
+                OperationData::AlterIndexTogether(self.extract_alter_index_together_operation(args))
+            }
             OperationType::RunSQL => OperationData::RunSQL(self.extract_run_sql_operation(args)),
             OperationType::RunPython => {
                 OperationData::RunPython(self.extract_run_python_operation(args))
@@ -386,7 +393,9 @@ impl<'a> MigrationExtractor<'a> {
             is_relation: is_relation_field(value, self),
             is_foreign_key: is_foreign_key_field(value, self),
             db_constraint: !field_kwarg_equals(self, value, "db_constraint", "False"),
-            db_index: field_kwarg_equals(self, value, "db_index", "True"),
+            db_index: field_kwarg_equals(self, value, "db_index", "True")
+                || (field_type(value, self) == Some("SlugField")
+                    && !field_kwarg_equals(self, value, "db_index", "False")),
             db_index_disabled: field_kwarg_equals(self, value, "db_index", "False"),
             is_unique: field_kwarg_equals(self, value, "unique", "True")
                 || field_kwarg_equals(self, value, "primary_key", "True"),
@@ -410,6 +419,36 @@ impl<'a> MigrationExtractor<'a> {
             model_name: model_name.unwrap_or_default(),
             constraint_type,
             not_valid: false,
+        }
+    }
+
+    fn extract_alter_unique_together_operation(&self, args: Node) -> AlterUniqueTogetherOperation {
+        let value = self
+            .get_keyword_arg_value(args, "unique_together")
+            .or_else(|| self.get_nth_positional_value(args, 1));
+        let adds_unique_together = value.is_some_and(|value| {
+            !matches!(self.node_text(value).trim(), "None" | "[]" | "()" | "set()")
+        });
+        AlterUniqueTogetherOperation {
+            model_name: self
+                .get_keyword_or_positional_string(args, "name", 0)
+                .unwrap_or_default(),
+            adds_unique_together,
+        }
+    }
+
+    fn extract_alter_index_together_operation(&self, args: Node) -> AlterIndexTogetherOperation {
+        let value = self
+            .get_keyword_arg_value(args, "index_together")
+            .or_else(|| self.get_nth_positional_value(args, 1));
+        let adds_index_together = value.is_some_and(|value| {
+            !matches!(self.node_text(value).trim(), "None" | "[]" | "()" | "set()")
+        });
+        AlterIndexTogetherOperation {
+            model_name: self
+                .get_keyword_or_positional_string(args, "name", 0)
+                .unwrap_or_default(),
+            adds_index_together,
         }
     }
 
