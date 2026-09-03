@@ -56,24 +56,38 @@ impl Rule for R002UniqueConstraintWithoutIndex {
                     self.id(),
                     self.name(),
                     self.severity(),
-                    if migration.framework == crate::discovery::MigrationFramework::Aerich {
-                        "Aerich UNIQUE constraint builds its index while locking the table"
-                    } else {
-                        if data.requires_state_only {
-                            "AddConstraint with this UniqueConstraint locks the table while it builds the index"
-                        } else {
+                    match migration.framework {
+                        crate::discovery::MigrationFramework::Alembic => {
+                            "Alembic create_unique_constraint locks the table while it builds the index"
+                        }
+                        crate::discovery::MigrationFramework::Aerich => {
+                            "Aerich UNIQUE constraint builds its index while locking the table"
+                        }
+                        crate::discovery::MigrationFramework::Django => {
+                            if data.requires_state_only {
+                                "AddConstraint with this UniqueConstraint locks the table while it builds the index"
+                            } else {
                             "AddConstraint with UniqueConstraint locks the table while it builds the index"
+                            }
                         }
                     },
                     ctx.path.to_path_buf(),
                     op.span,
                 )
-                .with_help(if migration.framework == crate::discovery::MigrationFramework::Aerich {
-                    "Create a UNIQUE INDEX CONCURRENTLY, then attach it with ALTER TABLE ... ADD CONSTRAINT ... UNIQUE USING INDEX in a later Aerich migration."
-                } else if data.requires_state_only {
-                    include_str!("help/r002_unique_constraint_state_only.txt")
-                } else {
-                    include_str!("help/r002_unique_constraint.txt")
+                .with_help(match migration.framework {
+                    crate::discovery::MigrationFramework::Alembic => {
+                        "Create a UNIQUE INDEX CONCURRENTLY inside an autocommit block, then attach it with ALTER TABLE ... ADD CONSTRAINT ... UNIQUE USING INDEX."
+                    }
+                    crate::discovery::MigrationFramework::Aerich => {
+                        "Create a UNIQUE INDEX CONCURRENTLY, then attach it with ALTER TABLE ... ADD CONSTRAINT ... UNIQUE USING INDEX in a later Aerich migration."
+                    }
+                    crate::discovery::MigrationFramework::Django => {
+                        if data.requires_state_only {
+                            include_str!("help/r002_unique_constraint_state_only.txt")
+                        } else {
+                            include_str!("help/r002_unique_constraint.txt")
+                        }
+                    }
                 }),
             );
         });

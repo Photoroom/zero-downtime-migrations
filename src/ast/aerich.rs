@@ -30,17 +30,83 @@ impl<'a> AerichMigrationExtractor<'a> {
         let mut operations = Vec::new();
         let functions = self.local_functions();
         let mut visited = BTreeSet::new();
-        self.extract_reachable_function("upgrade", &functions, &mut visited, true, &mut operations);
+        self.extract_reachable_function(
+            "upgrade",
+            &functions,
+            &mut visited,
+            true,
+            (is_generated_initial(path), self.is_generated_migration()),
+            &mut operations,
+        );
 
         Ok(Migration {
             path: path.to_path_buf(),
             framework: MigrationFramework::Aerich,
-            is_non_atomic: false,
+            is_non_atomic: self.is_non_transactional_generated_migration(),
             operations,
             imports: vec![],
             class_span: None,
             line_ignores: self.extract_line_ignores(),
         })
+    }
+
+    /// Aerich's generated migrations use a module-level setting to opt out of
+    /// the transaction wrapper.  Keep this deliberately narrow: custom files
+    /// have no static transaction contract we can safely infer.
+    fn is_non_transactional_generated_migration(&self) -> bool {
+        self.is_generated_migration() && self.final_run_in_transaction_is_false()
+    }
+
+    fn is_generated_migration(&self) -> bool {
+        let root = self.parsed.root_node();
+        let mut has_models_state = false;
+        for statement in root.named_children(&mut root.walk()) {
+            let Some(assignment) = statement
+                .kind()
+                .eq("expression_statement")
+                .then(|| statement.named_child(0))
+                .flatten()
+                .filter(|node| node.kind() == "assignment")
+            else {
+                continue;
+            };
+            let (Some(left), Some(_right)) = (
+                assignment.child_by_field_name("left"),
+                assignment.child_by_field_name("right"),
+            ) else {
+                continue;
+            };
+            if self.node_text(left) == "MODELS_STATE" {
+                has_models_state = true;
+            }
+        }
+        has_models_state
+    }
+
+    fn final_run_in_transaction_is_false(&self) -> bool {
+        let root = self.parsed.root_node();
+        let mut run_in_transaction = None;
+        for statement in root.named_children(&mut root.walk()) {
+            let Some(assignment) = statement
+                .kind()
+                .eq("expression_statement")
+                .then(|| statement.named_child(0))
+                .flatten()
+                .filter(|node| node.kind() == "assignment")
+            else {
+                continue;
+            };
+            let (Some(left), Some(right)) = (
+                assignment.child_by_field_name("left"),
+                assignment.child_by_field_name("right"),
+            ) else {
+                continue;
+            };
+            if self.node_text(left) == "RUN_IN_TRANSACTION" {
+                run_in_transaction = Some(self.node_text(right).trim() == "False");
+            }
+        }
+        run_in_transaction == Some(true)
     }
 
     fn local_functions(&self) -> BTreeMap<String, Node<'a>> {
@@ -62,6 +128,7 @@ impl<'a> AerichMigrationExtractor<'a> {
         functions: &BTreeMap<String, Node<'a>>,
         visited: &mut BTreeSet<String>,
         is_unconditional: bool,
+        generated: (bool, bool),
         operations: &mut Vec<Operation>,
     ) {
         let Some(function) = functions.get(name) else {
@@ -71,7 +138,14 @@ impl<'a> AerichMigrationExtractor<'a> {
             return;
         }
         if let Some(body) = function.child_by_field_name("body") {
-            self.extract_reachable_sql(body, functions, visited, is_unconditional, operations);
+            self.extract_reachable_sql(
+                body,
+                functions,
+                visited,
+                is_unconditional,
+                generated,
+                operations,
+            );
         }
     }
 
@@ -81,6 +155,7 @@ impl<'a> AerichMigrationExtractor<'a> {
         functions: &BTreeMap<String, Node<'a>>,
         visited: &mut BTreeSet<String>,
         is_unconditional: bool,
+        generated: (bool, bool),
         operations: &mut Vec<Operation>,
     ) {
         if matches!(
@@ -96,12 +171,19 @@ impl<'a> AerichMigrationExtractor<'a> {
             {
                 let sql = MigrationExtractor::new(self.parsed).extract_string_value(value);
                 let span = Span::from_node(&value);
-                self.extract_sql(&sql, span, is_unconditional, operations);
+                self.extract_sql(&sql, span, is_unconditional, generated, operations);
             }
             return;
         }
         if node.kind() == "call" {
-            self.extract_call_sql(node, functions, visited, is_unconditional, operations);
+            self.extract_call_sql(
+                node,
+                functions,
+                visited,
+                is_unconditional,
+                generated,
+                operations,
+            );
         }
         let is_unconditional = is_unconditional
             && !matches!(
@@ -113,7 +195,14 @@ impl<'a> AerichMigrationExtractor<'a> {
                     | "match_statement"
             );
         for child in node.named_children(&mut node.walk()) {
-            self.extract_reachable_sql(child, functions, visited, is_unconditional, operations);
+            self.extract_reachable_sql(
+                child,
+                functions,
+                visited,
+                is_unconditional,
+                generated,
+                operations,
+            );
         }
     }
 
@@ -123,6 +212,7 @@ impl<'a> AerichMigrationExtractor<'a> {
         functions: &BTreeMap<String, Node<'a>>,
         visited: &mut BTreeSet<String>,
         is_unconditional: bool,
+        generated: (bool, bool),
         operations: &mut Vec<Operation>,
     ) {
         let Some(function) = call.child_by_field_name("function") else {
@@ -137,7 +227,13 @@ impl<'a> AerichMigrationExtractor<'a> {
                 .filter(|value| matches!(value.kind(), "string" | "concatenated_string"))
             {
                 let sql = MigrationExtractor::new(self.parsed).extract_string_value(value);
-                self.extract_sql(&sql, Span::from_node(&value), is_unconditional, operations);
+                self.extract_sql(
+                    &sql,
+                    Span::from_node(&value),
+                    is_unconditional,
+                    generated,
+                    operations,
+                );
             }
         }
 
@@ -147,6 +243,7 @@ impl<'a> AerichMigrationExtractor<'a> {
                 functions,
                 visited,
                 is_unconditional,
+                generated,
                 operations,
             );
         }
@@ -158,6 +255,7 @@ impl<'a> AerichMigrationExtractor<'a> {
                         functions,
                         visited,
                         is_unconditional,
+                        generated,
                         operations,
                     );
                 }
@@ -170,19 +268,55 @@ impl<'a> AerichMigrationExtractor<'a> {
         sql: &str,
         span: Span,
         create_table_is_unconditional: bool,
+        generated: (bool, bool),
         operations: &mut Vec<Operation>,
     ) {
-        for statement in strip_sql_noise(sql).split(';') {
+        let cleaned = strip_sql_noise(sql);
+        let statements: Vec<_> = cleaned
+            .split(';')
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+            .collect();
+        let multi_statement_script = statements.len() > 1;
+        for statement in statements {
             let statement = statement.trim();
             let statement = if starts_with_words(statement, &["DO"]) {
                 alter_table_in_do_block(statement).unwrap_or(statement)
             } else {
                 statement
             };
-            if let Some(operation) =
-                self.extract_statement(statement, span, create_table_is_unconditional)
-            {
+            if let Some(operation) = self.extract_statement(
+                statement,
+                span,
+                create_table_is_unconditional,
+                generated,
+                multi_statement_script,
+            ) {
+                let inline_unique = match &operation.data {
+                    OperationData::Field(field) => field
+                        .field
+                        .as_ref()
+                        .is_some_and(|field| field.is_unique)
+                        .then(|| field.model_name.clone()),
+                    _ => None,
+                };
+                let table_identity = operation.table_identity.clone();
+                let in_autocommit_block = operation.in_autocommit_block;
                 operations.push(operation);
+                if let Some(model_name) = inline_unique {
+                    operations.push(Operation {
+                        op_type: OperationType::AddConstraint,
+                        span,
+                        data: OperationData::Constraint(ConstraintOperation {
+                            model_name,
+                            constraint_type: ConstraintType::Unique,
+                            not_valid: false,
+                            requires_state_only: false,
+                        }),
+                        table_identity,
+                        in_autocommit_block,
+                    });
+                }
             }
         }
     }
@@ -192,6 +326,8 @@ impl<'a> AerichMigrationExtractor<'a> {
         statement: &str,
         span: Span,
         create_table_is_unconditional: bool,
+        generated: (bool, bool),
+        multi_statement_script: bool,
     ) -> Option<Operation> {
         let statement = statement.trim();
         if statement.is_empty() {
@@ -202,7 +338,7 @@ impl<'a> AerichMigrationExtractor<'a> {
             span,
             data,
             table_identity,
-            in_autocommit_block: false,
+            in_autocommit_block: multi_statement_script,
         };
 
         if sql_statement_contains_create_index(statement) {
@@ -236,7 +372,8 @@ impl<'a> AerichMigrationExtractor<'a> {
         if starts_with_words(statement, &["CREATE", "TABLE"]) {
             let table = identifier_after_keyword(statement, "TABLE")?;
             let certain = create_table_is_unconditional
-                && !contains_words_in_order(statement, &["IF", "NOT", "EXISTS"]);
+                && ((generated.0 || generated.1)
+                    || !contains_words_in_order(statement, &["IF", "NOT", "EXISTS"]));
             return Some(operation(
                 OperationType::CreateModel,
                 OperationData::Model(ModelOperation {
@@ -245,6 +382,23 @@ impl<'a> AerichMigrationExtractor<'a> {
                 }),
                 certain.then_some(table),
             ));
+        }
+        if starts_with_words(statement, &["DROP", "TABLE"]) {
+            let table = identifier_after_keyword(statement, "TABLE")?;
+            return Some(operation(
+                OperationType::DeleteModel,
+                OperationData::Model(ModelOperation {
+                    name: table.name.clone(),
+                    old_name: None,
+                }),
+                Some(table),
+            ));
+        }
+        if generated.0
+            && (starts_with_words(statement, &["COMMENT", "ON", "TABLE"])
+                || starts_with_words(statement, &["COMMENT", "ON", "COLUMN"]))
+        {
+            return None;
         }
         if !starts_with_words(statement, &["ALTER", "TABLE"]) {
             return Some(operation(
@@ -257,6 +411,30 @@ impl<'a> AerichMigrationExtractor<'a> {
             ));
         }
         let table = identifier_after_keyword(statement, "TABLE")?;
+
+        let rename_is_constraint = contains_words_in_order(statement, &["RENAME", "CONSTRAINT"]);
+        let rename_is_column = !rename_is_constraint
+            && (contains_words_in_order(statement, &["RENAME", "COLUMN"])
+                || identifier_after_keyword(statement, "RENAME")
+                    .is_some_and(|name| !name.name.eq_ignore_ascii_case("TO")));
+        if contains_words_in_order(statement, &["RENAME", "TO"])
+            && !rename_is_column
+            && !rename_is_constraint
+        {
+            let new_name = identifier_after_keyword(statement, "TO")?;
+            let new_table = TableIdentity {
+                schema: table.schema.clone(),
+                name: new_name.name.clone(),
+            };
+            return Some(operation(
+                OperationType::RenameModel,
+                OperationData::Model(ModelOperation {
+                    name: new_name.name,
+                    old_name: Some(table.name),
+                }),
+                Some(new_table),
+            ));
+        }
 
         if contains_words_in_order(statement, &["DROP", "COLUMN"]) {
             let column = identifier_after_keyword(statement, "COLUMN")?.name;
@@ -272,8 +450,10 @@ impl<'a> AerichMigrationExtractor<'a> {
                 Some(table),
             ));
         }
-        if contains_words_in_order(statement, &["RENAME", "COLUMN"]) {
-            let old_name = identifier_after_keyword(statement, "COLUMN")?.name;
+        if rename_is_column {
+            let old_name = identifier_after_keyword(statement, "COLUMN")
+                .or_else(|| identifier_after_keyword(statement, "RENAME"))?
+                .name;
             let new_name = identifier_after_keyword(statement, "TO")?.name;
             return Some(operation(
                 OperationType::RenameField,
@@ -339,8 +519,7 @@ impl<'a> AerichMigrationExtractor<'a> {
                 Some(table),
             ));
         }
-        if contains_words_in_order(statement, &["ADD", "COLUMN"]) {
-            let column = identifier_after_keyword(statement, "COLUMN")?.name;
+        if let Some(column) = add_column_identifier(statement) {
             return Some(operation(
                 OperationType::AddField,
                 OperationData::Field(FieldOperation {
@@ -354,7 +533,7 @@ impl<'a> AerichMigrationExtractor<'a> {
                         db_constraint: true,
                         db_index: false,
                         db_index_disabled: false,
-                        is_unique: false,
+                        is_unique: contains_word(statement, "UNIQUE"),
                         is_nullable: !contains_words_in_order(statement, &["NOT", "NULL"]),
                         has_default: contains_word(statement, "DEFAULT"),
                         has_db_default: false,
@@ -422,6 +601,16 @@ impl<'a> AerichMigrationExtractor<'a> {
     }
 }
 
+fn is_generated_initial(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("0_"))
+        .is_some_and(|name| {
+            name.strip_suffix(".py")
+                .is_some_and(|name| name.ends_with("_init"))
+        })
+}
+
 fn starts_with_words(statement: &str, words: &[&str]) -> bool {
     let mut actual = sql_words(statement);
     words
@@ -448,6 +637,30 @@ fn contains_words_in_order(statement: &str, words: &[&str]) -> bool {
 
 fn contains_word(statement: &str, word: &str) -> bool {
     sql_words(statement).any(|actual| actual == word)
+}
+
+/// Return the column named by `ADD [COLUMN] [IF NOT EXISTS] <definition>`.
+/// Table constraints begin with reserved words and must remain constraints.
+fn add_column_identifier(statement: &str) -> Option<String> {
+    let upper = statement.to_ascii_uppercase();
+    let start = upper.match_indices("ADD").find_map(|(start, _)| {
+        let before = upper.as_bytes().get(start.wrapping_sub(1)).copied();
+        let end = start + "ADD".len();
+        let after = upper.as_bytes().get(end).copied();
+        (before.is_none_or(|byte| !is_identifier_byte(byte))
+            && after.is_none_or(|byte| !is_identifier_byte(byte)))
+        .then_some(end)
+    })?;
+    let mut definition = statement[start..].trim_start();
+    if let Some(rest) = strip_leading_word(definition, "COLUMN") {
+        definition = rest.trim_start();
+    }
+    let column = parse_identifier(definition)?.name;
+    (!matches!(
+        column.to_ascii_uppercase().as_str(),
+        "CONSTRAINT" | "UNIQUE" | "PRIMARY" | "FOREIGN" | "CHECK" | "EXCLUDE"
+    ))
+    .then_some(column)
 }
 
 /// Aerich migrations sometimes use `DO $$ ... $$` to make adding a constraint
@@ -624,6 +837,72 @@ async def upgrade(db):
     }
 
     #[test]
+    fn maps_generated_add_columns_but_not_table_constraints() {
+        let migration = migration(
+            r#"
+async def upgrade(db):
+    return '''
+        ALTER TABLE jobs ADD "column" TEXT DEFAULT 'new';
+        ALTER TABLE jobs ADD IF NOT EXISTS owner_id UUID NOT NULL REFERENCES owners (id);
+        ALTER TABLE jobs ADD UNIQUE (owner_id);
+        ALTER TABLE jobs ADD CONSTRAINT jobs_owner_check CHECK (owner_id IS NOT NULL);
+    '''
+"#,
+        );
+        assert_eq!(
+            migration
+                .operations
+                .iter()
+                .map(|operation| operation.op_type)
+                .collect::<Vec<_>>(),
+            vec![
+                OperationType::AddField,
+                OperationType::AddField,
+                OperationType::ExecuteSql,
+                OperationType::AddConstraint,
+            ]
+        );
+        let fields = migration
+            .operations
+            .iter()
+            .filter_map(|operation| match &operation.data {
+                OperationData::Field(field) => field.field.as_ref(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(fields[0].has_default && fields[0].is_nullable);
+        assert!(fields[1].is_relation && !fields[1].is_nullable);
+    }
+
+    #[test]
+    fn inline_unique_column_is_checked_on_existing_tables_only() {
+        let existing = migration(
+            r#"
+async def upgrade(db):
+    return 'ALTER TABLE "jobs" ADD "ref" VARCHAR(64) UNIQUE;'
+"#,
+        );
+        assert_eq!(
+            RuleRegistry::new()
+                .check(&existing, &Config::default())
+                .iter()
+                .map(|diagnostic| diagnostic.rule_id)
+                .collect::<Vec<_>>(),
+            vec!["R002"]
+        );
+
+        let fresh = migration(
+            r#"
+async def upgrade(db):
+    return 'CREATE TABLE "jobs" (id INT); ALTER TABLE "jobs" ADD "ref" VARCHAR(64) UNIQUE;'
+"#,
+        );
+        assert!(RuleRegistry::new()
+            .check(&fresh, &Config::default())
+            .is_empty());
+    }
+
+    #[test]
     fn create_table_if_not_exists_does_not_exempt_later_index() {
         let migration = migration(
             r#"
@@ -638,7 +917,65 @@ async def upgrade(db):
     }
 
     #[test]
-    fn concurrent_aerich_index_does_not_get_django_transaction_advice() {
+    fn generated_initial_table_with_comments_is_fresh() {
+        let source = r#"
+async def upgrade(db):
+    return 'CREATE TABLE IF NOT EXISTS jobs (id INT); COMMENT ON TABLE jobs IS \'jobs\'; COMMENT ON COLUMN jobs.id IS \'id\'; CREATE INDEX jobs_id_idx ON jobs (id);'
+"#;
+        let initial =
+            Migration::from_source(Path::new("migrations/models/0_20260903_init.py"), source)
+                .unwrap();
+        assert!(RuleRegistry::new()
+            .check(&initial, &Config::default())
+            .is_empty());
+        let non_initial =
+            Migration::from_source(Path::new("migrations/models/1_20260903_init.py"), source)
+                .unwrap();
+        assert!(RuleRegistry::new()
+            .check(&non_initial, &Config::default())
+            .iter()
+            .any(|diagnostic| diagnostic.rule_id == "R001"));
+    }
+
+    #[test]
+    fn generated_later_table_is_fresh_but_handwritten_if_not_exists_is_not() {
+        let sql = "async def upgrade(db):\n    return 'CREATE TABLE IF NOT EXISTS jobs (id INT); CREATE INDEX IF NOT EXISTS jobs_id_idx ON jobs (id);'\n";
+        let generated = Migration::from_source(
+            Path::new("migrations/models/2_20260903_jobs.py"),
+            &format!("MODELS_STATE = {{}}\n{sql}"),
+        )
+        .unwrap();
+        assert!(RuleRegistry::new()
+            .check(&generated, &Config::default())
+            .is_empty());
+        let handwritten =
+            Migration::from_source(Path::new("migrations/models/2_20260903_jobs.py"), sql).unwrap();
+        assert!(RuleRegistry::new()
+            .check(&handwritten, &Config::default())
+            .iter()
+            .any(|diagnostic| diagnostic.rule_id == "R001"));
+    }
+
+    #[test]
+    fn table_renames_and_drops_reuse_r019_with_freshness() {
+        let migration = migration(
+            r#"
+async def upgrade(db):
+    return 'DROP TABLE IF EXISTS old_jobs; ALTER TABLE jobs RENAME TO archived_jobs; ALTER TABLE jobs RENAME COLUMN old TO new; ALTER TABLE jobs RENAME "older" TO "newer"; ALTER TABLE jobs RENAME CONSTRAINT old_check TO new_check; CREATE TABLE fresh (id INT); ALTER TABLE fresh RENAME TO newer; CREATE INDEX newer_id_idx ON newer (id);'
+"#,
+        );
+        assert_eq!(
+            RuleRegistry::new()
+                .check(&migration, &Config::default())
+                .iter()
+                .map(|diagnostic| diagnostic.rule_id)
+                .collect::<Vec<_>>(),
+            vec!["R011", "R011", "R019", "R019"]
+        );
+    }
+
+    #[test]
+    fn concurrent_aerich_index_requires_generated_transaction_setting() {
         let migration = migration(
             r#"
 async def upgrade(db):
@@ -646,7 +983,13 @@ async def upgrade(db):
 "#,
         );
         let diagnostics = RuleRegistry::new().check(&migration, &Config::default());
-        assert!(diagnostics.is_empty(), "got: {diagnostics:?}");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.rule_id)
+                .collect::<Vec<_>>(),
+            vec!["R004"]
+        );
     }
 
     #[test]
