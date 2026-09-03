@@ -120,11 +120,70 @@ impl<'a> AlembicMigrationExtractor<'a> {
                 value.kind() == "call"
                     && value
                         .child_by_field_name("function")
-                        .is_some_and(|function| {
-                            self.node_text(function) == "op.get_context().autocommit_block"
+                        .is_some_and(|function| match self.node_text(function) {
+                            "op.get_context().autocommit_block" => true,
+                            name => name
+                                .strip_suffix(".autocommit_block")
+                                .is_some_and(|name| self.context_is_bound_before(node, name)),
                         })
             })
         })
+    }
+
+    fn context_is_bound_before(&self, node: Node<'a>, name: &str) -> bool {
+        let Some(body) = self
+            .find_upgrade()
+            .and_then(|upgrade| upgrade.child_by_field_name("body"))
+        else {
+            return false;
+        };
+        let mut bindings = BTreeMap::new();
+        for statement in body.children(&mut body.walk()) {
+            if statement.start_byte() >= node.start_byte() {
+                break;
+            }
+            self.collect_context_bindings(statement, true, &mut bindings);
+        }
+        bindings.get(name).copied().unwrap_or(false)
+    }
+
+    fn collect_context_bindings(
+        &self,
+        node: Node<'a>,
+        direct: bool,
+        bindings: &mut BTreeMap<String, bool>,
+    ) {
+        if matches!(node.kind(), "function_definition" | "lambda") {
+            return;
+        }
+        if node.kind() == "expression_statement" {
+            if let Some(assignment) = node.named_child(0) {
+                if assignment.kind() == "assignment"
+                    && assignment
+                        .child_by_field_name("left")
+                        .is_some_and(|left| left.kind() == "identifier")
+                {
+                    let name = self
+                        .node_text(assignment.child_by_field_name("left").unwrap())
+                        .to_string();
+                    bindings.insert(
+                        name,
+                        direct
+                            && assignment
+                                .child_by_field_name("right")
+                                .is_some_and(|right| {
+                                    right.kind() == "call"
+                                        && right.child_by_field_name("function").is_some_and(
+                                            |function| self.node_text(function) == "op.get_context",
+                                        )
+                                }),
+                    );
+                }
+            }
+        }
+        for child in node.named_children(&mut node.walk()) {
+            self.collect_context_bindings(child, false, bindings);
+        }
     }
 
     fn extract_operation(
@@ -265,40 +324,16 @@ impl<'a> AlembicMigrationExtractor<'a> {
                 .map(|(table, column)| {
                     let table_identity =
                         self.table_identity(args, table.clone(), "schema", Some(11));
-                    let mut operations = Vec::new();
-                    if self.keyword_is_false(args, "nullable")
+                    let sets_not_null = self.keyword_is_false(args, "nullable")
                         || self
                             .nth_value(args, 2)
-                            .is_some_and(|value| self.value_is_false(value))
-                    {
-                        operations.push(op(
-                            OperationType::AlterField,
-                            OperationData::Field(FieldOperation {
-                                model_name: table.clone(),
-                                field_name: column.clone(),
-                                old_name: None,
-                                new_name: None,
-                                field: Some(FieldInfo {
-                                    is_relation: false,
-                                    is_foreign_key: false,
-                                    db_constraint: true,
-                                    db_index: false,
-                                    db_index_disabled: false,
-                                    is_unique: false,
-                                    is_nullable: false,
-                                    has_default: false,
-                                    has_db_default: false,
-                                    is_type_change: false,
-                                }),
-                            }),
-                            table_identity.clone(),
-                        ));
-                    }
-                    if self
+                            .is_some_and(|value| self.value_is_false(value));
+                    let is_type_change = self
                         .keyword_value(args, "type_")
                         .or_else(|| self.nth_value(args, 6))
-                        .is_some_and(|value| self.node_text(value).trim() != "None")
-                    {
+                        .is_some_and(|value| self.node_text(value).trim() != "None");
+                    let mut operations = Vec::new();
+                    if sets_not_null || is_type_change {
                         operations.push(op(
                             OperationType::AlterField,
                             OperationData::Field(FieldOperation {
@@ -313,10 +348,10 @@ impl<'a> AlembicMigrationExtractor<'a> {
                                     db_index: false,
                                     db_index_disabled: false,
                                     is_unique: false,
-                                    is_nullable: true,
+                                    is_nullable: !sets_not_null,
                                     has_default: false,
                                     has_db_default: false,
-                                    is_type_change: true,
+                                    is_type_change,
                                 }),
                             }),
                             table_identity.clone(),
@@ -488,7 +523,10 @@ impl<'a> AlembicMigrationExtractor<'a> {
 
     fn column_field(&self, column: Node<'a>) -> Option<(String, FieldInfo)> {
         let function = column.child_by_field_name("function")?;
-        if !matches!(self.node_text(function), "Column" | "sa.Column") {
+        if !matches!(
+            self.node_text(function),
+            "Column" | "sa.Column" | "sqlalchemy.Column"
+        ) {
             return None;
         }
         let args = column.child_by_field_name("arguments")?;
@@ -820,6 +858,7 @@ def upgrade():
     const ADD_COLUMNS: &str = r#"
 from alembic import op
 import sqlalchemy as sa
+import sqlalchemy
 
 
 def upgrade():
@@ -831,6 +870,7 @@ def upgrade():
     op.add_column("new_jobs", sa.Column("required", sa.String(), nullable=False))
     op.add_column("jobs", sa.Column("id", sa.Integer(), primary_key=True))
     op.add_column("jobs", sa.Column("plain", sa.String(), nullable=True))
+    op.add_column("jobs", sqlalchemy.Column("qualified", sqlalchemy.String(), nullable=False))
 "#;
 
     const ADD_COLUMN_FLAGS: &str = r#"
@@ -883,8 +923,9 @@ def upgrade():
         "archive_jobs", "old_code", type_=sa.String(), new_column_name="new_code", schema="archive"
     )
     op.alter_column(
-        "archive_jobs", "legacy_code", None, None, None, None, sa.String(), None, None, None, None, "archive"
+        "archive_jobs", "legacy_code", type_=sa.String(), schema="archive"
     )
+    op.alter_column("jobs", "required_state", nullable=False, type_=sa.String())
 "#;
 
     const TABLE_RENAMES_AND_DROPS: &str = r#"
@@ -899,6 +940,42 @@ def upgrade():
     op.create_index("archived_events_idx", "archived_events", ["id"], schema="archive")
     op.drop_table("archived_events", schema="archive")
     op.drop_table("events", schema="archive")
+"#;
+
+    const BOUND_AUTOCOMMIT: &str = r#"
+from alembic import op
+
+
+def upgrade():
+    migration_context = op.get_context()
+    with migration_context.autocommit_block():
+        op.create_index("jobs_idx", "jobs", ["id"], postgresql_concurrently=True)
+"#;
+
+    const INVALID_BOUND_AUTOCOMMIT: &str = r#"
+from alembic import op
+
+
+def upgrade():
+    if enabled:
+        ctx = op.get_context()
+    with ctx.autocommit_block():
+        op.create_index("conditional_idx", "jobs", ["id"], postgresql_concurrently=True)
+
+    ctx = connection.get_context()
+    with ctx.autocommit_block():
+        op.create_index("non_context_idx", "jobs", ["id"], postgresql_concurrently=True)
+
+    ctx = op.get_context()
+    ctx = replacement
+    with ctx.autocommit_block():
+        op.create_index("rebound_idx", "jobs", ["id"], postgresql_concurrently=True)
+
+    ctx = op.get_context()
+    if enabled:
+        ctx = replacement
+    with ctx.autocommit_block():
+        op.create_index("conditional_rebound_idx", "jobs", ["id"], postgresql_concurrently=True)
 "#;
 
     fn migration(source: &str) -> Migration {
@@ -1198,6 +1275,7 @@ def upgrade():
                 OperationType::AddField,
                 OperationType::AddField,
                 OperationType::AddField,
+                OperationType::AddField,
             ],
         );
 
@@ -1207,8 +1285,13 @@ def upgrade():
                 .iter()
                 .map(|diagnostic| diagnostic.rule_id)
                 .collect::<Vec<_>>(),
-            vec!["R006", "R010", "R010", "R010", "R010"],
+            vec!["R006", "R010", "R010", "R010", "R010", "R010"],
         );
+        assert!(diagnostics[0].help.as_ref().is_some_and(|help| {
+            help.contains("add the foreign key as NOT VALID")
+                && !help.contains("Alembic")
+                && !help.contains("SeparateDatabaseAndState")
+        }));
     }
 
     #[test]
@@ -1265,15 +1348,7 @@ def upgrade():
                 .iter()
                 .map(|diagnostic| diagnostic.rule_id)
                 .collect::<Vec<_>>(),
-            vec!["R002", "R002", "R011", "R015", "R015", "R015"],
-        );
-        assert_eq!(
-            migration
-                .operations
-                .last()
-                .and_then(|op| op.table_identity.as_ref())
-                .map(|table| table.schema.as_deref()),
-            Some(Some("archive")),
+            vec!["R002", "R002", "R011", "R015", "R015", "R015", "R015"],
         );
         assert!(diagnostics[0]
             .help
@@ -1291,6 +1366,21 @@ def upgrade():
                 .map(|diagnostic| diagnostic.rule_id)
                 .collect::<Vec<_>>(),
             vec!["R019", "R019", "R019"],
+        );
+    }
+
+    #[test]
+    fn accepts_only_unconditionally_bound_alembic_contexts() {
+        assert!(RuleRegistry::new()
+            .check(&migration(BOUND_AUTOCOMMIT), &Config::default())
+            .is_empty());
+        assert_eq!(
+            RuleRegistry::new()
+                .check(&migration(INVALID_BOUND_AUTOCOMMIT), &Config::default())
+                .iter()
+                .map(|diagnostic| diagnostic.rule_id)
+                .collect::<Vec<_>>(),
+            vec!["R004", "R004", "R004", "R004"],
         );
     }
 }
