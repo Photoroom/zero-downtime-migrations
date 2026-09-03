@@ -20,7 +20,7 @@ impl Rule for R010AddFieldNotNull {
     }
 
     fn description(&self) -> &'static str {
-        "AddField with NOT NULL and no default requires rewriting all rows immediately. \
+        "AddField with NOT NULL and no Python or database default requires rewriting all rows immediately. \
          Add the field as nullable first, backfill data, then make it NOT NULL."
     }
 
@@ -41,7 +41,7 @@ impl Rule for R010AddFieldNotNull {
                 return;
             }
             let Some(field) = &data.field else { return };
-            if field.is_nullable || field.has_default {
+            if field.is_nullable || field.has_default || field.has_db_default {
                 return;
             }
 
@@ -57,7 +57,7 @@ impl Rule for R010AddFieldNotNull {
                         )
                     } else {
                         format!(
-                            "AddField '{}' is NOT NULL without a default value",
+                            "AddField '{}' is NOT NULL without a Python or database default",
                             data.field_name
                         )
                     },
@@ -68,7 +68,8 @@ impl Rule for R010AddFieldNotNull {
                     "Add the column as nullable, backfill it, then set NOT NULL in a later Aerich migration."
                 } else {
                     "Either: 1) Add the field as nullable with null=True, backfill, then \
-                     remove null=True in a separate migration, or 2) Provide a default value"
+                     remove null=True in a separate migration, or 2) Provide a default value. \
+                     A recognized db_default avoids this warning but is not a universal zero-downtime guarantee."
                 }),
             );
         });
@@ -162,6 +163,24 @@ class Migration(migrations.Migration):
         assert!(diagnostics.is_empty());
     }
 
+    const NOT_NULL_WITH_DB_DEFAULT_GOOD: &str = r#"
+from django.db import migrations, models
+
+class Migration(migrations.Migration):
+    operations = [
+        migrations.AddField(
+            model_name='product',
+            name='status',
+            field=models.CharField(max_length=50, db_default='active'),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_not_null_with_db_default_good() {
+        assert!(check_migration(NOT_NULL_WITH_DB_DEFAULT_GOOD).is_empty());
+    }
+
     const DEFAULT_NONE_BAD: &str = r#"
 from django.db import migrations, models
 
@@ -181,6 +200,25 @@ class Migration(migrations.Migration):
     fn test_default_none_does_not_count_as_default() {
         let diagnostics = check_migration(DEFAULT_NONE_BAD);
         assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].rule_id, "R010");
+    }
+
+    const DB_DEFAULT_NONE_BAD: &str = r#"
+from django.db import migrations, models
+
+class Migration(migrations.Migration):
+    operations = [
+        migrations.AddField(
+            model_name='product',
+            name='status',
+            field=models.CharField(max_length=50, db_default=None),
+        ),
+    ]
+"#;
+
+    #[test]
+    fn test_db_default_none_does_not_count_as_default() {
+        let diagnostics = check_migration(DB_DEFAULT_NONE_BAD);
         assert_eq!(diagnostics[0].rule_id, "R010");
     }
 

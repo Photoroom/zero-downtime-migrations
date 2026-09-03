@@ -6,9 +6,10 @@ use std::path::Path;
 use tree_sitter::Node;
 
 use super::{
-    ConstraintOperation, ConstraintType, FieldInfo, FieldOperation, Import, IndexOperation,
-    Migration, ModelOperation, Operation, OperationData, OperationType, RunPythonOperation,
-    RunSQLOperation, SeparateDatabaseAndStateOperation,
+    AlterIndexTogetherOperation, AlterUniqueTogetherOperation, ConstraintOperation, ConstraintType,
+    FieldInfo, FieldOperation, Import, IndexOperation, Migration, ModelOperation, Operation,
+    OperationData, OperationType, RunPythonOperation, RunSQLOperation,
+    SeparateDatabaseAndStateOperation,
 };
 use crate::diagnostics::Span;
 use crate::error::Result;
@@ -16,15 +17,22 @@ use crate::parser::ParsedMigration;
 
 /// Whether a field constructor creates a database relation.
 fn is_relation_field(value: Node<'_>, ex: &MigrationExtractor<'_>) -> bool {
-    let Some(function) = value.child_by_field_name("function") else {
-        return false;
-    };
+    matches!(field_type(value, ex), Some("ForeignKey" | "OneToOneField"))
+}
+
+fn is_foreign_key_field(value: Node<'_>, ex: &MigrationExtractor<'_>) -> bool {
+    field_type(value, ex) == Some("ForeignKey")
+}
+
+fn field_type<'a>(value: Node<'a>, ex: &'a MigrationExtractor<'a>) -> Option<&'a str> {
+    let function = value.child_by_field_name("function")?;
     let function_text = ex.node_text(function);
-    let field_name = function_text
-        .split('.')
-        .next_back()
-        .unwrap_or(function_text);
-    matches!(field_name, "ForeignKey" | "OneToOneField")
+    Some(
+        function_text
+            .split('.')
+            .next_back()
+            .unwrap_or(function_text),
+    )
 }
 
 /// `true` if the `models.<Type>(...)` call rooted at `value` has
@@ -281,7 +289,8 @@ impl<'a> MigrationExtractor<'a> {
             }
             OperationType::CreateModel
             | OperationType::DeleteModel
-            | OperationType::RenameModel => {
+            | OperationType::RenameModel
+            | OperationType::AlterModelTable => {
                 OperationData::Model(self.extract_model_operation(op_type, args))
             }
             OperationType::AddField
@@ -292,6 +301,12 @@ impl<'a> MigrationExtractor<'a> {
             }
             OperationType::AddConstraint | OperationType::RemoveConstraint => {
                 OperationData::Constraint(self.extract_constraint_operation(args))
+            }
+            OperationType::AlterUniqueTogether => OperationData::AlterUniqueTogether(
+                self.extract_alter_unique_together_operation(args),
+            ),
+            OperationType::AlterIndexTogether => {
+                OperationData::AlterIndexTogether(self.extract_alter_index_together_operation(args))
             }
             OperationType::RunSQL => OperationData::RunSQL(self.extract_run_sql_operation(args)),
             OperationType::RunPython => {
@@ -365,7 +380,7 @@ impl<'a> MigrationExtractor<'a> {
     /// The shape is `migrations.AddField(field=models.CharField(...))`
     /// (or `ForeignKey`, `IntegerField`, etc.). We find the
     /// `field=` kwarg, then descend the `models.<Type>(...)`
-    /// call to read its `null=` and `default=` kwargs from the
+    /// call to read its `null=`, `default=`, and `db_default=` kwargs from the
     /// AST directly — no raw-text scanning, no keyword-boundary
     /// gymnastics on a normalised byte buffer.
     fn extract_field_info(&self, args: Node) -> Option<FieldInfo> {
@@ -377,8 +392,17 @@ impl<'a> MigrationExtractor<'a> {
         }
         Some(FieldInfo {
             is_relation: is_relation_field(value, self),
+            is_foreign_key: is_foreign_key_field(value, self),
+            db_constraint: !field_kwarg_equals(self, value, "db_constraint", "False"),
+            db_index: field_kwarg_equals(self, value, "db_index", "True")
+                || (field_type(value, self) == Some("SlugField")
+                    && !field_kwarg_equals(self, value, "db_index", "False")),
+            db_index_disabled: field_kwarg_equals(self, value, "db_index", "False"),
+            is_unique: field_kwarg_equals(self, value, "unique", "True")
+                || field_kwarg_equals(self, value, "primary_key", "True"),
             is_nullable: field_kwarg_equals(self, value, "null", "True"),
             has_default: field_has_non_null_kwarg(self, value, "default"),
+            has_db_default: field_has_non_null_kwarg(self, value, "db_default"),
             is_type_change: false,
         })
     }
@@ -392,10 +416,70 @@ impl<'a> MigrationExtractor<'a> {
         let constraint_type = constraint_node
             .map(|node| self.extract_constraint_type_from_value(node))
             .unwrap_or(ConstraintType::Unknown);
+        let requires_state_only = constraint_node.is_some_and(|node| {
+            constraint_type == ConstraintType::Unique
+                && self.unique_constraint_requires_state_only(node)
+        });
         ConstraintOperation {
             model_name: model_name.unwrap_or_default(),
             constraint_type,
             not_valid: false,
+            requires_state_only,
+        }
+    }
+
+    fn unique_constraint_requires_state_only(&self, value: Node<'_>) -> bool {
+        let Some(args) = value.child_by_field_name("arguments") else {
+            return false;
+        };
+        let has_expression = args
+            .named_children(&mut args.walk())
+            .any(|child| !matches!(child.kind(), "keyword_argument" | "comment"));
+        let has_state_only_option = field_call_kwargs(value).any(|kw| {
+            let Some(name) = kw.child_by_field_name("name") else {
+                return false;
+            };
+            let Some(option) = kw.child_by_field_name("value") else {
+                return false;
+            };
+            let option = self.node_text(option).trim();
+            match self.node_text(name) {
+                "condition" => !matches!(option, "None" | "Q()" | "models.Q()"),
+                "include" | "opclasses" => !matches!(option, "None" | "[]" | "()" | "set()"),
+                "nulls_distinct" => false,
+                _ => false,
+            }
+        });
+        has_expression || has_state_only_option
+    }
+
+    fn extract_alter_unique_together_operation(&self, args: Node) -> AlterUniqueTogetherOperation {
+        let value = self
+            .get_keyword_arg_value(args, "unique_together")
+            .or_else(|| self.get_nth_positional_value(args, 1));
+        let adds_unique_together = value.is_some_and(|value| {
+            !matches!(self.node_text(value).trim(), "None" | "[]" | "()" | "set()")
+        });
+        AlterUniqueTogetherOperation {
+            model_name: self
+                .get_keyword_or_positional_string(args, "name", 0)
+                .unwrap_or_default(),
+            adds_unique_together,
+        }
+    }
+
+    fn extract_alter_index_together_operation(&self, args: Node) -> AlterIndexTogetherOperation {
+        let value = self
+            .get_keyword_arg_value(args, "index_together")
+            .or_else(|| self.get_nth_positional_value(args, 1));
+        let adds_index_together = value.is_some_and(|value| {
+            !matches!(self.node_text(value).trim(), "None" | "[]" | "()" | "set()")
+        });
+        AlterIndexTogetherOperation {
+            model_name: self
+                .get_keyword_or_positional_string(args, "name", 0)
+                .unwrap_or_default(),
+            adds_index_together,
         }
     }
 

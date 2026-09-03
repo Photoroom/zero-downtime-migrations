@@ -131,14 +131,14 @@ test suite — every field above is guaranteed on every diagnostic.
 | Rule | Name | Severity | Description |
 |------|------|----------|-------------|
 | R001 | non-concurrent-add-index | Error | Use `AddIndexConcurrently` instead of `AddIndex` |
-| R002 | unique-constraint-without-index | Error | Unique constraints should have a concurrent index |
+| R002 | unique-constraint-without-index | Error | Unique constraints need a concurrent index; partial/expression indexes use state-only metadata |
 | R003 | runsql-create-index | Error | Use `AddIndexConcurrently` instead of raw SQL `CREATE INDEX` |
 | R004 | missing-atomic-false | Error | Non-atomic migrations require `atomic = False` |
 | R005 | remove-field-without-separate | Error | Use `SeparateDatabaseAndState` to remove fields safely |
-| R006 | add-field-foreign-key | Error | Adding FK creates index and validates constraint (merged R007) |
+| R006 | add-field-foreign-key | Error | Adding FK creates index and validates constraint, except plain FKs that disable both |
 | R008 | disallowed-file-changes | Error | Don't change app code alongside migrations |
 | R009 | separate-db-state-same-pr | Error | Don't deploy both steps of `SeparateDatabaseAndState` together |
-| R010 | add-field-not-null | Error | Adding NOT NULL field without default rewrites table |
+| R010 | add-field-not-null | Error | Adding NOT NULL field without a Python or database default rewrites table |
 | R011 | rename-field | Error | Renaming fields can break running code |
 | R012 | irreversible-run-python | Warning | `RunPython` should have a reverse function |
 | R013 | irreversible-run-sql | Warning | `RunSQL` should have a reverse SQL |
@@ -146,12 +146,14 @@ test suite — every field above is guaranteed on every diagnostic.
 | R015 | alter-field-not-null | Warning | `AlterField` that sets NOT NULL may scan rows, and type changes may rewrite the table |
 | R016 | non-concurrent-remove-index | Error | Use `RemoveIndexConcurrently` instead of `RemoveIndex` |
 | R017 | non-concurrent-add-constraint | Error | CHECK constraint validates all rows; EXCLUDE constraint builds an index non-concurrently |
+| R018 | implicit-django-index | Error | `AddField` and non-empty `AlterUniqueTogether`/`AlterIndexTogether` build indexes non-concurrently; `AlterField` warns |
+| R019 | table-rename-or-drop | Error | Renaming or dropping an existing table breaks running application code |
 
 For Alembic revisions, zdm evaluates R001, R003-R005, R011, R015-R017 against direct `op.*` calls in `upgrade()`. For Aerich revisions, zdm evaluates R001-R002, R005-R006, R010-R011, and R015-R017 against supported literal PostgreSQL DDL reachable from `upgrade()`. In diff modes, changeset rule R008 also applies. The Django API references in this table apply only to Django; Alembic and Aerich diagnostics name their equivalent operations.
 
 ### CreateModel Exemption
 
-Several rules (R001, R002, R006, R010, R016, R017) automatically exempt operations that target models created in the same migration. This is because operations on newly created (empty) tables don't cause the locking issues these rules detect. The exemption is order-aware—a `CreateModel` that runs *after* the flagged op cannot retroactively exempt it—and follows `RenameModel` when the fresh table is renamed before a later operation.
+Several rules (R001, R002, R006, R010, R016-R019) automatically exempt operations that target models created in the same migration. This is because operations on newly created (empty) tables don't cause the locking issues these rules detect. The exemption is order-aware—a `CreateModel` that runs *after* the flagged op cannot retroactively exempt it—and follows `RenameModel` when the fresh table is renamed before a later operation.
 
 > **Note:** R007 (`fk-without-concurrent-index`) was merged into R006 and retired. R006 now takes the conservative stance that a prebuilt concurrent index does not make a one-step `AddField(ForeignKey)` safe on an existing table. Split the rollout instead of relying on an index exemption.
 

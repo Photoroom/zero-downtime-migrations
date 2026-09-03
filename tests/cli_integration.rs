@@ -1764,7 +1764,7 @@ mod list_rules {
     fn list_rules_includes_every_documented_rule() {
         let expected_ids = [
             "R001", "R002", "R003", "R004", "R005", "R006", "R008", "R009", "R010", "R011", "R012",
-            "R013", "R014", "R015", "R016", "R017",
+            "R013", "R014", "R015", "R016", "R017", "R018", "R019",
         ];
         let readme = fs::read_to_string("README.md").expect("README should be readable");
         let documented_ids: Vec<String> = readme

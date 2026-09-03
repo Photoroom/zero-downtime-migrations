@@ -233,8 +233,14 @@ impl<'a> AlembicMigrationExtractor<'a> {
                                 new_name: None,
                                 field: Some(FieldInfo {
                                     is_relation: false,
+                                    is_foreign_key: false,
+                                    db_constraint: true,
+                                    db_index: false,
+                                    db_index_disabled: false,
+                                    is_unique: false,
                                     is_nullable: false,
                                     has_default: false,
+                                    has_db_default: false,
                                     is_type_change: false,
                                 }),
                             }),
@@ -289,6 +295,7 @@ impl<'a> AlembicMigrationExtractor<'a> {
                                 model_name: table,
                                 constraint_type,
                                 not_valid: self.keyword_is_true(args, "postgresql_not_valid"),
+                                requires_state_only: false,
                             }),
                             table_identity,
                         )]

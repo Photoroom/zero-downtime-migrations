@@ -30,15 +30,18 @@ pub struct TableIdentity {
 
 impl Operation {
     /// The target model this operation acts on, when it has a single one
-    /// (index, field, and constraint operations). Returns `None` for
-    /// operations without a target model — `CreateModel`, `RunSQL`,
-    /// `RunPython`, and `SeparateDatabaseAndState`. Used by the
+    /// (index, field, constraint, and model operations). Returns `None` for
+    /// operations without a target model — `RunSQL`, `RunPython`, and
+    /// `SeparateDatabaseAndState`. Used by the
     /// created-in-this-migration exemption shared across several rules.
     pub fn model_name(&self) -> Option<&str> {
         match &self.data {
             OperationData::Index(op) => Some(&op.model_name),
             OperationData::Field(op) => Some(&op.model_name),
             OperationData::Constraint(op) => Some(&op.model_name),
+            OperationData::AlterUniqueTogether(op) => Some(&op.model_name),
+            OperationData::AlterIndexTogether(op) => Some(&op.model_name),
+            OperationData::Model(op) => Some(&op.name),
             _ => None,
         }
     }
@@ -150,6 +153,10 @@ pub enum OperationData {
     Field(FieldOperation),
     /// Constraint operation data.
     Constraint(ConstraintOperation),
+    /// AlterUniqueTogether operation data.
+    AlterUniqueTogether(AlterUniqueTogetherOperation),
+    /// AlterIndexTogether operation data.
+    AlterIndexTogether(AlterIndexTogetherOperation),
     /// RunSQL operation data.
     RunSQL(RunSQLOperation),
     /// RunPython operation data.
@@ -200,10 +207,22 @@ pub struct FieldOperation {
 pub struct FieldInfo {
     /// Whether the field is a `ForeignKey` or `OneToOneField`.
     pub is_relation: bool,
+    /// Whether the field is specifically a `ForeignKey`.
+    pub is_foreign_key: bool,
+    /// Whether Django will create the database constraint.
+    pub db_constraint: bool,
+    /// Whether Django explicitly creates a database index.
+    pub db_index: bool,
+    /// Whether Django explicitly disables the implicit relation index.
+    pub db_index_disabled: bool,
+    /// Whether the field is unique.
+    pub is_unique: bool,
     /// Whether the field is nullable.
     pub is_nullable: bool,
     /// Whether the field has a default value.
     pub has_default: bool,
+    /// Whether the field has a database default value.
+    pub has_db_default: bool,
     /// Whether the operation changes an existing column's type.
     pub is_type_change: bool,
 }
@@ -218,6 +237,28 @@ pub struct ConstraintOperation {
     pub constraint_type: ConstraintType,
     /// Whether Alembic creates this constraint as `NOT VALID`.
     pub not_valid: bool,
+    /// Whether a Django unique constraint needs state-only guidance.
+    pub requires_state_only: bool,
+}
+
+/// Data for `AlterUniqueTogether` operations.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct AlterUniqueTogetherOperation {
+    /// The model name.
+    pub model_name: String,
+    /// Whether the operation adds a non-empty unique-together definition.
+    pub adds_unique_together: bool,
+}
+
+/// Data for `AlterIndexTogether` operations.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct AlterIndexTogetherOperation {
+    /// The model name.
+    pub model_name: String,
+    /// Whether the operation adds a non-empty index-together definition.
+    pub adds_index_together: bool,
 }
 
 /// Type of database constraint added via `migrations.AddConstraint`.

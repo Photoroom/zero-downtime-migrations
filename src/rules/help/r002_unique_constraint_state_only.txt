@@ -1,0 +1,3 @@
+Non-plain unique indexes cannot be attached as PostgreSQL constraints. Build the unique index concurrently in `database_operations`, and record the `UniqueConstraint` only in `state_operations` through `SeparateDatabaseAndState` so Django's state remains aligned.
+
+Set `atomic = False` on the migration because `CREATE UNIQUE INDEX CONCURRENTLY` must run outside a transaction.
