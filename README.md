@@ -131,7 +131,7 @@ test suite — every field above is guaranteed on every diagnostic.
 | Rule | Name | Severity | Description |
 |------|------|----------|-------------|
 | R001 | non-concurrent-add-index | Error | Use `AddIndexConcurrently` instead of `AddIndex` |
-| R002 | unique-constraint-without-index | Error | Unique constraints should have a concurrent index |
+| R002 | unique-constraint-without-index | Error | Unique constraints need a concurrent index; partial/expression indexes use state-only metadata |
 | R003 | runsql-create-index | Error | Use `AddIndexConcurrently` instead of raw SQL `CREATE INDEX` |
 | R004 | missing-atomic-false | Error | Non-atomic migrations require `atomic = False` |
 | R005 | remove-field-without-separate | Error | Use `SeparateDatabaseAndState` to remove fields safely |
@@ -153,7 +153,7 @@ For Alembic revisions, zdm evaluates R001, R003-R005, R011, R015-R017 against di
 
 ### CreateModel Exemption
 
-Several rules (R001, R002, R006, R010, R016, R017) automatically exempt operations that target models created in the same migration. This is because operations on newly created (empty) tables don't cause the locking issues these rules detect. The exemption is order-aware—a `CreateModel` that runs *after* the flagged op cannot retroactively exempt it—and follows `RenameModel` when the fresh table is renamed before a later operation.
+Several rules (R001, R002, R006, R010, R016-R019) automatically exempt operations that target models created in the same migration. This is because operations on newly created (empty) tables don't cause the locking issues these rules detect. The exemption is order-aware—a `CreateModel` that runs *after* the flagged op cannot retroactively exempt it—and follows `RenameModel` when the fresh table is renamed before a later operation.
 
 > **Note:** R007 (`fk-without-concurrent-index`) was merged into R006 and retired. R006 now takes the conservative stance that a prebuilt concurrent index does not make a one-step `AddField(ForeignKey)` safe on an existing table. Split the rollout instead of relying on an index exemption.
 

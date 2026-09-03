@@ -416,11 +416,41 @@ impl<'a> MigrationExtractor<'a> {
         let constraint_type = constraint_node
             .map(|node| self.extract_constraint_type_from_value(node))
             .unwrap_or(ConstraintType::Unknown);
+        let requires_state_only = constraint_node.is_some_and(|node| {
+            constraint_type == ConstraintType::Unique
+                && self.unique_constraint_requires_state_only(node)
+        });
         ConstraintOperation {
             model_name: model_name.unwrap_or_default(),
             constraint_type,
             not_valid: false,
+            requires_state_only,
         }
+    }
+
+    fn unique_constraint_requires_state_only(&self, value: Node<'_>) -> bool {
+        let Some(args) = value.child_by_field_name("arguments") else {
+            return false;
+        };
+        let has_expression = args
+            .named_children(&mut args.walk())
+            .any(|child| !matches!(child.kind(), "keyword_argument" | "comment"));
+        let has_state_only_option = field_call_kwargs(value).any(|kw| {
+            let Some(name) = kw.child_by_field_name("name") else {
+                return false;
+            };
+            let Some(option) = kw.child_by_field_name("value") else {
+                return false;
+            };
+            let option = self.node_text(option).trim();
+            match self.node_text(name) {
+                "condition" => !matches!(option, "None" | "Q()" | "models.Q()"),
+                "include" | "opclasses" => !matches!(option, "None" | "[]" | "()" | "set()"),
+                "nulls_distinct" => false,
+                _ => false,
+            }
+        });
+        has_expression || has_state_only_option
     }
 
     fn extract_alter_unique_together_operation(&self, args: Node) -> AlterUniqueTogetherOperation {

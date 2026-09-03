@@ -237,6 +237,8 @@ pub struct ConstraintOperation {
     pub constraint_type: ConstraintType,
     /// Whether Alembic creates this constraint as `NOT VALID`.
     pub not_valid: bool,
+    /// Whether a Django unique constraint needs state-only guidance.
+    pub requires_state_only: bool,
 }
 
 /// Data for `AlterUniqueTogether` operations.

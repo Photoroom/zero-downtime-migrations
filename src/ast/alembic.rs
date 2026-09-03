@@ -295,6 +295,7 @@ impl<'a> AlembicMigrationExtractor<'a> {
                                 model_name: table,
                                 constraint_type,
                                 not_valid: self.keyword_is_true(args, "postgresql_not_valid"),
+                                requires_state_only: false,
                             }),
                             table_identity,
                         )]

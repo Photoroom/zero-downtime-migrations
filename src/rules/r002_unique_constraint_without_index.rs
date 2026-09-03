@@ -59,13 +59,19 @@ impl Rule for R002UniqueConstraintWithoutIndex {
                     if migration.framework == crate::discovery::MigrationFramework::Aerich {
                         "Aerich UNIQUE constraint builds its index while locking the table"
                     } else {
-                        "AddConstraint with UniqueConstraint locks the table while it builds the index"
+                        if data.requires_state_only {
+                            "AddConstraint with this UniqueConstraint locks the table while it builds the index"
+                        } else {
+                            "AddConstraint with UniqueConstraint locks the table while it builds the index"
+                        }
                     },
                     ctx.path.to_path_buf(),
                     op.span,
                 )
                 .with_help(if migration.framework == crate::discovery::MigrationFramework::Aerich {
                     "Create a UNIQUE INDEX CONCURRENTLY, then attach it with ALTER TABLE ... ADD CONSTRAINT ... UNIQUE USING INDEX in a later Aerich migration."
+                } else if data.requires_state_only {
+                    include_str!("help/r002_unique_constraint_state_only.txt")
                 } else {
                     include_str!("help/r002_unique_constraint.txt")
                 }),
@@ -229,6 +235,67 @@ class Migration(migrations.Migration):
             help.contains("state_operations") && help.contains("database_operations"),
             "help should show both halves of the SDaS wrap, got:\n{help}",
         );
+    }
+
+    #[test]
+    fn test_partial_and_expression_constraints_do_not_recommend_using_index() {
+        for constraint in [
+            "models.UniqueConstraint(fields=['sku'], condition=models.Q(active=True), name='active_sku')",
+            "models.UniqueConstraint(models.F('sku').desc(), name='sku_desc')",
+        ] {
+            let diagnostics = check_migration(&format!(
+                "from django.db import migrations, models\nclass Migration(migrations.Migration):\n    operations = [migrations.AddConstraint('product', {constraint})]\n"
+            ));
+            let help = diagnostics[0].help.as_ref().unwrap();
+            assert!(help.contains("SeparateDatabaseAndState"));
+            assert!(!help.contains("USING INDEX"));
+        }
+    }
+
+    #[test]
+    fn test_empty_conditions_keep_attachable_guidance() {
+        for constraint in [
+            "models.UniqueConstraint(fields=['sku'], condition=None, name='sku')",
+            "models.UniqueConstraint(fields=['sku'], condition=models.Q(), name='sku')",
+        ] {
+            let diagnostics = check_migration(&format!(
+                "from django.db import migrations, models\nclass Migration(migrations.Migration):\n    operations = [migrations.AddConstraint('product', {constraint})]\n"
+            ));
+            assert!(diagnostics[0]
+                .help
+                .as_ref()
+                .unwrap()
+                .contains("USING INDEX"));
+        }
+    }
+
+    #[test]
+    fn test_non_plain_unique_indexes_do_not_recommend_using_index() {
+        for constraint in [
+            "models.UniqueConstraint(fields=['sku'], include=['name'], name='sku')",
+            "models.UniqueConstraint(fields=['sku'], opclasses=['text_pattern_ops'], name='sku')",
+        ] {
+            let diagnostics = check_migration(&format!(
+                "from django.db import migrations, models\nclass Migration(migrations.Migration):\n    operations = [migrations.AddConstraint('product', {constraint})]\n"
+            ));
+            assert!(!diagnostics[0]
+                .help
+                .as_ref()
+                .unwrap()
+                .contains("USING INDEX"));
+        }
+    }
+
+    #[test]
+    fn test_nulls_distinct_keeps_attachable_guidance() {
+        let diagnostics = check_migration(
+            "from django.db import migrations, models\nclass Migration(migrations.Migration):\n    operations = [migrations.AddConstraint('product', models.UniqueConstraint(fields=['sku'], nulls_distinct=False, name='sku'))]\n",
+        );
+        assert!(diagnostics[0]
+            .help
+            .as_ref()
+            .unwrap()
+            .contains("USING INDEX"));
     }
 
     const UNIQUE_CONSTRAINT_IN_WRAPPED_DATABASE_OPS_BAD: &str = r#"

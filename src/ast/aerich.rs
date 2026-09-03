@@ -401,6 +401,7 @@ impl<'a> AerichMigrationExtractor<'a> {
                 model_name: table.name.clone(),
                 constraint_type,
                 not_valid: ends_with_not_valid_clause(statement),
+                requires_state_only: false,
             }),
             Some(table),
         ))
