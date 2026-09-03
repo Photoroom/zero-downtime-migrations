@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "zdm"
-version = "0.6.0"
+version = "0.7.0"
 description = "A PostgreSQL migration safety linter for Django, Alembic, and Aerich"
 readme = "README.md"
 license = { text = "MIT" }

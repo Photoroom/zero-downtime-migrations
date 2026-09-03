@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.0 - 2026-09-03
+
+### Added
+
+- Extend Django migration safety checks for implicit indexes and table renames or drops.
+- Extend Alembic analysis for column indexes, unique constraints, foreign keys, and Flask-Migrate revisions.
+- Extend Aerich/Tortoise analysis for generated migration transaction settings, inline unique constraints, and table changes.
+
 ## 0.6.0 - 2026-08-24
 
 ### Added
