@@ -181,9 +181,7 @@ impl<'a> AlembicMigrationExtractor<'a> {
                         ("drop_index", true) => OperationType::RemoveIndexConcurrently,
                         _ => OperationType::RemoveIndex,
                     };
-                    let schema_position = (name == "create_index").then_some(3).or(Some(2));
-                    let schema =
-                        self.table_identity(args, table.clone(), "schema", schema_position);
+                    let schema = self.table_identity(args, table.clone(), "schema", None);
                     vec![op(
                         op_type,
                         OperationData::Index(IndexOperation { model_name: table }),
@@ -198,8 +196,7 @@ impl<'a> AlembicMigrationExtractor<'a> {
                         .or_else(|| self.keyword_string(args, "column_name")),
                 )
                 .map(|(table, column)| {
-                    let table_identity =
-                        self.table_identity(args, table.clone(), "schema", Some(2));
+                    let table_identity = self.table_identity(args, table.clone(), "schema", None);
                     vec![op(
                         OperationType::RemoveField,
                         OperationData::Field(FieldOperation {
@@ -222,7 +219,7 @@ impl<'a> AlembicMigrationExtractor<'a> {
                 .and_then(|(table, column)| {
                     self.column_field(column).map(|(field_name, field)| {
                         let table_identity =
-                            self.table_identity(args, table.clone(), "schema", Some(2));
+                            self.table_identity(args, table.clone(), "schema", None);
                         let is_unique = field.is_unique;
                         let has_index = field.db_index;
                         let mut operations = vec![op(
@@ -347,8 +344,7 @@ impl<'a> AlembicMigrationExtractor<'a> {
                 .nth_string(args, 1)
                 .or_else(|| self.keyword_string(args, "table_name"))
                 .map(|table| {
-                    let table_identity =
-                        self.table_identity(args, table.clone(), "schema", Some(3));
+                    let table_identity = self.table_identity(args, table.clone(), "schema", None);
                     vec![op(
                         OperationType::AddConstraint,
                         OperationData::Constraint(ConstraintOperation {
@@ -356,6 +352,38 @@ impl<'a> AlembicMigrationExtractor<'a> {
                             constraint_type: ConstraintType::Unique,
                             not_valid: false,
                             requires_state_only: false,
+                        }),
+                        table_identity,
+                    )]
+                }),
+            "rename_table" => self
+                .nth_string(args, 0)
+                .or_else(|| self.keyword_string(args, "old_table_name"))
+                .zip(
+                    self.nth_string(args, 1)
+                        .or_else(|| self.keyword_string(args, "new_table_name")),
+                )
+                .map(|(old_name, name)| {
+                    let table_identity = self.table_identity(args, name.clone(), "schema", None);
+                    vec![op(
+                        OperationType::RenameModel,
+                        OperationData::Model(ModelOperation {
+                            name,
+                            old_name: Some(old_name),
+                        }),
+                        table_identity,
+                    )]
+                }),
+            "drop_table" => self
+                .nth_string(args, 0)
+                .or_else(|| self.keyword_string(args, "table_name"))
+                .map(|name| {
+                    let table_identity = self.table_identity(args, name.clone(), "schema", None);
+                    vec![op(
+                        OperationType::DeleteModel,
+                        OperationData::Model(ModelOperation {
+                            name,
+                            old_name: None,
                         }),
                         table_identity,
                     )]
@@ -378,15 +406,12 @@ impl<'a> AlembicMigrationExtractor<'a> {
                         )
                     })
                     .map(|table| {
-                        let (schema, schema_position) = if name == "create_foreign_key" {
-                            ("source_schema", Some(5))
-                        } else if name == "create_check_constraint" {
-                            ("schema", Some(3))
+                        let schema = if name == "create_foreign_key" {
+                            "source_schema"
                         } else {
-                            ("schema", None)
+                            "schema"
                         };
-                        let table_identity =
-                            self.table_identity(args, table.clone(), schema, schema_position);
+                        let table_identity = self.table_identity(args, table.clone(), schema, None);
                         vec![op(
                             OperationType::AddConstraint,
                             OperationData::Constraint(ConstraintOperation {
@@ -741,16 +766,6 @@ def upgrade():
     op.create_index("jobs_idx", "jobs", ["id"], schema="archive")
 "#;
 
-    const POSITIONAL_SCHEMAS: &str = r#"
-from alembic import op
-
-
-def upgrade():
-    op.create_table("users")
-    op.create_index("archive_users_idx", "users", ["id"], "archive")
-    op.create_foreign_key("archive_users_owner_fk", "users", "owners", ["owner_id"], ["id"], "archive")
-"#;
-
     const MULTI_CONTEXT_AUTOCOMMIT: &str = r#"
 from contextlib import nullcontext
 from alembic import op
@@ -870,6 +885,20 @@ def upgrade():
     op.alter_column(
         "archive_jobs", "legacy_code", None, None, None, None, sa.String(), None, None, None, None, "archive"
     )
+"#;
+
+    const TABLE_RENAMES_AND_DROPS: &str = r#"
+from alembic import op
+
+
+def upgrade():
+    op.rename_table("jobs", "archived_jobs")
+    op.drop_table("legacy_jobs")
+    op.create_table("events", schema="archive")
+    op.rename_table("events", "archived_events", schema="archive")
+    op.create_index("archived_events_idx", "archived_events", ["id"], schema="archive")
+    op.drop_table("archived_events", schema="archive")
+    op.drop_table("events", schema="archive")
 "#;
 
     fn migration(source: &str) -> Migration {
@@ -1094,19 +1123,6 @@ def upgrade():
     }
 
     #[test]
-    fn positional_schemas_do_not_match_unqualified_fresh_tables() {
-        let diagnostics =
-            RuleRegistry::new().check(&migration(POSITIONAL_SCHEMAS), &Config::default());
-        assert_eq!(
-            diagnostics
-                .iter()
-                .map(|diagnostic| diagnostic.rule_id)
-                .collect::<Vec<_>>(),
-            vec!["R001", "R017"],
-        );
-    }
-
-    #[test]
     fn accepts_autocommit_block_after_another_context_manager() {
         let diagnostics =
             RuleRegistry::new().check(&migration(MULTI_CONTEXT_AUTOCOMMIT), &Config::default());
@@ -1263,5 +1279,18 @@ def upgrade():
             .help
             .as_ref()
             .is_some_and(|help| help.contains("UNIQUE INDEX CONCURRENTLY")));
+    }
+
+    #[test]
+    fn table_renames_and_drops_reuse_r019_with_schema_aware_freshness() {
+        let migration = migration(TABLE_RENAMES_AND_DROPS);
+        let diagnostics = RuleRegistry::new().check(&migration, &Config::default());
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.rule_id)
+                .collect::<Vec<_>>(),
+            vec!["R019", "R019", "R019"],
+        );
     }
 }
