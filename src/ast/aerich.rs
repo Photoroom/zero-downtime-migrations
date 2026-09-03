@@ -30,7 +30,14 @@ impl<'a> AerichMigrationExtractor<'a> {
         let mut operations = Vec::new();
         let functions = self.local_functions();
         let mut visited = BTreeSet::new();
-        self.extract_reachable_function("upgrade", &functions, &mut visited, true, &mut operations);
+        self.extract_reachable_function(
+            "upgrade",
+            &functions,
+            &mut visited,
+            true,
+            (is_generated_initial(path), self.is_generated_migration()),
+            &mut operations,
+        );
 
         Ok(Migration {
             path: path.to_path_buf(),
@@ -47,8 +54,37 @@ impl<'a> AerichMigrationExtractor<'a> {
     /// the transaction wrapper.  Keep this deliberately narrow: custom files
     /// have no static transaction contract we can safely infer.
     fn is_non_transactional_generated_migration(&self) -> bool {
+        self.is_generated_migration() && self.final_run_in_transaction_is_false()
+    }
+
+    fn is_generated_migration(&self) -> bool {
         let root = self.parsed.root_node();
         let mut has_models_state = false;
+        for statement in root.named_children(&mut root.walk()) {
+            let Some(assignment) = statement
+                .kind()
+                .eq("expression_statement")
+                .then(|| statement.named_child(0))
+                .flatten()
+                .filter(|node| node.kind() == "assignment")
+            else {
+                continue;
+            };
+            let (Some(left), Some(_right)) = (
+                assignment.child_by_field_name("left"),
+                assignment.child_by_field_name("right"),
+            ) else {
+                continue;
+            };
+            if self.node_text(left) == "MODELS_STATE" {
+                has_models_state = true;
+            }
+        }
+        has_models_state
+    }
+
+    fn final_run_in_transaction_is_false(&self) -> bool {
+        let root = self.parsed.root_node();
         let mut run_in_transaction = None;
         for statement in root.named_children(&mut root.walk()) {
             let Some(assignment) = statement
@@ -66,15 +102,11 @@ impl<'a> AerichMigrationExtractor<'a> {
             ) else {
                 continue;
             };
-            match self.node_text(left) {
-                "MODELS_STATE" => has_models_state = true,
-                "RUN_IN_TRANSACTION" => {
-                    run_in_transaction = Some(self.node_text(right).trim() == "False")
-                }
-                _ => {}
+            if self.node_text(left) == "RUN_IN_TRANSACTION" {
+                run_in_transaction = Some(self.node_text(right).trim() == "False");
             }
         }
-        has_models_state && run_in_transaction == Some(true)
+        run_in_transaction == Some(true)
     }
 
     fn local_functions(&self) -> BTreeMap<String, Node<'a>> {
@@ -96,6 +128,7 @@ impl<'a> AerichMigrationExtractor<'a> {
         functions: &BTreeMap<String, Node<'a>>,
         visited: &mut BTreeSet<String>,
         is_unconditional: bool,
+        generated: (bool, bool),
         operations: &mut Vec<Operation>,
     ) {
         let Some(function) = functions.get(name) else {
@@ -105,7 +138,14 @@ impl<'a> AerichMigrationExtractor<'a> {
             return;
         }
         if let Some(body) = function.child_by_field_name("body") {
-            self.extract_reachable_sql(body, functions, visited, is_unconditional, operations);
+            self.extract_reachable_sql(
+                body,
+                functions,
+                visited,
+                is_unconditional,
+                generated,
+                operations,
+            );
         }
     }
 
@@ -115,6 +155,7 @@ impl<'a> AerichMigrationExtractor<'a> {
         functions: &BTreeMap<String, Node<'a>>,
         visited: &mut BTreeSet<String>,
         is_unconditional: bool,
+        generated: (bool, bool),
         operations: &mut Vec<Operation>,
     ) {
         if matches!(
@@ -130,12 +171,19 @@ impl<'a> AerichMigrationExtractor<'a> {
             {
                 let sql = MigrationExtractor::new(self.parsed).extract_string_value(value);
                 let span = Span::from_node(&value);
-                self.extract_sql(&sql, span, is_unconditional, operations);
+                self.extract_sql(&sql, span, is_unconditional, generated, operations);
             }
             return;
         }
         if node.kind() == "call" {
-            self.extract_call_sql(node, functions, visited, is_unconditional, operations);
+            self.extract_call_sql(
+                node,
+                functions,
+                visited,
+                is_unconditional,
+                generated,
+                operations,
+            );
         }
         let is_unconditional = is_unconditional
             && !matches!(
@@ -147,7 +195,14 @@ impl<'a> AerichMigrationExtractor<'a> {
                     | "match_statement"
             );
         for child in node.named_children(&mut node.walk()) {
-            self.extract_reachable_sql(child, functions, visited, is_unconditional, operations);
+            self.extract_reachable_sql(
+                child,
+                functions,
+                visited,
+                is_unconditional,
+                generated,
+                operations,
+            );
         }
     }
 
@@ -157,6 +212,7 @@ impl<'a> AerichMigrationExtractor<'a> {
         functions: &BTreeMap<String, Node<'a>>,
         visited: &mut BTreeSet<String>,
         is_unconditional: bool,
+        generated: (bool, bool),
         operations: &mut Vec<Operation>,
     ) {
         let Some(function) = call.child_by_field_name("function") else {
@@ -171,7 +227,13 @@ impl<'a> AerichMigrationExtractor<'a> {
                 .filter(|value| matches!(value.kind(), "string" | "concatenated_string"))
             {
                 let sql = MigrationExtractor::new(self.parsed).extract_string_value(value);
-                self.extract_sql(&sql, Span::from_node(&value), is_unconditional, operations);
+                self.extract_sql(
+                    &sql,
+                    Span::from_node(&value),
+                    is_unconditional,
+                    generated,
+                    operations,
+                );
             }
         }
 
@@ -181,6 +243,7 @@ impl<'a> AerichMigrationExtractor<'a> {
                 functions,
                 visited,
                 is_unconditional,
+                generated,
                 operations,
             );
         }
@@ -192,6 +255,7 @@ impl<'a> AerichMigrationExtractor<'a> {
                         functions,
                         visited,
                         is_unconditional,
+                        generated,
                         operations,
                     );
                 }
@@ -204,6 +268,7 @@ impl<'a> AerichMigrationExtractor<'a> {
         sql: &str,
         span: Span,
         create_table_is_unconditional: bool,
+        generated: (bool, bool),
         operations: &mut Vec<Operation>,
     ) {
         let cleaned = strip_sql_noise(sql);
@@ -224,6 +289,7 @@ impl<'a> AerichMigrationExtractor<'a> {
                 statement,
                 span,
                 create_table_is_unconditional,
+                generated,
                 multi_statement_script,
             ) {
                 let inline_unique = match &operation.data {
@@ -260,6 +326,7 @@ impl<'a> AerichMigrationExtractor<'a> {
         statement: &str,
         span: Span,
         create_table_is_unconditional: bool,
+        generated: (bool, bool),
         multi_statement_script: bool,
     ) -> Option<Operation> {
         let statement = statement.trim();
@@ -305,7 +372,8 @@ impl<'a> AerichMigrationExtractor<'a> {
         if starts_with_words(statement, &["CREATE", "TABLE"]) {
             let table = identifier_after_keyword(statement, "TABLE")?;
             let certain = create_table_is_unconditional
-                && !contains_words_in_order(statement, &["IF", "NOT", "EXISTS"]);
+                && ((generated.0 || generated.1)
+                    || !contains_words_in_order(statement, &["IF", "NOT", "EXISTS"]));
             return Some(operation(
                 OperationType::CreateModel,
                 OperationData::Model(ModelOperation {
@@ -314,6 +382,12 @@ impl<'a> AerichMigrationExtractor<'a> {
                 }),
                 certain.then_some(table),
             ));
+        }
+        if generated.0
+            && (starts_with_words(statement, &["COMMENT", "ON", "TABLE"])
+                || starts_with_words(statement, &["COMMENT", "ON", "COLUMN"]))
+        {
+            return None;
         }
         if !starts_with_words(statement, &["ALTER", "TABLE"]) {
             return Some(operation(
@@ -488,6 +562,16 @@ impl<'a> AerichMigrationExtractor<'a> {
     fn node_text(&self, node: Node<'_>) -> &str {
         self.parsed.node_text(node)
     }
+}
+
+fn is_generated_initial(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("0_"))
+        .is_some_and(|name| {
+            name.strip_suffix(".py")
+                .is_some_and(|name| name.ends_with("_init"))
+        })
 }
 
 fn starts_with_words(statement: &str, words: &[&str]) -> bool {
@@ -791,6 +875,46 @@ async def upgrade(db):
         );
         let diagnostics = RuleRegistry::new().check(&migration, &Config::default());
         assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.rule_id == "R001"));
+    }
+
+    #[test]
+    fn generated_initial_table_with_comments_is_fresh() {
+        let source = r#"
+async def upgrade(db):
+    return 'CREATE TABLE IF NOT EXISTS jobs (id INT); COMMENT ON TABLE jobs IS \'jobs\'; COMMENT ON COLUMN jobs.id IS \'id\'; CREATE INDEX jobs_id_idx ON jobs (id);'
+"#;
+        let initial =
+            Migration::from_source(Path::new("migrations/models/0_20260903_init.py"), source)
+                .unwrap();
+        assert!(RuleRegistry::new()
+            .check(&initial, &Config::default())
+            .is_empty());
+        let non_initial =
+            Migration::from_source(Path::new("migrations/models/1_20260903_init.py"), source)
+                .unwrap();
+        assert!(RuleRegistry::new()
+            .check(&non_initial, &Config::default())
+            .iter()
+            .any(|diagnostic| diagnostic.rule_id == "R001"));
+    }
+
+    #[test]
+    fn generated_later_table_is_fresh_but_handwritten_if_not_exists_is_not() {
+        let sql = "async def upgrade(db):\n    return 'CREATE TABLE IF NOT EXISTS jobs (id INT); CREATE INDEX IF NOT EXISTS jobs_id_idx ON jobs (id);'\n";
+        let generated = Migration::from_source(
+            Path::new("migrations/models/2_20260903_jobs.py"),
+            &format!("MODELS_STATE = {{}}\n{sql}"),
+        )
+        .unwrap();
+        assert!(RuleRegistry::new()
+            .check(&generated, &Config::default())
+            .is_empty());
+        let handwritten =
+            Migration::from_source(Path::new("migrations/models/2_20260903_jobs.py"), sql).unwrap();
+        assert!(RuleRegistry::new()
+            .check(&handwritten, &Config::default())
             .iter()
             .any(|diagnostic| diagnostic.rule_id == "R001"));
     }
