@@ -383,6 +383,17 @@ impl<'a> AerichMigrationExtractor<'a> {
                 certain.then_some(table),
             ));
         }
+        if starts_with_words(statement, &["DROP", "TABLE"]) {
+            let table = identifier_after_keyword(statement, "TABLE")?;
+            return Some(operation(
+                OperationType::DeleteModel,
+                OperationData::Model(ModelOperation {
+                    name: table.name.clone(),
+                    old_name: None,
+                }),
+                Some(table),
+            ));
+        }
         if generated.0
             && (starts_with_words(statement, &["COMMENT", "ON", "TABLE"])
                 || starts_with_words(statement, &["COMMENT", "ON", "COLUMN"]))
@@ -401,6 +412,30 @@ impl<'a> AerichMigrationExtractor<'a> {
         }
         let table = identifier_after_keyword(statement, "TABLE")?;
 
+        let rename_is_constraint = contains_words_in_order(statement, &["RENAME", "CONSTRAINT"]);
+        let rename_is_column = !rename_is_constraint
+            && (contains_words_in_order(statement, &["RENAME", "COLUMN"])
+                || identifier_after_keyword(statement, "RENAME")
+                    .is_some_and(|name| !name.name.eq_ignore_ascii_case("TO")));
+        if contains_words_in_order(statement, &["RENAME", "TO"])
+            && !rename_is_column
+            && !rename_is_constraint
+        {
+            let new_name = identifier_after_keyword(statement, "TO")?;
+            let new_table = TableIdentity {
+                schema: table.schema.clone(),
+                name: new_name.name.clone(),
+            };
+            return Some(operation(
+                OperationType::RenameModel,
+                OperationData::Model(ModelOperation {
+                    name: new_name.name,
+                    old_name: Some(table.name),
+                }),
+                Some(new_table),
+            ));
+        }
+
         if contains_words_in_order(statement, &["DROP", "COLUMN"]) {
             let column = identifier_after_keyword(statement, "COLUMN")?.name;
             return Some(operation(
@@ -415,8 +450,10 @@ impl<'a> AerichMigrationExtractor<'a> {
                 Some(table),
             ));
         }
-        if contains_words_in_order(statement, &["RENAME", "COLUMN"]) {
-            let old_name = identifier_after_keyword(statement, "COLUMN")?.name;
+        if rename_is_column {
+            let old_name = identifier_after_keyword(statement, "COLUMN")
+                .or_else(|| identifier_after_keyword(statement, "RENAME"))?
+                .name;
             let new_name = identifier_after_keyword(statement, "TO")?.name;
             return Some(operation(
                 OperationType::RenameField,
@@ -917,6 +954,24 @@ async def upgrade(db):
             .check(&handwritten, &Config::default())
             .iter()
             .any(|diagnostic| diagnostic.rule_id == "R001"));
+    }
+
+    #[test]
+    fn table_renames_and_drops_reuse_r019_with_freshness() {
+        let migration = migration(
+            r#"
+async def upgrade(db):
+    return 'DROP TABLE IF EXISTS old_jobs; ALTER TABLE jobs RENAME TO archived_jobs; ALTER TABLE jobs RENAME COLUMN old TO new; ALTER TABLE jobs RENAME "older" TO "newer"; ALTER TABLE jobs RENAME CONSTRAINT old_check TO new_check; CREATE TABLE fresh (id INT); ALTER TABLE fresh RENAME TO newer; CREATE INDEX newer_id_idx ON newer (id);'
+"#,
+        );
+        assert_eq!(
+            RuleRegistry::new()
+                .check(&migration, &Config::default())
+                .iter()
+                .map(|diagnostic| diagnostic.rule_id)
+                .collect::<Vec<_>>(),
+            vec!["R011", "R011", "R019", "R019"]
+        );
     }
 
     #[test]
