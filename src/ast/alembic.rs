@@ -267,9 +267,13 @@ impl<'a> AlembicMigrationExtractor<'a> {
                 )
                 .map(|(table, column)| {
                     let table_identity =
-                        self.table_identity(args, table.clone(), "schema", Some(10));
+                        self.table_identity(args, table.clone(), "schema", Some(11));
                     let mut operations = Vec::new();
-                    if self.keyword_is_false(args, "nullable") {
+                    if self.keyword_is_false(args, "nullable")
+                        || self
+                            .nth_value(args, 2)
+                            .is_some_and(|value| self.value_is_false(value))
+                    {
                         operations.push(op(
                             OperationType::AlterField,
                             OperationData::Field(FieldOperation {
@@ -293,7 +297,38 @@ impl<'a> AlembicMigrationExtractor<'a> {
                             table_identity.clone(),
                         ));
                     }
-                    if let Some(new_name) = self.keyword_string(args, "new_column_name") {
+                    if self
+                        .keyword_value(args, "type_")
+                        .or_else(|| self.nth_value(args, 6))
+                        .is_some_and(|value| self.node_text(value).trim() != "None")
+                    {
+                        operations.push(op(
+                            OperationType::AlterField,
+                            OperationData::Field(FieldOperation {
+                                model_name: table.clone(),
+                                field_name: column.clone(),
+                                old_name: None,
+                                new_name: None,
+                                field: Some(FieldInfo {
+                                    is_relation: false,
+                                    is_foreign_key: false,
+                                    db_constraint: true,
+                                    db_index: false,
+                                    db_index_disabled: false,
+                                    is_unique: false,
+                                    is_nullable: true,
+                                    has_default: false,
+                                    has_db_default: false,
+                                    is_type_change: true,
+                                }),
+                            }),
+                            table_identity.clone(),
+                        ));
+                    }
+                    if let Some(new_name) = self
+                        .keyword_string(args, "new_column_name")
+                        .or_else(|| self.nth_string(args, 5))
+                    {
                         operations.push(op(
                             OperationType::RenameField,
                             OperationData::Field(FieldOperation {
@@ -307,6 +342,23 @@ impl<'a> AlembicMigrationExtractor<'a> {
                         ));
                     }
                     operations
+                }),
+            "create_unique_constraint" => self
+                .nth_string(args, 1)
+                .or_else(|| self.keyword_string(args, "table_name"))
+                .map(|table| {
+                    let table_identity =
+                        self.table_identity(args, table.clone(), "schema", Some(3));
+                    vec![op(
+                        OperationType::AddConstraint,
+                        OperationData::Constraint(ConstraintOperation {
+                            model_name: table,
+                            constraint_type: ConstraintType::Unique,
+                            not_valid: false,
+                            requires_state_only: false,
+                        }),
+                        table_identity,
+                    )]
                 }),
             "create_foreign_key" | "create_check_constraint" | "create_exclude_constraint" => {
                 let constraint_type = match name {
@@ -471,7 +523,11 @@ impl<'a> AlembicMigrationExtractor<'a> {
 
     fn keyword_is_false(&self, args: Node<'a>, name: &str) -> bool {
         self.keyword_value(args, name)
-            .is_some_and(|value| self.node_text(value).trim() == "False")
+            .is_some_and(|value| self.value_is_false(value))
+    }
+
+    fn value_is_false(&self, value: Node<'a>) -> bool {
+        self.node_text(value).trim() == "False"
     }
 
     fn keyword_is_false_or_absent(&self, args: Node<'a>, name: &str) -> bool {
@@ -789,6 +845,31 @@ import sqlalchemy as sa
 
 def upgrade():
     op.add_column("jobs", sa.Column("owner_id", sa.Integer(), sqlalchemy.ForeignKey("owners.id")))
+"#;
+
+    const UNIQUE_CONSTRAINTS_AND_TYPE_CHANGES: &str = r#"
+from alembic import op
+import sqlalchemy as sa
+
+
+def upgrade():
+    op.create_unique_constraint("jobs_code_key", "jobs", ["code"])
+    op.create_unique_constraint(
+        constraint_name="archive_jobs_code_key",
+        table_name="jobs",
+        columns=["code"],
+        schema="archive",
+    )
+    op.create_table("new_jobs")
+    op.create_unique_constraint("new_jobs_code_key", "new_jobs", ["code"])
+    op.alter_column("jobs", "state", type_=sa.String())
+    op.alter_column(table_name="jobs", column_name="ignored", type_=None)
+    op.alter_column(
+        "archive_jobs", "old_code", type_=sa.String(), new_column_name="new_code", schema="archive"
+    )
+    op.alter_column(
+        "archive_jobs", "legacy_code", None, None, None, None, sa.String(), None, None, None, None, "archive"
+    )
 "#;
 
     fn migration(source: &str) -> Migration {
@@ -1157,5 +1238,30 @@ def upgrade():
                 .collect::<Vec<_>>(),
             vec!["R006"],
         );
+    }
+
+    #[test]
+    fn unique_constraints_and_type_changes_reuse_the_safety_rules() {
+        let migration = migration(UNIQUE_CONSTRAINTS_AND_TYPE_CHANGES);
+        let diagnostics = RuleRegistry::new().check(&migration, &Config::default());
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.rule_id)
+                .collect::<Vec<_>>(),
+            vec!["R002", "R002", "R011", "R015", "R015", "R015"],
+        );
+        assert_eq!(
+            migration
+                .operations
+                .last()
+                .and_then(|op| op.table_identity.as_ref())
+                .map(|table| table.schema.as_deref()),
+            Some(Some("archive")),
+        );
+        assert!(diagnostics[0]
+            .help
+            .as_ref()
+            .is_some_and(|help| help.contains("UNIQUE INDEX CONCURRENTLY")));
     }
 }
