@@ -35,12 +35,46 @@ impl<'a> AerichMigrationExtractor<'a> {
         Ok(Migration {
             path: path.to_path_buf(),
             framework: MigrationFramework::Aerich,
-            is_non_atomic: false,
+            is_non_atomic: self.is_non_transactional_generated_migration(),
             operations,
             imports: vec![],
             class_span: None,
             line_ignores: self.extract_line_ignores(),
         })
+    }
+
+    /// Aerich's generated migrations use a module-level setting to opt out of
+    /// the transaction wrapper.  Keep this deliberately narrow: custom files
+    /// have no static transaction contract we can safely infer.
+    fn is_non_transactional_generated_migration(&self) -> bool {
+        let root = self.parsed.root_node();
+        let mut has_models_state = false;
+        let mut run_in_transaction = None;
+        for statement in root.named_children(&mut root.walk()) {
+            let Some(assignment) = statement
+                .kind()
+                .eq("expression_statement")
+                .then(|| statement.named_child(0))
+                .flatten()
+                .filter(|node| node.kind() == "assignment")
+            else {
+                continue;
+            };
+            let (Some(left), Some(right)) = (
+                assignment.child_by_field_name("left"),
+                assignment.child_by_field_name("right"),
+            ) else {
+                continue;
+            };
+            match self.node_text(left) {
+                "MODELS_STATE" => has_models_state = true,
+                "RUN_IN_TRANSACTION" => {
+                    run_in_transaction = Some(self.node_text(right).trim() == "False")
+                }
+                _ => {}
+            }
+        }
+        has_models_state && run_in_transaction == Some(true)
     }
 
     fn local_functions(&self) -> BTreeMap<String, Node<'a>> {
@@ -172,16 +206,26 @@ impl<'a> AerichMigrationExtractor<'a> {
         create_table_is_unconditional: bool,
         operations: &mut Vec<Operation>,
     ) {
-        for statement in strip_sql_noise(sql).split(';') {
+        let cleaned = strip_sql_noise(sql);
+        let statements: Vec<_> = cleaned
+            .split(';')
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+            .collect();
+        let multi_statement_script = statements.len() > 1;
+        for statement in statements {
             let statement = statement.trim();
             let statement = if starts_with_words(statement, &["DO"]) {
                 alter_table_in_do_block(statement).unwrap_or(statement)
             } else {
                 statement
             };
-            if let Some(operation) =
-                self.extract_statement(statement, span, create_table_is_unconditional)
-            {
+            if let Some(operation) = self.extract_statement(
+                statement,
+                span,
+                create_table_is_unconditional,
+                multi_statement_script,
+            ) {
                 operations.push(operation);
             }
         }
@@ -192,6 +236,7 @@ impl<'a> AerichMigrationExtractor<'a> {
         statement: &str,
         span: Span,
         create_table_is_unconditional: bool,
+        multi_statement_script: bool,
     ) -> Option<Operation> {
         let statement = statement.trim();
         if statement.is_empty() {
@@ -202,7 +247,7 @@ impl<'a> AerichMigrationExtractor<'a> {
             span,
             data,
             table_identity,
-            in_autocommit_block: false,
+            in_autocommit_block: multi_statement_script,
         };
 
         if sql_statement_contains_create_index(statement) {
@@ -638,7 +683,7 @@ async def upgrade(db):
     }
 
     #[test]
-    fn concurrent_aerich_index_does_not_get_django_transaction_advice() {
+    fn concurrent_aerich_index_requires_generated_transaction_setting() {
         let migration = migration(
             r#"
 async def upgrade(db):
@@ -646,7 +691,13 @@ async def upgrade(db):
 "#,
         );
         let diagnostics = RuleRegistry::new().check(&migration, &Config::default());
-        assert!(diagnostics.is_empty(), "got: {diagnostics:?}");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.rule_id)
+                .collect::<Vec<_>>(),
+            vec!["R004"]
+        );
     }
 
     #[test]

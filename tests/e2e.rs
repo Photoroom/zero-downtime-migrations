@@ -233,7 +233,9 @@ fn e2e_aerich_unsafe_revision_reports_the_supported_rule_set() {
         .collect();
     assert_eq!(
         ids,
-        vec!["R001", "R016", "R005", "R011", "R015", "R006", "R010", "R002", "R017", "R017"]
+        vec![
+            "R001", "R004", "R016", "R005", "R011", "R015", "R006", "R010", "R002", "R017", "R017"
+        ]
     );
 }
 

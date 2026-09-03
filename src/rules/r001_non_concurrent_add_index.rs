@@ -62,7 +62,7 @@ impl Rule for R001NonConcurrentAddIndex {
                         "Use postgresql_concurrently=True inside op.get_context().autocommit_block()."
                     }
                     crate::discovery::MigrationFramework::Aerich => {
-                        "Return CREATE INDEX CONCURRENTLY from upgrade() to avoid table locks."
+                        "Return CREATE INDEX CONCURRENTLY from upgrade(); generated-format migrations also require RUN_IN_TRANSACTION = False."
                     }
                     crate::discovery::MigrationFramework::Django => {
                         "Replace migrations.AddIndex with AddIndexConcurrently from django.contrib.postgres.operations"

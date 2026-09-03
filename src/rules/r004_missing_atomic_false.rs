@@ -34,11 +34,27 @@ impl Rule for R004MissingAtomicFalse {
     }
 
     fn check(&self, migration: &Migration, ctx: &RuleContext) -> Vec<Diagnostic> {
-        // Aerich has no migration-level transaction control analogous to
-        // Django's `atomic = False` or Alembic's autocommit block, so R004
-        // cannot offer an actionable fix for its SQL-returning migrations.
         if migration.framework == MigrationFramework::Aerich {
-            return Vec::new();
+            return migration
+                .database_effective_operations()
+                .filter(|op| {
+                    operation_requires_non_atomic(op)
+                        && (!migration.is_non_atomic || op.in_autocommit_block)
+                })
+                .map(|op| {
+                    Diagnostic::new(
+                        self.id(),
+                        self.name(),
+                        self.severity(),
+                        "Aerich concurrent operation may run inside a transaction",
+                        ctx.path.to_path_buf(),
+                        op.span,
+                    )
+                    .with_help(
+                        "Use `RUN_IN_TRANSACTION = False` in a generated migration; concurrent SQL must also be the script's only statement.",
+                    )
+                })
+                .collect();
         }
         if migration.framework == MigrationFramework::Alembic {
             return migration
@@ -177,6 +193,126 @@ class Migration(migrations.Migration):
 
     fn check_migration(source: &str) -> Vec<Diagnostic> {
         crate::rules::test_support::check_rule(&R004MissingAtomicFalse, source)
+    }
+
+    #[test]
+    fn generated_aerich_non_transactional_migration_allows_concurrent_index() {
+        let migration = Migration::from_source(
+            Path::new("migrations/models/1_20260903_jobs.py"),
+            "MODELS_STATE = {}\nRUN_IN_TRANSACTION = False\nasync def upgrade(db):\n    return 'CREATE INDEX CONCURRENTLY jobs_idx ON jobs (state);'\n",
+        )
+        .unwrap();
+        assert!(R004MissingAtomicFalse
+            .check(
+                &migration,
+                &RuleContext {
+                    config: &Config::default(),
+                    path: Path::new("test.py")
+                }
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn generated_aerich_multi_statement_script_is_flagged() {
+        let migration = Migration::from_source(
+            Path::new("migrations/models/1_20260903_jobs.py"),
+            "MODELS_STATE = {}\nRUN_IN_TRANSACTION = False\nasync def upgrade(db):\n    return 'CREATE INDEX CONCURRENTLY jobs_idx ON jobs (state); SELECT 1;'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            R004MissingAtomicFalse
+                .check(
+                    &migration,
+                    &RuleContext {
+                        config: &Config::default(),
+                        path: Path::new("test.py"),
+                    },
+                )
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn generated_aerich_separate_scripts_are_clean() {
+        let migration = Migration::from_source(
+            Path::new("migrations/models/1_20260903_jobs.py"),
+            "MODELS_STATE = {}\nRUN_IN_TRANSACTION = False\nasync def upgrade(db):\n    await execute_statement(db, 'CREATE INDEX CONCURRENTLY jobs_idx ON jobs (state);')\n    await execute_statement(db, 'SELECT 1;')\n",
+        )
+        .unwrap();
+        assert!(R004MissingAtomicFalse
+            .check(
+                &migration,
+                &RuleContext {
+                    config: &Config::default(),
+                    path: Path::new("test.py"),
+                },
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn generated_aerich_multi_statement_helper_script_is_flagged() {
+        let migration = Migration::from_source(
+            Path::new("migrations/models/1_20260903_jobs.py"),
+            "MODELS_STATE = {}\nRUN_IN_TRANSACTION = False\nasync def upgrade(db):\n    await execute_statement(db, 'DROP INDEX CONCURRENTLY jobs_idx; SELECT 1;')\n",
+        )
+        .unwrap();
+        assert_eq!(
+            R004MissingAtomicFalse
+                .check(
+                    &migration,
+                    &RuleContext {
+                        config: &Config::default(),
+                        path: Path::new("test.py"),
+                    },
+                )
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn custom_aerich_migration_with_concurrent_index_is_flagged() {
+        let migration = Migration::from_source(
+            Path::new("migrations/models/1_20260903_jobs.py"),
+            "async def upgrade(db):\n    return 'CREATE INDEX CONCURRENTLY jobs_idx ON jobs (state);'\n",
+        )
+        .unwrap();
+        let diagnostics = R004MissingAtomicFalse.check(
+            &migration,
+            &RuleContext {
+                config: &Config::default(),
+                path: Path::new("test.py"),
+            },
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0]
+            .help
+            .as_deref()
+            .is_some_and(|help| help.contains("RUN_IN_TRANSACTION")));
+    }
+
+    #[test]
+    fn later_generated_transactional_rebinding_is_flagged() {
+        let migration = Migration::from_source(
+            Path::new("migrations/models/1_20260903_jobs.py"),
+            "MODELS_STATE = {}\nRUN_IN_TRANSACTION = False\nRUN_IN_TRANSACTION = True\nasync def upgrade(db):\n    return 'CREATE INDEX CONCURRENTLY jobs_idx ON jobs (state);'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            R004MissingAtomicFalse
+                .check(
+                    &migration,
+                    &RuleContext {
+                        config: &Config::default(),
+                        path: Path::new("test.py"),
+                    },
+                )
+                .len(),
+            1
+        );
     }
 
     #[test]
