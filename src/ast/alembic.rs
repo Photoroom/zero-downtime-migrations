@@ -212,6 +212,52 @@ impl<'a> AlembicMigrationExtractor<'a> {
                         table_identity,
                     )]
                 }),
+            "add_column" => self
+                .nth_string(args, 0)
+                .or_else(|| self.keyword_string(args, "table_name"))
+                .zip(
+                    self.nth_value(args, 1)
+                        .or_else(|| self.keyword_value(args, "column")),
+                )
+                .and_then(|(table, column)| {
+                    self.column_field(column).map(|(field_name, field)| {
+                        let table_identity =
+                            self.table_identity(args, table.clone(), "schema", Some(2));
+                        let is_unique = field.is_unique;
+                        let has_index = field.db_index;
+                        let mut operations = vec![op(
+                            OperationType::AddField,
+                            OperationData::Field(FieldOperation {
+                                model_name: table.clone(),
+                                field_name,
+                                old_name: None,
+                                new_name: None,
+                                field: Some(field),
+                            }),
+                            table_identity.clone(),
+                        )];
+                        if is_unique {
+                            operations.push(op(
+                                OperationType::AddConstraint,
+                                OperationData::Constraint(ConstraintOperation {
+                                    model_name: table.clone(),
+                                    constraint_type: ConstraintType::Unique,
+                                    not_valid: false,
+                                    requires_state_only: false,
+                                }),
+                                table_identity.clone(),
+                            ));
+                        }
+                        if has_index {
+                            operations.push(op(
+                                OperationType::AddIndex,
+                                OperationData::Index(IndexOperation { model_name: table }),
+                                table_identity,
+                            ));
+                        }
+                        operations
+                    })
+                }),
             "alter_column" => self
                 .nth_string(args, 0)
                 .or_else(|| self.keyword_string(args, "table_name"))
@@ -357,6 +403,49 @@ impl<'a> AlembicMigrationExtractor<'a> {
             .into_iter()
             .nth(n)
             .and_then(|value| self.static_string(value))
+    }
+
+    fn nth_value(&self, args: Node<'a>, n: usize) -> Option<Node<'a>> {
+        self.positional_values(args).into_iter().nth(n)
+    }
+
+    fn column_field(&self, column: Node<'a>) -> Option<(String, FieldInfo)> {
+        let function = column.child_by_field_name("function")?;
+        if !matches!(self.node_text(function), "Column" | "sa.Column") {
+            return None;
+        }
+        let args = column.child_by_field_name("arguments")?;
+        let field_name = self.nth_string(args, 0)?;
+        let is_relation = self.positional_values(args).into_iter().any(|value| {
+            value
+                .child_by_field_name("function")
+                .is_some_and(|function| {
+                    matches!(
+                        self.node_text(function),
+                        "ForeignKey" | "sa.ForeignKey" | "sqlalchemy.ForeignKey"
+                    )
+                })
+        });
+        let is_nullable =
+            !self.keyword_is_false(args, "nullable") && !self.keyword_is_true(args, "primary_key");
+        let has_default = self
+            .keyword_value(args, "server_default")
+            .is_some_and(|value| self.node_text(value).trim() != "None");
+        Some((
+            field_name,
+            FieldInfo {
+                is_relation,
+                is_foreign_key: is_relation,
+                db_constraint: true,
+                db_index: self.keyword_is_true(args, "index"),
+                db_index_disabled: false,
+                is_unique: self.keyword_is_true(args, "unique"),
+                is_nullable,
+                has_default: false,
+                has_db_default: has_default,
+                is_type_change: false,
+            },
+        ))
     }
 
     fn keyword_value(&self, args: Node<'a>, name: &str) -> Option<Node<'a>> {
@@ -657,6 +746,51 @@ def upgrade():
     op.create_check_constraint("dynamic_check", "jobs", "state <> ''", postgresql_not_valid=not_valid)
 "#;
 
+    const ADD_COLUMNS: &str = r#"
+from alembic import op
+import sqlalchemy as sa
+
+
+def upgrade():
+    op.add_column("jobs", sa.Column("required", sa.String(), nullable=False))
+    op.add_column("jobs", sa.Column("defaulted", sa.String(), nullable=False, server_default="queued"))
+    op.add_column("jobs", sa.Column("none_default", sa.String(), nullable=False, server_default=None))
+    op.add_column("jobs", sa.Column("owner_id", sa.Integer(), sa.ForeignKey("owners.id"), nullable=False))
+    op.create_table("new_jobs")
+    op.add_column("new_jobs", sa.Column("required", sa.String(), nullable=False))
+    op.add_column("jobs", sa.Column("id", sa.Integer(), primary_key=True))
+    op.add_column("jobs", sa.Column("plain", sa.String(), nullable=True))
+"#;
+
+    const ADD_COLUMN_FLAGS: &str = r#"
+from alembic import op
+import sqlalchemy as sa
+
+
+def upgrade():
+    op.add_column("jobs", sa.Column("code", sa.String(), unique=True))
+    op.add_column("jobs", sa.Column("slug", sa.String(), index=True))
+"#;
+
+    const SAFE_ADD_COLUMN: &str = r#"
+from alembic import op
+import sqlalchemy as sa
+
+
+def upgrade():
+    op.add_column("jobs", sa.Column("label", sa.String()))
+"#;
+
+    const QUALIFIED_FOREIGN_KEY: &str = r#"
+from alembic import op
+import sqlalchemy
+import sqlalchemy as sa
+
+
+def upgrade():
+    op.add_column("jobs", sa.Column("owner_id", sa.Integer(), sqlalchemy.ForeignKey("owners.id")))
+"#;
+
     fn migration(source: &str) -> Migration {
         Migration::from_source(Path::new("alembic/versions/20260809_jobs.py"), source).unwrap()
     }
@@ -946,6 +1080,82 @@ def upgrade():
                 .map(|diagnostic| diagnostic.rule_id)
                 .collect::<Vec<_>>(),
             vec!["R017", "R017"],
+        );
+    }
+
+    #[test]
+    fn add_column_reuses_add_field_rules_without_column_constraints() {
+        let migration = migration(ADD_COLUMNS);
+        assert_eq!(
+            migration
+                .operations
+                .iter()
+                .map(|op| op.op_type)
+                .collect::<Vec<_>>(),
+            vec![
+                OperationType::AddField,
+                OperationType::AddField,
+                OperationType::AddField,
+                OperationType::AddField,
+                OperationType::CreateModel,
+                OperationType::AddField,
+                OperationType::AddField,
+                OperationType::AddField,
+            ],
+        );
+
+        let diagnostics = RuleRegistry::new().check(&migration, &Config::default());
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.rule_id)
+                .collect::<Vec<_>>(),
+            vec!["R006", "R010", "R010", "R010", "R010"],
+        );
+    }
+
+    #[test]
+    fn add_column_unique_and_index_flags_reuse_their_safety_rules() {
+        let migration = migration(ADD_COLUMN_FLAGS);
+        assert_eq!(
+            migration
+                .operations
+                .iter()
+                .map(|op| op.op_type)
+                .collect::<Vec<_>>(),
+            vec![
+                OperationType::AddField,
+                OperationType::AddConstraint,
+                OperationType::AddField,
+                OperationType::AddIndex,
+            ],
+        );
+        assert_eq!(
+            RuleRegistry::new()
+                .check(&migration, &Config::default())
+                .iter()
+                .map(|diagnostic| diagnostic.rule_id)
+                .collect::<Vec<_>>(),
+            vec!["R001", "R002"],
+        );
+    }
+
+    #[test]
+    fn add_column_without_index_or_unique_is_safe() {
+        assert!(RuleRegistry::new()
+            .check(&migration(SAFE_ADD_COLUMN), &Config::default())
+            .is_empty());
+    }
+
+    #[test]
+    fn add_column_recognises_qualified_foreign_keys() {
+        assert_eq!(
+            RuleRegistry::new()
+                .check(&migration(QUALIFIED_FOREIGN_KEY), &Config::default())
+                .iter()
+                .map(|diagnostic| diagnostic.rule_id)
+                .collect::<Vec<_>>(),
+            vec!["R006"],
         );
     }
 }
