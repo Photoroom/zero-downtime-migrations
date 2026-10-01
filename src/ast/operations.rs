@@ -76,6 +76,8 @@ pub enum OperationType {
     RunSQL,
     /// A static SQL statement passed to Alembic's `op.execute`.
     ExecuteSql,
+    /// Alembic `autocommit_block()` entry, including an empty block.
+    AutocommitBoundary,
     RunPython,
 
     // Special operations
@@ -233,6 +235,8 @@ pub struct FieldInfo {
 pub struct ConstraintOperation {
     /// The model name.
     pub model_name: String,
+    /// Literal Alembic constraint name when known.
+    pub name: Option<String>,
     /// The constraint type.
     pub constraint_type: ConstraintType,
     /// Whether Alembic creates this constraint as `NOT VALID`.
@@ -346,7 +350,7 @@ fn compact_sql_token_starts_with(token: &str, keywords: &[&str]) -> bool {
     token.starts_with(&expected)
 }
 
-fn sql_tokens(statement: &str) -> Vec<String> {
+pub(crate) fn sql_tokens(statement: &str) -> Vec<String> {
     // Split on any non-identifier byte. Python escapes (`\n`, `\x20`, …) are
     // already resolved before SQL ever reaches here: the extractor decodes
     // them in non-raw strings (so `'CREATE\nINDEX'` arrives as real

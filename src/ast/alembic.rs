@@ -32,12 +32,19 @@ impl<'a> AlembicMigrationExtractor<'a> {
                 self.extract_operations(body, false, true, &mut operations);
             }
         }
+        let mut downgrade_operations = Vec::new();
+        if let Some(downgrade) = self.find_function("downgrade") {
+            if let Some(body) = downgrade.child_by_field_name("body") {
+                self.extract_operations(body, false, true, &mut downgrade_operations);
+            }
+        }
 
         Ok(Migration {
             path: path.to_path_buf(),
             framework: MigrationFramework::Alembic,
             is_non_atomic: false,
             operations,
+            downgrade_operations,
             imports: vec![],
             class_span: None,
             line_ignores: self.extract_line_ignores(),
@@ -45,12 +52,16 @@ impl<'a> AlembicMigrationExtractor<'a> {
     }
 
     fn find_upgrade(&self) -> Option<Node<'a>> {
+        self.find_function("upgrade")
+    }
+
+    fn find_function(&self, function_name: &str) -> Option<Node<'a>> {
         let root = self.parsed.root_node();
         root.named_children(&mut root.walk()).find(|node| {
             node.kind() == "function_definition"
                 && node
                     .child_by_field_name("name")
-                    .is_some_and(|name| self.node_text(name) == "upgrade")
+                    .is_some_and(|name| self.node_text(name) == function_name)
         })
     }
 
@@ -73,7 +84,17 @@ impl<'a> AlembicMigrationExtractor<'a> {
             return;
         }
         if node.kind() == "with_statement" {
-            let in_autocommit_block = in_autocommit_block || self.is_autocommit_block(node);
+            let enters_autocommit = self.is_autocommit_block(node);
+            if enters_autocommit && !in_autocommit_block {
+                out.push(Operation {
+                    op_type: OperationType::AutocommitBoundary,
+                    span: Span::from_node(&node),
+                    data: OperationData::Empty,
+                    table_identity: None,
+                    in_autocommit_block: true,
+                });
+            }
+            let in_autocommit_block = in_autocommit_block || enters_autocommit;
             if let Some(body) = node.child_by_field_name("body") {
                 self.extract_operations(
                     body,
@@ -297,6 +318,7 @@ impl<'a> AlembicMigrationExtractor<'a> {
                                 OperationType::AddConstraint,
                                 OperationData::Constraint(ConstraintOperation {
                                     model_name: table.clone(),
+                                    name: None,
                                     constraint_type: ConstraintType::Unique,
                                     not_valid: false,
                                     requires_state_only: false,
@@ -384,6 +406,7 @@ impl<'a> AlembicMigrationExtractor<'a> {
                         OperationType::AddConstraint,
                         OperationData::Constraint(ConstraintOperation {
                             model_name: table,
+                            name: None,
                             constraint_type: ConstraintType::Unique,
                             not_valid: false,
                             requires_state_only: false,
@@ -451,6 +474,9 @@ impl<'a> AlembicMigrationExtractor<'a> {
                             OperationType::AddConstraint,
                             OperationData::Constraint(ConstraintOperation {
                                 model_name: table,
+                                name: self
+                                    .nth_string(args, 0)
+                                    .or_else(|| self.keyword_string(args, "constraint_name")),
                                 constraint_type,
                                 not_valid: self.keyword_is_true(args, "postgresql_not_valid"),
                                 requires_state_only: false,
@@ -983,7 +1009,7 @@ def upgrade():
     }
 
     #[test]
-    fn extracts_direct_upgrade_operations_and_ignores_downgrade() {
+    fn extracts_upgrade_and_downgrade_independently() {
         let migration = migration(UNSAFE);
         assert_eq!(migration.framework, MigrationFramework::Alembic);
         assert_eq!(
@@ -1005,6 +1031,7 @@ def upgrade():
                 OperationType::AddIndexConcurrently,
             ]
         );
+        assert_eq!(migration.downgrade_operations.len(), 1);
     }
 
     #[test]
@@ -1017,7 +1044,10 @@ def upgrade():
             .collect();
         assert_eq!(
             ids,
-            vec!["R001", "R003", "R004", "R005", "R011", "R015", "R016", "R017", "R017", "R017"]
+            vec![
+                "R001", "R003", "R004", "R005", "R011", "R015", "R016", "R017", "R017", "R017",
+                "R001"
+            ]
         );
         assert!(diagnostics
             .iter()
@@ -1381,6 +1411,143 @@ def upgrade():
                 .map(|diagnostic| diagnostic.rule_id)
                 .collect::<Vec<_>>(),
             vec!["R004", "R004", "R004", "R004"],
+        );
+    }
+    #[test]
+    fn rollback_operations_are_checked_without_upgrade_fresh_table_state() {
+        let source = r#"
+from alembic import op
+def upgrade():
+    op.create_table("jobs")
+def downgrade():
+    op.drop_column("jobs", "legacy")
+    op.create_check_constraint("jobs_check", "jobs", "id > 0")
+"#;
+        let diagnostics = RuleRegistry::new().check(&migration(source), &Config::default());
+        assert_eq!(
+            diagnostics.iter().map(|d| d.rule_id).collect::<Vec<_>>(),
+            vec!["R005", "R017"]
+        );
+    }
+
+    #[test]
+    fn raw_check_sql_and_same_revision_validation_are_flagged() {
+        let source = r#"
+from alembic import op
+def upgrade():
+    op.execute("ALTER TABLE jobs ADD CONSTRAINT jobs_bad CHECK (id > 0)")
+    op.execute("ALTER TABLE jobs ADD CONSTRAINT jobs_ok CHECK (id > 0) NOT VALID")
+    op.execute("ALTER TABLE jobs VALIDATE CONSTRAINT jobs_ok")
+    op.create_check_constraint("typed_ok", "jobs", "id > 0", postgresql_not_valid=True)
+    op.execute("ALTER TABLE jobs VALIDATE CONSTRAINT typed_ok")
+"#;
+        let diagnostics = RuleRegistry::new().check(&migration(source), &Config::default());
+        assert_eq!(
+            diagnostics.iter().map(|d| d.rule_id).collect::<Vec<_>>(),
+            vec!["R017", "R017", "R017"]
+        );
+    }
+
+    #[test]
+    fn unrelated_or_later_validation_is_not_flagged() {
+        let source = r#"
+from alembic import op
+def upgrade():
+    op.execute("-- ALTER TABLE jobs ADD CONSTRAINT fake CHECK (id > 0)\nSELECT 'ALTER TABLE jobs ADD CONSTRAINT fake CHECK (id > 0)'")
+    op.execute("ALTER TABLE jobs ADD CONSTRAINT jobs_ok CHECK (id > 0) NOT VALID")
+    op.execute("ALTER TABLE jobs VALIDATE CONSTRAINT other_constraint")
+def downgrade():
+    op.execute("ALTER TABLE jobs VALIDATE CONSTRAINT jobs_ok")
+"#;
+        let diagnostics = RuleRegistry::new().check(&migration(source), &Config::default());
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn autocommit_boundary_releases_add_constraint_lock() {
+        let source = r#"
+from alembic import op
+def upgrade():
+    op.execute("ALTER TABLE jobs ADD CONSTRAINT jobs_ok CHECK (id > 0) NOT VALID")
+    with op.get_context().autocommit_block():
+        op.execute("SELECT 1")
+    op.execute("ALTER TABLE jobs VALIDATE CONSTRAINT jobs_ok")
+"#;
+        let diagnostics = RuleRegistry::new().check(&migration(source), &Config::default());
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn empty_autocommit_block_and_explicit_commit_release_lock() {
+        let source = r#"
+from alembic import op
+def upgrade():
+    op.execute("ALTER TABLE jobs ADD CONSTRAINT first CHECK (id > 0) NOT VALID")
+    with op.get_context().autocommit_block():
+        pass
+    op.execute("ALTER TABLE jobs VALIDATE CONSTRAINT first")
+    op.execute("ALTER TABLE jobs ADD CONSTRAINT second CHECK (id > 0) NOT VALID")
+    op.execute("COMMIT")
+    op.execute("ALTER TABLE jobs VALIDATE CONSTRAINT second")
+"#;
+        let diagnostics = RuleRegistry::new().check(&migration(source), &Config::default());
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn raw_sql_checks_all_alter_actions_and_ignores_not_valid_inside_expression() {
+        let source = r#"
+from alembic import op
+def upgrade():
+    op.execute('ALTER TABLE jobs ADD CONSTRAINT safe CHECK (id > 0) NOT VALID, ADD CONSTRAINT unsafe CHECK (id > 0)')
+    op.execute('ALTER TABLE jobs ADD CONSTRAINT quoted CHECK ("NOT VALID" IS NOT NULL)')
+    op.execute('ALTER TABLE jobs ADD CONSTRAINT expression CHECK (NOT valid)')
+    op.execute('ALTER TABLE jobs DROP COLUMN old, ADD CONSTRAINT later CHECK (id > 0)')
+    op.execute('ALTER TABLE "add" ADD CONSTRAINT quoted_table CHECK (id > 0)')
+"#;
+        let diagnostics = RuleRegistry::new().check(&migration(source), &Config::default());
+        assert_eq!(
+            diagnostics.iter().map(|d| d.rule_id).collect::<Vec<_>>(),
+            vec!["R017", "R017", "R017", "R017", "R017"]
+        );
+    }
+
+    #[test]
+    fn raw_check_on_new_table_is_exempt() {
+        let source = r#"
+from alembic import op
+def upgrade():
+    op.create_table("jobs")
+    op.execute("ALTER TABLE jobs ADD CONSTRAINT jobs_check CHECK (id > 0); SELECT 1")
+"#;
+        let diagnostics = RuleRegistry::new().check(&migration(source), &Config::default());
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn raw_sql_before_check_revokes_new_table_exemption() {
+        let source = r#"
+from alembic import op
+def upgrade():
+    op.create_table("jobs")
+    op.execute("INSERT INTO jobs (id) VALUES (1); ALTER TABLE jobs ADD CONSTRAINT jobs_check CHECK (id > 0)")
+"#;
+        let diagnostics = RuleRegistry::new().check(&migration(source), &Config::default());
+        assert_eq!(
+            diagnostics.iter().map(|d| d.rule_id).collect::<Vec<_>>(),
+            vec!["R017"]
         );
     }
 }
