@@ -14,7 +14,7 @@ A standalone Rust CLI tool that statically analyzes Django, Alembic, and Aerich 
 
 ### Alembic support
 
-zdm also discovers Alembic revision scripts directly under `alembic/versions/*.py`. It statically supports direct `op.*` calls in `upgrade()`:
+zdm also discovers Alembic revision scripts directly under `alembic/versions/*.py`. It statically supports direct `op.*` calls in `upgrade()` and `downgrade()`:
 
 - `create_table`, `create_index`, `drop_index`
 - `create_foreign_key` and `create_check_constraint` (including `postgresql_not_valid=True`), plus `create_exclude_constraint`
@@ -28,7 +28,7 @@ with op.get_context().autocommit_block():
     op.create_index("jobs_state_idx", "jobs", ["state"], postgresql_concurrently=True)
 ```
 
-The Alembic path is intentionally static: zdm does not import or execute revision scripts, connect to a database, inspect SQLAlchemy models, resolve aliases/custom operations, or evaluate dynamic SQL. `op.execute` is inspected only when its first positional argument or `sqltext` keyword is a string literal; use explicit SQL when you want it checked.
+The Alembic path is intentionally static: zdm does not import or execute revision scripts, connect to a database, inspect SQLAlchemy models, resolve aliases/custom operations, or evaluate dynamic SQL. `op.execute` is inspected only when its first positional argument or `sqltext` keyword is a string literal; use explicit SQL when you want it checked. Literal `ALTER TABLE ... ADD CONSTRAINT ... CHECK` and validation before its `NOT VALID` addition commits are checked by R017. Separate revisions need separate transactions if applied together.
 
 ### Aerich/Tortoise support
 
@@ -149,7 +149,7 @@ test suite — every field above is guaranteed on every diagnostic.
 | R018 | implicit-django-index | Error | `AddField` and non-empty `AlterUniqueTogether`/`AlterIndexTogether` build indexes non-concurrently; `AlterField` warns |
 | R019 | table-rename-or-drop | Error | Renaming or dropping an existing table breaks running application code |
 
-For Alembic revisions, zdm evaluates R001-R005, R010-R011, and R015-R019 against direct `op.*` calls in `upgrade()`. For Aerich revisions, zdm evaluates R001-R006, R010-R011, and R015-R017 plus R019 against supported literal PostgreSQL DDL reachable from `upgrade()`; R004 applies to recognized generated-format transaction settings. R018 is Django-only. In diff modes, changeset rule R008 also applies. The Django API references in this table apply only to Django; Alembic and Aerich diagnostics name their equivalent operations.
+For Alembic revisions, zdm evaluates R001-R005, R010-R011, and R015-R019 against direct `op.*` calls in `upgrade()` and `downgrade()` independently. For Aerich revisions, zdm evaluates R001-R006, R010-R011, and R015-R017 plus R019 against supported literal PostgreSQL DDL reachable from `upgrade()`; R004 applies to recognized generated-format transaction settings. R018 is Django-only. In diff modes, changeset rule R008 also applies. The Django API references in this table apply only to Django; Alembic and Aerich diagnostics name their equivalent operations.
 
 ### CreateModel Exemption
 

@@ -44,6 +44,7 @@ impl<'a> AerichMigrationExtractor<'a> {
             framework: MigrationFramework::Aerich,
             is_non_atomic: self.is_non_transactional_generated_migration(),
             operations,
+            downgrade_operations: vec![],
             imports: vec![],
             class_span: None,
             line_ignores: self.extract_line_ignores(),
@@ -309,6 +310,7 @@ impl<'a> AerichMigrationExtractor<'a> {
                         span,
                         data: OperationData::Constraint(ConstraintOperation {
                             model_name,
+                            name: None,
                             constraint_type: ConstraintType::Unique,
                             not_valid: false,
                             requires_state_only: false,
@@ -578,6 +580,7 @@ impl<'a> AerichMigrationExtractor<'a> {
             OperationType::AddConstraint,
             OperationData::Constraint(ConstraintOperation {
                 model_name: table.name.clone(),
+                name: None,
                 constraint_type,
                 not_valid: ends_with_not_valid_clause(statement),
                 requires_state_only: false,

@@ -193,6 +193,7 @@ impl<'a> MigrationExtractor<'a> {
             framework: crate::discovery::MigrationFramework::Django,
             is_non_atomic,
             operations,
+            downgrade_operations: vec![],
             imports,
             class_span,
             line_ignores,
@@ -422,6 +423,7 @@ impl<'a> MigrationExtractor<'a> {
         });
         ConstraintOperation {
             model_name: model_name.unwrap_or_default(),
+            name: None,
             constraint_type,
             not_valid: false,
             requires_state_only,

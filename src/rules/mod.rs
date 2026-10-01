@@ -131,6 +131,20 @@ impl CreatedModels {
         op.model_name().is_some_and(|name| self.contains(name))
     }
 
+    pub(crate) fn contains_sql_table(&self, parts: &[String]) -> bool {
+        self.sql_tables.iter().any(|table| match parts {
+            [name] => table.schema.is_none() && table.name.eq_ignore_ascii_case(name),
+            [schema, name] => {
+                table
+                    .schema
+                    .as_ref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(schema))
+                    && table.name.eq_ignore_ascii_case(name)
+            }
+            _ => false,
+        })
+    }
+
     /// Is `name` in the set? Comparison is case-insensitive on
     /// both sides — callers do not need to lowercase before
     /// calling.
@@ -169,11 +183,6 @@ fn walk_database_effective_operation(
             }
         }
         _ => {
-            if migration.framework.uses_sql_table_identity()
-                && op.op_type == OperationType::ExecuteSql
-            {
-                created.clear_sql_tables();
-            }
             if let OperationData::Model(ModelOperation { name, old_name }) = &op.data {
                 if op.op_type == OperationType::CreateModel {
                     if migration.framework.uses_sql_table_identity() {
@@ -213,6 +222,11 @@ fn walk_database_effective_operation(
                 }
             }
             handle(op, created);
+            if migration.framework.uses_sql_table_identity()
+                && op.op_type == OperationType::ExecuteSql
+            {
+                created.clear_sql_tables();
+            }
         }
     }
 }
@@ -327,6 +341,16 @@ impl RuleRegistry {
 
     /// Run all enabled rules on a migration.
     pub fn check(&self, migration: &Migration, config: &Config) -> Vec<Diagnostic> {
+        let mut diagnostics = self.check_operations(migration, config);
+        if !migration.downgrade_operations.is_empty() {
+            let mut rollback = migration.clone();
+            rollback.operations = std::mem::take(&mut rollback.downgrade_operations);
+            diagnostics.extend(self.check_operations(&rollback, config));
+        }
+        diagnostics
+    }
+
+    fn check_operations(&self, migration: &Migration, config: &Config) -> Vec<Diagnostic> {
         let ctx = RuleContext {
             config,
             path: &migration.path,

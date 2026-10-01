@@ -11,7 +11,7 @@ mod operations;
 pub(crate) use extractor::MigrationExtractor;
 pub(crate) use operations::{
     any_sql_statement, sql_statement_contains_concurrently, sql_statement_contains_create_index,
-    sql_statement_contains_drop_index, sql_statement_contains_reindex, strip_sql_noise,
+    sql_statement_contains_drop_index, sql_statement_contains_reindex, sql_tokens, strip_sql_noise,
 };
 pub use operations::{
     AlterIndexTogetherOperation, AlterUniqueTogetherOperation, ConstraintOperation, ConstraintType,
@@ -42,6 +42,8 @@ pub struct Migration {
     pub is_non_atomic: bool,
     /// The list of operations in this migration.
     pub operations: Vec<Operation>,
+    /// Alembic rollback operations, checked independently from `upgrade()`.
+    pub downgrade_operations: Vec<Operation>,
     /// Import statements that may be relevant for linting.
     pub imports: Vec<Import>,
     /// Span of the `class Migration(...)` definition, when present. Used

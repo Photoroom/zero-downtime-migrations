@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.0 - 2026-10-01
+
+### Alembic safety
+
+- Analyze `downgrade()` independently of `upgrade()` so unsafe rollback operations are reported.
+- Detect literal `ALTER TABLE ... ADD CONSTRAINT ... CHECK` SQL that validates existing rows, including multiple actions in one statement.
+- Report validation of a `NOT VALID` constraint before its addition commits, while recognizing Alembic autocommit blocks and explicit SQL commits.
+
 ## 0.7.0 - 2026-09-03
 
 ### Added
