@@ -131,6 +131,15 @@ For Aerich, evidence can authorize only a fully understood, single-action
 actions, `ONLY`, `IF EXISTS`, and escaped identifier quotes remain blocked.
 Aerich still checks `upgrade()` only; Alembic checks both migration directions.
 
+CI must run diff mode in a checkout with the intended committed HEAD and the
+base history available. Copying only selected migrations to a temporary scan
+directory discards the model evidence. Establish coverage/configuration before
+the contraction PR, and use one owner for migration/application separation:
+keep R008 enabled with explicit `allowed-file-patterns`, or retain an equivalent
+required policy and configure that choice explicitly. Do not generate a modified
+configuration during the check. See [the Gateway regression validation](VALIDATION.md)
+for an actual-source example and its explicit coverage limits.
+
 This check establishes earlier **ORM removal within configured source coverage**.
 It does not prove absence of handwritten SQL, external consumers, or runtime
 monkey-patching, and does not verify deployment or replica state. R008 still

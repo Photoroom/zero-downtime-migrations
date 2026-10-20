@@ -1,26 +1,28 @@
 # Gateway compatibility fixes for ZDM
 
-Status: implementation in progress on `codex/gateway-compatibility`.
+Status: implemented locally on `codex/gateway-compatibility`; see VALIDATION.md.
 
-Commit 1: complete. The regression failed before the fix; 493 tests, Clippy,
+Commit 1: complete. The regression failed before the fix; 495 tests, Clippy,
 and formatting pass. SQLAlchemy 2.0 declarative-table documentation confirms
 nullable Annotated templates and explicit option precedence.
-Commit 2: complete; failing regression reproduced, 495 tests, Clippy, and
+Commit 2: complete; failing regression reproduced, 497 tests, Clippy, and
 formatting pass.
 Full runtime model-inventory probe at Gateway 888461880d79ee10fb5842a3cd05635fa0f153e1
 contains 17 declaration/base files. Arithmetic failures are fixed. Additional
 unsupported constructs include dataclass decorators, enum bases, Pydantic
 TypeAdapter construction, and missing ContentBackendTimestamps/imported exception
 dependencies. These are not converted into absence. A broad `app` scan remains
-unsupported. Acceptance will use an explicitly declared inventory of all mappings
+unsupported. Acceptance uses an explicitly declared inventory of all mappings
 for the contraction's physical table and their local dependency closure, verified
 against the repository declarations. This is a declared coverage boundary, not a
 claim of whole-service Python analysis; unrelated model inventories may still
 need future parser support. This narrows the earlier broad-inventory expectation
 without introducing suppressions or changing R005's evidence model.
-Commit 3: complete; the scan initially missed the unsafe beta drop. All 501
+Commit 3: complete; the scan initially missed the unsafe beta drop. All 503
 tests, Clippy, and formatting pass with configured discovery and parser routing.
-Commit 4: pending.
+Commit 4: complete; 506 tests, Clippy, and formatting pass. Actual-source
+Gateway validation passes the earlier-removal case and rejects same-PR removal
+in HEAD and staged modes. No release or downstream change has been made.
 
 ## Outcome and baseline
 
