@@ -11,7 +11,8 @@ mod operations;
 pub(crate) use extractor::MigrationExtractor;
 pub(crate) use operations::{
     any_sql_statement, sql_statement_contains_concurrently, sql_statement_contains_create_index,
-    sql_statement_contains_drop_index, sql_statement_contains_reindex, sql_tokens, strip_sql_noise,
+    sql_statement_contains_drop_index, sql_statement_contains_reindex, sql_statements, sql_tokens,
+    strip_sql_noise,
 };
 pub use operations::{
     AlterIndexTogetherOperation, AlterUniqueTogetherOperation, ConstraintOperation, ConstraintType,

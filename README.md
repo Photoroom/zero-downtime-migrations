@@ -36,6 +36,81 @@ zdm discovers Aerich revisions under `migrations/<app>/<number>_*.py`. Aerich's 
 
 The Aerich path is static: zdm does not import Tortoise, execute migrations, connect to a database, resolve imports, or evaluate variables and f-strings. Direct `db.execute_script()` and `db.execute_query()` calls, qualified helpers, keyword arguments, and dynamically assembled SQL are not checked. Generated modern revisions with `MODELS_STATE` may exempt their `CREATE TABLE IF NOT EXISTS` tables, including later newly-created models; hand-written files do not receive that exemption. R004 accepts `RUN_IN_TRANSACTION = False` only in that generated format, and concurrent SQL must be its script's only statement. Tortoise's built-in migration file layout is detected, but Tortoise 1.x projects are unsupported.
 
+### Column drops after an earlier model removal (R005)
+
+Alembic and Aerich can drop a column after a separate change has removed it from
+the application models. ZDM checks the ORM mappings in the Git merge-base and
+in the checked revision. Both must resolve the table completely and exclude the
+exact database column. Removing a mapping and dropping the column in the same
+PR remains an error. A missing table/model is unknown, not evidence of absence.
+
+First establish ORM source coverage in the repository-root configuration in an
+earlier PR. For `pyproject.toml`:
+
+```toml
+[[tool.zdm.model-sources]]
+orm = "sqlalchemy"
+paths = ["app"]
+```
+
+For Aerich use `orm = "tortoise"`. Multiple source entries are supported; consumers
+from all configured providers must agree that a physical column is absent.
+`paths` are literal repository-relative Python source files or directories and
+must cover all relevant model definitions, bases, and mixins. No paths outside
+the repository, globs, application imports, or database access are used. With
+`zero-downtime-migrations.toml`, use `[[model-sources]]` instead. Only source
+coverage already configured at the merge-base is used, for both snapshots;
+changing coverage in the contraction PR cannot grant permission to drop a column.
+Model-source settings are read from the repository root, not nested configs.
+
+Then remove the ORM field and its application usage in a compatibility PR, leaving
+the database column in place. In a later migration-only PR, use the ordinary drop:
+
+```python
+# Alembic
+from alembic import op
+
+
+def upgrade():
+    op.drop_column("jobs", "signed_manifest")
+```
+
+```python
+# Aerich
+async def upgrade(db):
+    return 'ALTER TABLE "jobs" DROP COLUMN "signed_manifest";'
+```
+
+Run `zdm --diff origin/main` or `zdm --diff-staged origin/main`. The earlier model
+removal must be included in the branch's merge-base. HEAD mode reads committed
+models; staged mode reads index models. Unstaged/worktree edits do not supply
+evidence. Migration path filters and `exclude` do not filter the model inventory.
+A standalone migration scan or library call without historical evidence retains
+R005; there is no source annotation or per-column exemption configuration.
+
+The SQLAlchemy adapter supports a conservative subset of declarative mappings:
+`Column`, `mapped_column`, bare `Mapped[...]` annotations, explicit database names,
+and statically resolved local aliases, abstract bases, and mixins. Tortoise checks
+ordinary and inherited fields, `source_field`, implicit `id` primary keys, and
+supported foreign-key/one-to-one backing columns. A differently named Python
+attribute can therefore keep a database column in use. Quoted database names and
+schema presence must match exactly; an unspecified schema does not imply `public`.
+
+Unresolved imports/bases, dynamically generated mappings, reflection, ambiguous
+metadata, missing sources, and unsupported model syntax keep the drop blocked.
+This is not a general Python interpreter. Treat a source-scope declaration as an
+analysis boundary: ZDM cannot find consumers outside the configured coverage.
+For Aerich, evidence can authorize only a fully understood, single-action
+`ALTER TABLE [schema.]table DROP COLUMN column [CASCADE|RESTRICT]`. Compound
+actions, `ONLY`, `IF EXISTS`, and escaped identifier quotes remain blocked.
+Aerich still checks `upgrade()` only; Alembic checks both migration directions.
+
+This check establishes earlier **ORM removal within configured source coverage**.
+It does not prove absence of handwritten SQL, external consumers, or runtime
+monkey-patching, and does not verify deployment or replica state. R008 still
+checks migration/application separation; other rules are unchanged. Django keeps
+its existing `SeparateDatabaseAndState` checks, without replaying model history.
+
 ## Installation
 
 > **Breaking change:** the `zero-downtime-migrations` command alias has been removed. Use `zdm`. (`alias zero-downtime-migrations=zdm` in your shell is a one-line workaround if you depended on the old name.)
@@ -134,7 +209,7 @@ test suite — every field above is guaranteed on every diagnostic.
 | R002 | unique-constraint-without-index | Error | Unique constraints need a concurrent index; partial/expression indexes use state-only metadata |
 | R003 | runsql-create-index | Error | Use `AddIndexConcurrently` instead of raw SQL `CREATE INDEX` |
 | R004 | missing-atomic-false | Error | Non-atomic migrations require `atomic = False` |
-| R005 | remove-field-without-separate | Error | Use `SeparateDatabaseAndState` to remove fields safely |
+| R005 | remove-field-without-separate | Error | Separate Django state removal, or verify earlier ORM removal in diff mode |
 | R006 | add-field-foreign-key | Error | Adding FK creates index and validates constraint, except plain FKs that disable both |
 | R008 | disallowed-file-changes | Error | Don't change app code alongside migrations |
 | R009 | separate-db-state-same-pr | Error | Don't deploy both steps of `SeparateDatabaseAndState` together |
