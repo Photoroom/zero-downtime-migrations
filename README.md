@@ -100,6 +100,13 @@ supported foreign-key/one-to-one backing columns. A differently named Python
 attribute can therefore keep a database column in use. Quoted database names and
 schema presence must match exactly; an unspecified schema does not imply `public`.
 
+Module constants may use literal scalar addition, `len` of a resolved scalar,
+and `string.ascii_letters`/`string.digits`. Local constant imports are resolved
+independently of source file order. Unknown calls and operands remain unsupported;
+this does not make scanning arbitrary application code equivalent to identifying
+all ORM declarations. Configure an explicit inventory of the relevant mappings
+and their bases/mixins when a broad source directory contains unsupported code.
+
 Unresolved imports/bases, dynamically generated mappings, reflection, ambiguous
 metadata, missing sources, and unsupported model syntax keep the drop blocked.
 This is not a general Python interpreter. Treat a source-scope declaration as an

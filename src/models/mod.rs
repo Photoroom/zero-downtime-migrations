@@ -38,6 +38,7 @@ enum Expr {
     Limit,
     Tuple(Vec<Expr>),
     Union(Vec<Expr>),
+    Add(Vec<Expr>),
     Other,
     Missing,
 }
@@ -64,6 +65,7 @@ struct Sources {
     classes: HashMap<String, Class>,
     aliases: HashMap<String, (Expr, String)>,
     unknown: Vec<String>,
+    globals: Vec<(Expr, String, String)>,
 }
 #[derive(Default, Clone)]
 struct Resolved {
@@ -82,6 +84,13 @@ impl ModelIndex {
         let mut sources = Sources::default();
         for file in files {
             sources.read(file);
+        }
+        for (value, module, location) in &sources.globals {
+            if sources.dynamic_global(value, module) {
+                sources.unknown.push(format!(
+                    "{location}: dynamic module expression may construct mappings"
+                ));
+            }
         }
         let mut index = Self {
             mappings: vec![],
@@ -216,7 +225,9 @@ fn contains_limit(value: &Expr) -> bool {
         Expr::Mapping(values) => values
             .iter()
             .any(|(k, v)| contains_limit(k) || contains_limit(v)),
-        Expr::Tuple(values) | Expr::Union(values) => values.iter().any(contains_limit),
+        Expr::Tuple(values) | Expr::Union(values) | Expr::Add(values) => {
+            values.iter().any(contains_limit)
+        }
         _ => false,
     }
 }
@@ -304,6 +315,13 @@ fn expr(node: Node<'_>, source: &str) -> Expr {
                 .is_some_and(|n| text(n, source) == "|") =>
         {
             Expr::Union(named(node).iter().map(|n| expr(*n, source)).collect())
+        }
+        "binary_operator"
+            if node
+                .child_by_field_name("operator")
+                .is_some_and(|n| text(n, source) == "+") =>
+        {
+            Expr::Add(named(node).iter().map(|n| expr(*n, source)).collect())
         }
         "union_type" => Expr::Union(named(node).iter().map(|n| expr(*n, source)).collect()),
         "generic_type" => {
@@ -523,13 +541,15 @@ impl Sources {
                         ) {
                             if left.kind() == "identifier" {
                                 let value = expr(right, &file.source);
-                                if self.dynamic_global(&value, &module) {
-                                    self.unknown.push(format!(
-                                        "{}:{}: dynamic module expression may construct mappings",
+                                self.globals.push((
+                                    value.clone(),
+                                    module.clone(),
+                                    format!(
+                                        "{}:{}",
                                         file.path.display(),
                                         node.start_position().row + 1
-                                    ));
-                                }
+                                    ),
+                                ));
                                 if let Expr::Call(function, _, _) = &value {
                                     let name =
                                         self.symbol(function, &module, 0).unwrap_or_default();
@@ -627,10 +647,29 @@ impl Sources {
             _ => false,
         }
     }
+    fn static_scalar(&self, value: &Expr, module: &str) -> bool {
+        match self.expand(value, module, 0) {
+            Expr::String(_) | Expr::Literal => true,
+            Expr::Name(name) => matches!(name.as_str(), "string.ascii_letters" | "string.digits"),
+            Expr::Add(values) => values.iter().all(|v| self.static_scalar(v, module)),
+            Expr::Call(function, args, kwargs) => {
+                self.symbol(&function, module, 0).as_deref() == Some("len")
+                    && args.len() == 1
+                    && kwargs.is_empty()
+                    && self.static_scalar(&args[0], module)
+            }
+            _ => false,
+        }
+    }
     fn dynamic_global(&self, value: &Expr, module: &str) -> bool {
         match value {
             Expr::Call(function, args, kwargs) => {
                 let name = self.symbol(function, module, 0).unwrap_or_default();
+                if name == "len" {
+                    return args.len() != 1
+                        || !kwargs.is_empty()
+                        || !self.static_scalar(&args[0], module);
+                }
                 let known = matches!(
                     name.as_str(),
                     "sqlalchemy.orm.registry"
@@ -679,6 +718,7 @@ impl Sources {
                 self.dynamic_global(key, module) || self.dynamic_global(value, module)
             }),
             Expr::Subscript(_, values) => values.iter().any(|a| self.dynamic_global(a, module)),
+            Expr::Add(_) => !self.static_scalar(value, module),
             Expr::Other => true,
             _ => false,
         }
@@ -898,6 +938,11 @@ impl Sources {
                             self.expand_bounded(value, module, depth + 1, budget),
                         )
                     })
+                    .collect(),
+            ),
+            Expr::Add(args) => Expr::Add(
+                args.iter()
+                    .map(|a| self.expand_bounded(a, module, depth + 1, budget))
                     .collect(),
             ),
             Expr::Union(args) => Expr::Union(
@@ -1722,6 +1767,61 @@ mod tests {
             )
             .unwrap_err()
             .contains("still mapped"));
+    }
+
+    #[test]
+    fn gateway_module_constants_are_static_in_either_file_order() {
+        let shared = "PREFIX = 'ai_tool_bundle'\nSUFFIX_LENGTH = 21\n";
+        let concrete = "import string\nfrom .constants import PREFIX, SUFFIX_LENGTH\nfrom sqlalchemy.orm import DeclarativeBase, Mapped\nLENGTH = len(PREFIX) + 1 + SUFFIX_LENGTH\n_BASE62 = string.ascii_letters + string.digits\nclass Base(DeclarativeBase):\n    pass\nclass Job(Base):\n    __tablename__ = 'jobs'\n    id: Mapped[int]\n";
+        for reverse in [false, true] {
+            let mut files = vec![
+                ModelFile {
+                    path: "app/constants.py".into(),
+                    orm: ModelOrm::Sqlalchemy,
+                    source: shared.into(),
+                },
+                ModelFile {
+                    path: "app/models.py".into(),
+                    orm: ModelOrm::Sqlalchemy,
+                    source: concrete.into(),
+                },
+            ];
+            if reverse {
+                files.reverse();
+            }
+            let index = ModelIndex::build(files);
+            assert!(index
+                .column_absence(
+                    MigrationFramework::Alembic,
+                    &table("jobs"),
+                    "signed_manifest"
+                )
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn scalar_lookalikes_and_side_effects_keep_coverage_unknown() {
+        for expression in [
+            "len(register_models()) + 1",
+            "len(unknown) + 1",
+            "custom + 1",
+            "string.unknown + string.digits",
+            "len = register_models\nLENGTH = len('prefix')",
+            "len = len\nLENGTH = len('prefix')",
+        ] {
+            let source = format!("import string\nfrom sqlalchemy.orm import DeclarativeBase\nclass Base(DeclarativeBase):\n    pass\nclass Job(Base):\n    __tablename__ = 'jobs'\nLENGTH = {expression}\n");
+            assert!(
+                index(ModelOrm::Sqlalchemy, &source)
+                    .column_absence(
+                        MigrationFramework::Alembic,
+                        &table("jobs"),
+                        "signed_manifest"
+                    )
+                    .is_err(),
+                "{expression}"
+            );
+        }
     }
 
     #[test]
