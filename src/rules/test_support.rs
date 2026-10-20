@@ -27,6 +27,7 @@ pub(crate) fn check_rule<R: Rule>(rule: &R, source: &str) -> Vec<Diagnostic> {
         .expect("test source should parse and extract");
     let config = Config::default();
     let ctx = RuleContext {
+        model_evidence: None,
         config: &config,
         path: Path::new("test.py"),
     };

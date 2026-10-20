@@ -5,6 +5,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::OnceLock;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -15,6 +16,7 @@ use zero_downtime_migrations::diagnostics::{Diagnostic, Severity};
 use zero_downtime_migrations::discovery;
 use zero_downtime_migrations::error::{Error, Result};
 use zero_downtime_migrations::git::{ChangedFile, ChangedKind, DiffSource, GitRepo};
+use zero_downtime_migrations::model_check::ModelEvidence;
 use zero_downtime_migrations::rules::{ChangesetRuleRegistry, RuleRegistry};
 
 /// Zero-Downtime Migrations - A PostgreSQL migration safety linter for Django
@@ -355,6 +357,8 @@ struct DiffContext {
     root: PathBuf,
     files: Vec<ChangedFile>,
     source: DiffSource,
+    base_ref: String,
+    model_evidence: OnceLock<ModelEvidence>,
 }
 
 impl DiffContext {
@@ -368,6 +372,8 @@ impl DiffContext {
             root,
             files,
             source,
+            base_ref: mode.base_ref().to_string(),
+            model_evidence: OnceLock::new(),
         })
     }
 
@@ -640,7 +646,27 @@ fn parse_and_check_file(
     };
 
     // Run rules
-    let diagnostics = rule_registry.check(&migration, config);
+    let evidence = diff
+        .filter(|_| {
+            config.is_rule_enabled("R005")
+                && matches!(
+                    migration.framework,
+                    zero_downtime_migrations::discovery::MigrationFramework::Alembic
+                        | zero_downtime_migrations::discovery::MigrationFramework::Aerich
+                )
+                && migration
+                    .operations
+                    .iter()
+                    .chain(&migration.downgrade_operations)
+                    .any(|op| {
+                        op.op_type == zero_downtime_migrations::ast::OperationType::RemoveField
+                    })
+        })
+        .map(|diff| {
+            diff.model_evidence
+                .get_or_init(|| ModelEvidence::from_git(&diff.repo, &diff.base_ref, diff.source))
+        });
+    let diagnostics = rule_registry.check_with_model_evidence(&migration, config, evidence);
 
     Ok((migration, diagnostics))
 }

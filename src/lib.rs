@@ -10,6 +10,8 @@ pub mod discovery;
 pub mod error;
 mod file_io;
 pub mod git;
+pub mod model_check;
+pub mod models;
 pub mod parser;
 pub mod rules;
 

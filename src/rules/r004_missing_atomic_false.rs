@@ -206,6 +206,7 @@ class Migration(migrations.Migration):
             .check(
                 &migration,
                 &RuleContext {
+                    model_evidence: None,
                     config: &Config::default(),
                     path: Path::new("test.py")
                 }
@@ -225,6 +226,7 @@ class Migration(migrations.Migration):
                 .check(
                     &migration,
                     &RuleContext {
+                        model_evidence: None,
                         config: &Config::default(),
                         path: Path::new("test.py"),
                     },
@@ -245,6 +247,7 @@ class Migration(migrations.Migration):
             .check(
                 &migration,
                 &RuleContext {
+                    model_evidence: None,
                     config: &Config::default(),
                     path: Path::new("test.py"),
                 },
@@ -264,6 +267,7 @@ class Migration(migrations.Migration):
                 .check(
                     &migration,
                     &RuleContext {
+                        model_evidence: None,
                         config: &Config::default(),
                         path: Path::new("test.py"),
                     },
@@ -283,6 +287,7 @@ class Migration(migrations.Migration):
         let diagnostics = R004MissingAtomicFalse.check(
             &migration,
             &RuleContext {
+                model_evidence: None,
                 config: &Config::default(),
                 path: Path::new("test.py"),
             },
@@ -306,6 +311,7 @@ class Migration(migrations.Migration):
                 .check(
                     &migration,
                     &RuleContext {
+                        model_evidence: None,
                         config: &Config::default(),
                         path: Path::new("test.py"),
                     },
@@ -522,6 +528,7 @@ class Migration(migrations.Migration):
         let raw = R004MissingAtomicFalse.check(
             &migration,
             &RuleContext {
+                model_evidence: None,
                 config: &Config::default(),
                 path: Path::new("test.py"),
             },

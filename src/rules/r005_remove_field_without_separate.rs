@@ -1,10 +1,10 @@
 //! R005: RemoveField without SeparateDatabaseAndState
 //!
-//! Detects RemoveField operations not wrapped in SeparateDatabaseAndState.
+//! Require Django state separation or earlier, resolved SQL ORM removal.
 //! Directly removing a field can cause errors if the application still
 //! references the column.
 
-use crate::ast::{Migration, OperationType};
+use crate::ast::{Migration, OperationData, OperationType};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::rules::{Rule, RuleContext};
 
@@ -23,7 +23,8 @@ impl Rule for R005RemoveFieldWithoutSeparate {
     fn description(&self) -> &'static str {
         "RemoveField should be wrapped in SeparateDatabaseAndState to separate \
          the schema change from Django's state. First remove from Django state, \
-         deploy, then drop the column in a separate migration."
+         deploy, then drop the column in a separate migration. SQL frameworks require \
+         absence from resolved ORM mappings at the merge-base and checked revision."
     }
 
     fn severity(&self) -> Severity {
@@ -36,6 +37,19 @@ impl Rule for R005RemoveFieldWithoutSeparate {
         // Top-level only: a RemoveField correctly wrapped in
         // SeparateDatabaseAndState is the safe pattern and must not be flagged.
         for op in migration.top_level_operations_of_type(OperationType::RemoveField) {
+            let mut model_reason = None;
+            if migration.framework.uses_sql_table_identity() {
+                model_reason = Some(match (&op.table_identity, &op.data, ctx.model_evidence) {
+                    (Some(table), OperationData::Field(field), Some(evidence)) => {
+                        match evidence.column_absence(migration.framework, table, &field.field_name) {
+                            Ok(()) => continue,
+                            Err(reason) => reason,
+                        }
+                    }
+                    (None, _, _) => "cannot establish an unambiguous database column identity".into(),
+                    _ => "historical model evidence requires --diff or --diff-staged and model-sources configured in an earlier PR".into(),
+                });
+            }
             diagnostics.push(
                 Diagnostic::new(
                     self.id(),
@@ -49,11 +63,7 @@ impl Rule for R005RemoveFieldWithoutSeparate {
                     ctx.path.to_path_buf(),
                     op.span,
                 )
-                .with_help(if migration.framework.uses_sql_table_identity() {
-                    "Deploy code that no longer reads the column before a later drop-column migration."
-                } else {
-                    "Wrap RemoveField in SeparateDatabaseAndState. First migration removes from state (state_operations), deploy the app, then second migration drops the column (database_operations)."
-                }),
+                .with_help(model_reason.unwrap_or_else(|| "Wrap RemoveField in SeparateDatabaseAndState. First migration removes from state (state_operations), deploy the app, then second migration drops the column (database_operations).".into())),
             );
         }
 

@@ -5,6 +5,7 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
+use super::sql_statements;
 use super::{
     sql_statement_contains_create_index, sql_statement_contains_drop_index, strip_sql_noise,
     ConstraintOperation, ConstraintType, FieldInfo, FieldOperation, IndexOperation, Migration,
@@ -273,8 +274,8 @@ impl<'a> AerichMigrationExtractor<'a> {
         operations: &mut Vec<Operation>,
     ) {
         let cleaned = strip_sql_noise(sql);
-        let statements: Vec<_> = cleaned
-            .split(';')
+        let statements: Vec<_> = sql_statements(&cleaned)
+            .into_iter()
             .map(str::trim)
             .filter(|statement| !statement.is_empty())
             .collect();
@@ -439,7 +440,13 @@ impl<'a> AerichMigrationExtractor<'a> {
         }
 
         if contains_words_in_order(statement, &["DROP", "COLUMN"]) {
-            let column = identifier_after_keyword(statement, "COLUMN")?.name;
+            let fallback_column = identifier_after_keyword(statement, "COLUMN")?.name;
+            let parsed_drop = model_drop_target(statement);
+            let column = parsed_drop
+                .as_ref()
+                .map(|(_, column)| column.clone())
+                .unwrap_or(fallback_column);
+            let model_target = parsed_drop.map(|(table, _)| table);
             return Some(operation(
                 OperationType::RemoveField,
                 OperationData::Field(FieldOperation {
@@ -449,7 +456,9 @@ impl<'a> AerichMigrationExtractor<'a> {
                     new_name: None,
                     field: None,
                 }),
-                Some(table),
+                // A permissive target cannot authorize absence evidence for
+                // compound or otherwise unexamined ALTER actions.
+                model_target,
             ));
         }
         if rename_is_column {
@@ -735,6 +744,52 @@ fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+/// Absence evidence may authorize only a completely understood single drop.
+fn model_drop_target(statement: &str) -> Option<(TableIdentity, String)> {
+    let rest = strip_leading_word(statement.trim(), "ALTER")?.trim_start();
+    let rest = strip_leading_word(rest, "TABLE")?.trim_start();
+    let (first, rest) = model_sql_identifier(rest)?;
+    let rest = rest.trim_start();
+    let (table, rest) = if let Some(rest) = rest.strip_prefix('.') {
+        let (name, rest) = model_sql_identifier(rest.trim_start())?;
+        (
+            TableIdentity {
+                schema: Some(first),
+                name,
+            },
+            rest,
+        )
+    } else {
+        (
+            TableIdentity {
+                schema: None,
+                name: first,
+            },
+            rest,
+        )
+    };
+    let rest = strip_leading_word(rest.trim_start(), "DROP")?.trim_start();
+    let rest = strip_leading_word(rest, "COLUMN")?.trim_start();
+    let (column, rest) = model_sql_identifier(rest)?;
+    let rest = rest.trim();
+    let rest = strip_leading_word(rest, "CASCADE")
+        .or_else(|| strip_leading_word(rest, "RESTRICT"))
+        .unwrap_or(rest);
+    rest.trim().is_empty().then_some((table, column))
+}
+/// PostgreSQL folds unquoted names; ORM metadata string names preserve case.
+fn model_sql_identifier(value: &str) -> Option<(String, &str)> {
+    let (identifier, rest) = parse_identifier_part(value)?;
+    Some((
+        if value.starts_with('"') {
+            identifier
+        } else {
+            identifier.to_ascii_lowercase()
+        },
+        rest,
+    ))
+}
+
 fn parse_identifier(value: &str) -> Option<TableIdentity> {
     let mut value = value.trim_start();
     for keyword in ["IF", "NOT", "EXISTS"] {
@@ -790,6 +845,37 @@ mod tests {
 
     fn migration(source: &str) -> Migration {
         Migration::from_source(Path::new("migrations/models/1_20260823_jobs.py"), source).unwrap()
+    }
+
+    #[test]
+    fn drop_evidence_uses_postgres_identifier_case() {
+        for (sql, schema, table, column) in [
+            (
+                "ALTER TABLE PUBLIC.JOBS DROP COLUMN MANIFEST",
+                "public",
+                "jobs",
+                "manifest",
+            ),
+            (
+                "ALTER TABLE \"Public\".\"Jobs\" DROP COLUMN \"Manifest\"",
+                "Public",
+                "Jobs",
+                "Manifest",
+            ),
+        ] {
+            let source = format!("async def upgrade(db):\n    return '{sql};'\n");
+            let migration = migration(&source);
+            let operation = &migration.operations[0];
+            assert_eq!(
+                operation.table_identity.as_ref().unwrap().schema.as_deref(),
+                Some(schema)
+            );
+            assert_eq!(operation.table_identity.as_ref().unwrap().name, table);
+            let OperationData::Field(field) = &operation.data else {
+                panic!("expected field");
+            };
+            assert_eq!(field.field_name, column);
+        }
     }
 
     #[test]

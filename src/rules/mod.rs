@@ -68,13 +68,19 @@ pub struct RuleContext<'a> {
     pub config: &'a Config,
     /// The file path being linted.
     pub path: &'a Path,
+    /// Optional historical model evidence; absent in standalone scans.
+    pub model_evidence: Option<&'a crate::model_check::ModelEvidence>,
 }
 
 impl<'a> RuleContext<'a> {
     /// Build a context for invoking a rule. Out-of-tree
     /// consumers building custom rules call this in their tests.
     pub fn new(config: &'a Config, path: &'a Path) -> Self {
-        Self { config, path }
+        Self {
+            config,
+            path,
+            model_evidence: None,
+        }
     }
 }
 
@@ -341,19 +347,35 @@ impl RuleRegistry {
 
     /// Run all enabled rules on a migration.
     pub fn check(&self, migration: &Migration, config: &Config) -> Vec<Diagnostic> {
-        let mut diagnostics = self.check_operations(migration, config);
+        self.check_with_model_evidence(migration, config, None)
+    }
+
+    /// Check a migration with evidence from the same immutable Git snapshots.
+    pub fn check_with_model_evidence(
+        &self,
+        migration: &Migration,
+        config: &Config,
+        evidence: Option<&crate::model_check::ModelEvidence>,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = self.check_operations(migration, config, evidence);
         if !migration.downgrade_operations.is_empty() {
             let mut rollback = migration.clone();
             rollback.operations = std::mem::take(&mut rollback.downgrade_operations);
-            diagnostics.extend(self.check_operations(&rollback, config));
+            diagnostics.extend(self.check_operations(&rollback, config, evidence));
         }
         diagnostics
     }
 
-    fn check_operations(&self, migration: &Migration, config: &Config) -> Vec<Diagnostic> {
+    fn check_operations(
+        &self,
+        migration: &Migration,
+        config: &Config,
+        evidence: Option<&crate::model_check::ModelEvidence>,
+    ) -> Vec<Diagnostic> {
         let ctx = RuleContext {
             config,
             path: &migration.path,
+            model_evidence: evidence,
         };
 
         let mut diagnostics = Vec::new();

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.0 - 2026-10-20
+
+### Column retirement checks
+
+- Allow native Alembic and Aerich column drops when the database column is absent
+  from supported SQLAlchemy or Tortoise mappings at both the Git merge-base and
+  checked HEAD/index revision.
+- Add base-established `model-sources` coverage for diff-mode checks. Missing,
+  dynamic, ambiguous, or unsupported mappings remain blocking; standalone scans
+  and Django's existing state-separation checks retain their behavior.
+- Account for physical column aliases, inherited mappings, generated Tortoise
+  columns, and potentially overlapping schemas without executing application code.
+- Preserve quoted SQL identifiers during comment removal and statement splitting
+  so Aerich model checks cannot authorize a drop against a different table.
+
 ## 0.8.0 - 2026-10-01
 
 ### Alembic safety

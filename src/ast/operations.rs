@@ -392,6 +392,22 @@ pub(crate) fn strip_sql_noise(sql: &str) -> String {
     let mut chars = sql.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
+            '"' => {
+                // Comment/string delimiters inside a quoted identifier are
+                // part of its database name, not noise to remove.
+                out.push(c);
+                while let Some(next) = chars.next() {
+                    out.push(next);
+                    if next == '"' {
+                        if chars.peek() == Some(&'"') {
+                            out.push(chars.next().expect("peeked quote"));
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+
             '-' if chars.peek() == Some(&'-') => {
                 chars.next();
                 for nc in chars.by_ref() {
@@ -433,12 +449,37 @@ pub(crate) fn strip_sql_noise(sql: &str) -> String {
     out
 }
 
+/// Split cleaned SQL only at separators outside quoted identifiers.
+/// Single-quoted string contents have already been removed by strip_sql_noise.
+pub(crate) fn sql_statements(sql: &str) -> Vec<&str> {
+    let mut statements = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut chars = sql.char_indices().peekable();
+    while let Some((index, character)) = chars.next() {
+        if character == '"' {
+            if quoted && chars.peek().is_some_and(|(_, next)| *next == '"') {
+                chars.next();
+            } else {
+                quoted = !quoted;
+            }
+        } else if character == ';' && !quoted {
+            statements.push(&sql[start..index]);
+            start = index + 1;
+        }
+    }
+    statements.push(&sql[start..]);
+    statements
+}
+
 /// Strip SQL comments and string literals (via [`strip_sql_noise`]), split the
 /// result into individual statements on `;`, and return whether any statement
 /// satisfies `predicate`. Splitting per-statement matters: a RunSQL mixing a
 /// non-concurrent and a concurrent index would otherwise be judged as a whole.
 pub(crate) fn any_sql_statement(sql: &str, predicate: impl Fn(&str) -> bool) -> bool {
-    strip_sql_noise(sql).split(';').any(predicate)
+    sql_statements(&strip_sql_noise(sql))
+        .into_iter()
+        .any(predicate)
 }
 
 #[cfg(test)]
@@ -449,6 +490,26 @@ mod tests {
         RunSQLOperation {
             sql: sql.to_string(),
             reverse_sql: None,
+        }
+    }
+
+    #[test]
+    fn quoted_semicolons_do_not_split_statements() {
+        let sql = "ALTER TABLE \"jobs; ALTER TABLE clean DROP COLUMN retired;\" DROP COLUMN signed_manifest;";
+        let statements = sql_statements(sql);
+        assert_eq!(statements.len(), 2);
+        assert_eq!(statements[0], sql.trim_end_matches(';'));
+        assert_eq!(statements[1], "");
+    }
+
+    #[test]
+    fn quoted_identifier_contents_are_preserved_during_noise_removal() {
+        for sql in [
+            "ALTER TABLE \"jobs/*x*/\" DROP COLUMN signed_manifest",
+            "ALTER TABLE \"jobs--x\" DROP COLUMN \"a'b'c\"",
+            "ALTER TABLE \"jobs\"\"live\" DROP COLUMN manifest",
+        ] {
+            assert_eq!(strip_sql_noise(sql), sql);
         }
     }
 

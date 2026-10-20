@@ -212,6 +212,7 @@ async def upgrade(db):
         let diagnostics = R018ImplicitDjangoIndex.check(
             &migration,
             &RuleContext {
+                model_evidence: None,
                 config: &config,
                 path: migration.path.as_path(),
             },
