@@ -12,7 +12,7 @@
 //! 4. Default values
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -20,6 +20,44 @@ use crate::error::{Error, Result};
 use crate::file_io::{read_bounded_regular_file, ReadFileError};
 
 const MAX_CONFIG_FILE_SIZE: u64 = 1024 * 1024;
+
+/// ORM whose mappings are checked before native SQL column drops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelOrm {
+    Sqlalchemy,
+    Tortoise,
+}
+
+/// Repository-relative source coverage established before a contraction PR.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelSource {
+    pub orm: ModelOrm,
+    pub paths: Vec<PathBuf>,
+}
+
+impl ModelSource {
+    pub(crate) fn validate(&self) -> std::result::Result<(), String> {
+        if self.paths.is_empty() {
+            return Err("model-sources paths must not be empty".into());
+        }
+        for path in &self.paths {
+            if path.as_os_str().is_empty()
+                || path
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+                || path.to_string_lossy().contains(['*', '?', '[', ']', '\\'])
+            {
+                return Err(format!(
+                    "model-sources path '{}' must be a literal repository-relative path",
+                    path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Configuration for zdm.
 ///
@@ -43,6 +81,8 @@ pub struct Config {
     /// migrations. Files NOT matching these patterns will trigger a
     /// error.
     pub allowed_file_patterns: Vec<String>,
+    /// ORM source coverage (historical settings authorize diff-mode checks).
+    pub model_sources: Vec<ModelSource>,
 }
 
 impl Config {
@@ -168,6 +208,9 @@ impl Config {
                 message: e.to_string(),
             })?;
         }
+        for source in &self.model_sources {
+            source.validate().map_err(Error::cli_usage)?;
+        }
         Ok(())
     }
 
@@ -201,6 +244,9 @@ impl Config {
         }
         if let Some(exclude) = other.exclude {
             self.exclude = exclude;
+        }
+        if let Some(sources) = other.model_sources {
+            self.model_sources = sources;
         }
         if let Some(patterns) = other.allowed_file_patterns {
             self.allowed_file_patterns = patterns;
@@ -299,6 +345,8 @@ pub struct FileConfig {
     pub exclude: Option<Vec<String>>,
     /// For R008: allowed file patterns.
     pub allowed_file_patterns: Option<Vec<String>>,
+    /// ORM source coverage for historical column-removal checks.
+    pub model_sources: Option<Vec<ModelSource>>,
 }
 
 #[cfg(test)]
@@ -863,5 +911,35 @@ line-length = 88
             !anchor_dir_is_trusted(&dir),
             "world-writable anchors must not authorize config walk-up",
         );
+    }
+}
+
+#[cfg(test)]
+mod model_source_tests {
+    use super::*;
+
+    #[test]
+    fn model_source_scope_is_explicit_and_repo_relative() {
+        let cfg: FileConfig = toml::from_str(
+            r#"
+[[model-sources]]
+orm = "sqlalchemy"
+paths = ["app"]
+[[model-sources]]
+orm = "tortoise"
+paths = ["service"]
+"#,
+        )
+        .unwrap();
+        let sources = cfg.model_sources.unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].orm, ModelOrm::Sqlalchemy);
+        for path in ["../app", "/app", "", "app/*.py"] {
+            let scope = ModelSource {
+                orm: ModelOrm::Sqlalchemy,
+                paths: vec![path.into()],
+            };
+            assert!(scope.validate().is_err(), "{path}");
+        }
     }
 }

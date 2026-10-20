@@ -10,6 +10,7 @@
 //! - Detached HEAD states
 //! - Missing origin/main branch
 
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use git2::{DiffOptions, Repository};
@@ -54,6 +55,12 @@ pub struct ChangedFile {
     pub path: PathBuf,
     /// The status of the change.
     pub status: FileStatus,
+}
+
+/// Immutable object IDs and file modes for a historical tree or staged index.
+/// Entries include non-regular files so coverage cannot silently skip symlinks.
+pub(crate) struct GitSnapshot {
+    pub(crate) entries: BTreeMap<PathBuf, (git2::Oid, u32)>,
 }
 
 /// Git repository wrapper for diff operations.
@@ -241,6 +248,77 @@ impl GitRepo {
             )));
         }
         self.read_blob(entry.id(), path, &relative_path, "HEAD")
+    }
+
+    /// Capture the merge-base (when supplied), otherwise HEAD or the index.
+    pub(crate) fn model_snapshot(
+        &self,
+        base_ref: Option<&str>,
+        source: DiffSource,
+    ) -> Result<GitSnapshot> {
+        let mut entries = BTreeMap::new();
+        if base_ref.is_none() && matches!(source, DiffSource::Index) {
+            let index = self
+                .repo
+                .index()
+                .map_err(|e| Error::git_error_msg(format!("Failed to read model index: {e}")))?;
+            for entry in index.iter() {
+                if entry.flags & 0x3000 != 0 {
+                    return Err(Error::git_error_msg(
+                        "Unresolved index conflicts prevent model coverage",
+                    ));
+                }
+                let path = std::str::from_utf8(&entry.path)
+                    .map_err(|_| Error::git_error_msg("Non-UTF-8 path in model snapshot"))?;
+                validate_repo_relative_path(Path::new(path))?;
+                entries.insert(PathBuf::from(path), (entry.id, entry.mode));
+            }
+        } else {
+            let tree = match base_ref {
+                Some(reference) => self.merge_base_tree(reference)?,
+                None => self.head_tree()?,
+            };
+            let mut invalid_path = false;
+            tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+                if entry.kind() == Some(git2::ObjectType::Tree) {
+                    return git2::TreeWalkResult::Ok;
+                }
+                let Ok(name) = entry.name() else {
+                    invalid_path = true;
+                    return git2::TreeWalkResult::Abort;
+                };
+                let path = Path::new(root).join(name);
+                if validate_repo_relative_path(&path).is_err() {
+                    invalid_path = true;
+                    return git2::TreeWalkResult::Abort;
+                }
+                entries.insert(path, (entry.id(), entry.filemode() as u32));
+                git2::TreeWalkResult::Ok
+            })
+            .map_err(|e| Error::git_error_msg(format!("Cannot enumerate model snapshot: {e}")))?;
+            if invalid_path {
+                return Err(Error::git_error_msg("Unsafe path in model snapshot"));
+            }
+        }
+        Ok(GitSnapshot { entries })
+    }
+
+    pub(crate) fn read_snapshot_file(
+        &self,
+        snapshot: &GitSnapshot,
+        path: &Path,
+    ) -> Result<Option<String>> {
+        validate_repo_relative_path(path)?;
+        let Some(&(id, mode)) = snapshot.entries.get(path) else {
+            return Ok(None);
+        };
+        if mode & 0o170000 != 0o100000 {
+            return Err(Error::git_error_msg(format!(
+                "Refusing non-regular model source '{}'",
+                path.display()
+            )));
+        }
+        self.read_blob(id, path, path, "model snapshot").map(Some)
     }
 
     /// Compute and project a diff in one call. The CLI uses
@@ -460,6 +538,42 @@ mod tests {
     ) -> Vec<PathBuf> {
         let files = repo.changed_files_for_source(base_ref, source).unwrap();
         repo.paths_from(&files, kind).unwrap()
+    }
+
+    #[test]
+    fn model_snapshots_freeze_object_ids_and_never_follow_symlinks() {
+        let (temp, repo) = create_test_repo();
+        std::fs::write(temp.path().join("models.py"), "base").unwrap();
+        commit(&temp, "base");
+        let frozen = repo.model_snapshot(Some("HEAD"), DiffSource::Head).unwrap();
+        std::fs::write(temp.path().join("models.py"), "head").unwrap();
+        commit(&temp, "head");
+        assert_eq!(
+            repo.read_snapshot_file(&frozen, Path::new("models.py"))
+                .unwrap()
+                .unwrap(),
+            "base"
+        );
+        let current = repo.model_snapshot(None, DiffSource::Head).unwrap();
+        std::fs::write(temp.path().join("models.py"), "dirty").unwrap();
+        assert_eq!(
+            repo.read_snapshot_file(&current, Path::new("models.py"))
+                .unwrap()
+                .unwrap(),
+            "head"
+        );
+        assert!(repo
+            .read_snapshot_file(&frozen, Path::new("../models.py"))
+            .is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("models.py", temp.path().join("alias.py")).unwrap();
+            commit(&temp, "link");
+            let links = repo.model_snapshot(None, DiffSource::Head).unwrap();
+            assert!(repo
+                .read_snapshot_file(&links, Path::new("alias.py"))
+                .is_err());
+        }
     }
 
     #[test]
