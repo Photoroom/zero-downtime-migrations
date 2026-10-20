@@ -90,7 +90,11 @@ R005; there is no source annotation or per-column exemption configuration.
 
 The SQLAlchemy adapter supports a conservative subset of declarative mappings:
 `Column`, `mapped_column`, bare `Mapped[...]` annotations, explicit database names,
-and statically resolved local aliases, abstract bases, and mixins. Tortoise checks
+and statically resolved local aliases, abstract bases, and mixins. Imported
+`Annotated[T, mapped_column(...)]` aliases also work inside nullable `Mapped`
+annotations (`Alias | None`, `Optional[Alias]`, or `Union[Alias, None]`). Explicit
+`mapped_column` options override the alias template. Ambiguous metadata and
+unresolved aliases keep the drop blocked. Tortoise checks
 ordinary and inherited fields, `source_field`, implicit `id` primary keys, and
 supported foreign-key/one-to-one backing columns. A differently named Python
 attribute can therefore keep a database column in use. Quoted database names and
