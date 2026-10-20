@@ -18,9 +18,9 @@ against the repository declarations. This is a declared coverage boundary, not a
 claim of whole-service Python analysis; unrelated model inventories may still
 need future parser support. This narrows the earlier broad-inventory expectation
 without introducing suppressions or changing R005's evidence model.
-Commit 3: complete; the scan initially missed the unsafe beta drop. All 503
+Commit 3: complete; the scan initially missed the unsafe beta drop. All 505
 tests, Clippy, and formatting pass with configured discovery and parser routing.
-Commit 4: complete; 506 tests, Clippy, and formatting pass. Actual-source
+Commit 4: complete; 508 tests, Clippy, and formatting pass. Actual-source
 Gateway validation passes the earlier-removal case and rejects same-PR removal
 in HEAD and staged modes. No release or downstream change has been made.
 
@@ -164,3 +164,11 @@ If the remote checkout is unavailable, report that unverified acceptance item.
 Do not bump versions, publish a release, merge, execute DDL, or modify Gateway in
 this planning task. Release metadata belongs in the later release change. This
 plan does not claim that tests have run or that the failures are already fixed.
+
+Release review: security, general, architecture, query/performance, and tests
+reviews completed. The parent-relative path bypass was reproduced, fixed in the
+discovery commit, and independently rechecked by general/architecture reviewers.
+Release metadata prepares v0.9.1; publishing follows GitHub CI and merge.
+Windows scan/exclusion root alias handling was corrected and independently
+reviewed after CI found a platform mismatch; cross-platform CI must pass before
+merge and publication.

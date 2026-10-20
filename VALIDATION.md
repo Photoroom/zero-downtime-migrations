@@ -5,7 +5,7 @@ was executed, and no database or application runtime was accessed.
 
 ## Automated regression suite
 
-`cargo test --locked --all-features` passes 506 tests. Formatting and
+`cargo test --locked --all-features` passes 508 tests. Formatting and
 `cargo clippy --locked --all-targets --all-features -- -D warnings` pass.
 Each implementation commit was tested independently, including after amending
 the alias commit with negative tests for unknown explicit column values.
@@ -23,8 +23,10 @@ records and module-operation sources, rather than the shortened fixture base.
 Only proposed ZDM configuration and synthetic static probes are committed in
 these disposable clones. No changes were made to the original Gateway checkout.
 
-Candidate source: `8c87d96` (the final test/docs commit does not change the binary).
-Candidate debug binary SHA-256: `67f2e92339a25c4c7db064a9000283910ef9f1c42cdd499a986183cf03044ffb`.
+Candidate implementation: `a1f3d1e`, with v0.9.1 release metadata.
+Final source checks and actual-source validation were repeated after the
+review-discovered parent-relative path fix.
+Candidate debug binary SHA-256: `8d793eeb5be7c3451ff05f473c27cec29f26929769cc7973077520163fd1eb57`.
 
 | Scenario | Original Gateway revision | Exit: HEAD / staged |
 | --- | --- | --- |
@@ -69,10 +71,10 @@ zdm --diff-staged zdm-validation-base --output-format json
 
 Synthetic local commit receipts:
 
-- earlier-removal: adoption/merge-base `13f12e10e5fcc181f14c3bf3da6c6d9a6940b8ce`;
-  probe HEAD `f72f6bb8a16c6f5a524740397380c701a4dbe86a`.
-- same-pr-removal: adoption/merge-base `41d0fb6f36c34ead21f033e1a677c2a834f46127`;
-  probe HEAD `95f92e470446d02b4aa2b1dad4327c1cd4a6f302`.
+- earlier-removal: adoption/merge-base `4f75469318d716157c3c3a059fef5977cd8e51a9`;
+  probe HEAD `6cafbeadcef77d24a418d140bc4b68aaca8c77a4`.
+- same-pr-removal: adoption/merge-base `13b974f527c286e5e2a4d8923c6ed988ee2f34dd`;
+  probe HEAD `1a1140d0347793021bb772d66607dbb5adfa9d1f`.
 
 The existing v0.9.0 binary fails the safe case with R005 for ordinary module
 expressions and misses the beta revision. The candidate returns no diagnostics
@@ -107,3 +109,27 @@ No temporary migration copy or generated configuration is needed.
 Deployment/replica checks and review of consumers outside declared ORM coverage
 remain operational work. No version bump, release, merge, or Gateway modification
 is included here.
+
+## Independent release review
+
+Security, general, architecture, query/performance, and test reviewers approved.
+General/architecture review found a parent-relative path classification bypass.
+The original discovery commit was amended to normalize paths lexically without
+consulting the worktree. Eight file/directory, root/subdirectory, and custom/beta
+cases reproduced the issue before the fix and pass afterward. General and
+architecture reviewers independently approved the fix; the test reviewer reran
+the final Gateway histories. No review findings remain open.
+
+Windows CI additionally exposed inconsistent long/short/verbatim path spelling
+between filesystem scans and Git roots. Normal scans now normalize both
+locations and accepted scopes, including exclusion roots; immutable diff/index
+classification still never canonicalizes dirty worktree paths. A path-alias
+regression reproduced the mismatch before the fix. General, architecture, and
+test review approved the correction, including anchored exclusions. Native debug
+and release suites and actual-source validation were repeated after the fix.
+
+The remaining Windows subdirectory test failures assumed Unix parent-config
+lookup. Existing non-Unix ownership policy deliberately disables that lookup;
+fixtures now provide current-directory config only on non-Unix platforms.
+Production configuration trust is unchanged. Tests and security reviewers
+independently approved the fixture correction.
