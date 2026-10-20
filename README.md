@@ -30,6 +30,21 @@ with op.get_context().autocommit_block():
 
 The Alembic path is intentionally static: zdm does not import or execute revision scripts, connect to a database, inspect SQLAlchemy models, resolve aliases/custom operations, or evaluate dynamic SQL. `op.execute` is inspected only when its first positional argument or `sqltext` keyword is a string literal; use explicit SQL when you want it checked. Literal `ALTER TABLE ... ADD CONSTRAINT ... CHECK` and validation before its `NOT VALID` addition commits are checked by R017. Separate revisions need separate transactions if applied together.
 
+For custom Alembic revision directories, configure their literal paths relative
+to the repository root (or the current directory outside Git):
+
+```toml
+[tool.zdm]
+alembic-version-locations = ["migrations/versions", "migrations/beta_versions"]
+```
+
+Use `alembic-version-locations = [...]` at the top level in
+`zero-downtime-migrations.toml`. Only direct `.py` children, excluding
+`__init__.py`, are revisions. Explicit locations override the default framework
+layout heuristics in scans, diff/staged selection, parsing, and changeset rules.
+Default Django, Alembic, and Aerich layouts remain recognized. Locations must
+stay inside the repository; globs and parent traversal are rejected.
+
 ### Aerich/Tortoise support
 
 zdm discovers Aerich revisions under `migrations/<app>/<number>_*.py`. Aerich's documented migration contract is a SQL string returned by `upgrade()`; zdm also supports the local-helper `execute_statement(connection, sql)` convention, including callbacks such as `run_with_lock_timeout(db, _upgrade_attempt)`. It maps PostgreSQL `CREATE/DROP INDEX`, `CREATE TABLE`, and `ALTER TABLE` column and constraint statements to the same safety rules used for Django and Alembic.
@@ -90,11 +105,22 @@ R005; there is no source annotation or per-column exemption configuration.
 
 The SQLAlchemy adapter supports a conservative subset of declarative mappings:
 `Column`, `mapped_column`, bare `Mapped[...]` annotations, explicit database names,
-and statically resolved local aliases, abstract bases, and mixins. Tortoise checks
+and statically resolved local aliases, abstract bases, and mixins. Imported
+`Annotated[T, mapped_column(...)]` aliases also work inside nullable `Mapped`
+annotations (`Alias | None`, `Optional[Alias]`, or `Union[Alias, None]`). Explicit
+`mapped_column` options override the alias template. Ambiguous metadata and
+unresolved aliases keep the drop blocked. Tortoise checks
 ordinary and inherited fields, `source_field`, implicit `id` primary keys, and
 supported foreign-key/one-to-one backing columns. A differently named Python
 attribute can therefore keep a database column in use. Quoted database names and
 schema presence must match exactly; an unspecified schema does not imply `public`.
+
+Module constants may use literal scalar addition, `len` of a resolved scalar,
+and `string.ascii_letters`/`string.digits`. Local constant imports are resolved
+independently of source file order. Unknown calls and operands remain unsupported;
+this does not make scanning arbitrary application code equivalent to identifying
+all ORM declarations. Configure an explicit inventory of the relevant mappings
+and their bases/mixins when a broad source directory contains unsupported code.
 
 Unresolved imports/bases, dynamically generated mappings, reflection, ambiguous
 metadata, missing sources, and unsupported model syntax keep the drop blocked.
@@ -104,6 +130,15 @@ For Aerich, evidence can authorize only a fully understood, single-action
 `ALTER TABLE [schema.]table DROP COLUMN column [CASCADE|RESTRICT]`. Compound
 actions, `ONLY`, `IF EXISTS`, and escaped identifier quotes remain blocked.
 Aerich still checks `upgrade()` only; Alembic checks both migration directions.
+
+CI must run diff mode in a checkout with the intended committed HEAD and the
+base history available. Copying only selected migrations to a temporary scan
+directory discards the model evidence. Establish coverage/configuration before
+the contraction PR, and use one owner for migration/application separation:
+keep R008 enabled with explicit `allowed-file-patterns`, or retain an equivalent
+required policy and configure that choice explicitly. Do not generate a modified
+configuration during the check. See [the Gateway regression validation](VALIDATION.md)
+for an actual-source example and its explicit coverage limits.
 
 This check establishes earlier **ORM removal within configured source coverage**.
 It does not prove absence of handwritten SQL, external consumers, or runtime

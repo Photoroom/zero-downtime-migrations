@@ -626,3 +626,135 @@ fn quoted_semicolons_cannot_authorize_a_fictitious_drop() {
     commit(dir.path());
     check(&dir, &["--diff", "origin/main"], false);
 }
+
+const GATEWAY_MODEL: &str = "app/ai_tools/persistence/generation_records.py";
+const GATEWAY_BASE: &str = "app/persistence/models.py";
+const GATEWAY_OPERATIONS: &str = "app/ai_generators/persistence/module_operations.py";
+const GATEWAY_PROVENANCE: &str = include_str!("fixtures/models/gateway/generation_records.py");
+
+fn gateway_config(paths: &str) -> String {
+    config(Orm::SqlAlchemy, paths).replace(
+        "[tool.zdm]\n",
+        "[tool.zdm]\nalembic-version-locations = ['migrations/versions', 'migrations/beta_versions']\n",
+    )
+}
+
+fn gateway_mapped() -> String {
+    format!("{GATEWAY_PROVENANCE}\n    signed_manifest: Mapped[bytes]\n")
+}
+
+fn gateway_repo(earlier_removal: bool) -> TempDir {
+    let dir = repo(Orm::SqlAlchemy, "");
+    write(
+        dir.path(),
+        "pyproject.toml",
+        &gateway_config(&format!(
+            "'{GATEWAY_BASE}', '{GATEWAY_MODEL}', '{GATEWAY_OPERATIONS}'"
+        )),
+    );
+    write(
+        dir.path(),
+        GATEWAY_BASE,
+        include_str!("fixtures/models/gateway/base.py"),
+    );
+    write(
+        dir.path(),
+        GATEWAY_OPERATIONS,
+        include_str!("fixtures/models/gateway/module_operations.py"),
+    );
+    write(dir.path(), GATEWAY_MODEL, &gateway_mapped());
+    commit(dir.path());
+    if earlier_removal {
+        write(dir.path(), GATEWAY_MODEL, GATEWAY_PROVENANCE);
+        commit(dir.path());
+    }
+    git(dir.path(), &["branch", "-f", "origin/main", "HEAD"]);
+    dir
+}
+
+fn gateway_drop(dir: &TempDir, location: &str) {
+    write(dir.path(), &format!("{location}/20261020_0044_drop.py"), "from alembic import op\nrevision = '0044'\ndown_revision = '0043'\ndef upgrade():\n    op.drop_column('ai_tool_generation_provenance', 'signed_manifest')\ndef downgrade():\n    pass\n");
+}
+
+fn gateway_check(dir: &TempDir, staged: bool, allowed: bool) -> Value {
+    if staged {
+        git(dir.path(), &["add", "."]);
+    } else {
+        commit(dir.path());
+    }
+    check(
+        dir,
+        &[
+            if staged { "--diff-staged" } else { "--diff" },
+            "origin/main",
+        ],
+        allowed,
+    )
+}
+
+#[test]
+fn gateway_prior_removal_allows_main_and_beta_drop_in_head_and_index() {
+    for location in ["migrations/versions", "migrations/beta_versions"] {
+        for staged in [false, true] {
+            let dir = gateway_repo(true);
+            gateway_drop(&dir, location);
+            gateway_check(&dir, staged, true);
+            // Neither dirty mapping reintroduction nor a broken worktree base changes evidence.
+            write(dir.path(), GATEWAY_MODEL, &gateway_mapped());
+            write(dir.path(), GATEWAY_BASE, "invalid python !!!");
+            check(
+                &dir,
+                &[
+                    if staged { "--diff-staged" } else { "--diff" },
+                    "origin/main",
+                ],
+                true,
+            );
+        }
+    }
+}
+
+#[test]
+fn gateway_same_pr_and_retained_mappings_are_rejected_by_r005() {
+    for remove_now in [false, true] {
+        for staged in [false, true] {
+            let dir = gateway_repo(false);
+            if remove_now {
+                write(dir.path(), GATEWAY_MODEL, GATEWAY_PROVENANCE);
+            }
+            gateway_drop(&dir, "migrations/beta_versions");
+            let result = gateway_check(&dir, staged, false);
+            assert!(result
+                .to_string()
+                .contains("merge-base: column signed_manifest is still mapped"));
+        }
+    }
+}
+
+#[test]
+fn gateway_reintroduction_duplicate_and_missing_dependency_cannot_authorize_drop() {
+    for scenario in ["reintroduce", "duplicate", "dependency", "new-coverage"] {
+        for staged in [false, true] {
+            let dir = gateway_repo(true);
+            match scenario {
+                "reintroduce" => write(dir.path(), GATEWAY_MODEL, &gateway_mapped()),
+                "duplicate" => write(dir.path(), GATEWAY_MODEL, &format!("{GATEWAY_PROVENANCE}\nclass OtherProvenance(Base):\n    __tablename__ = 'ai_tool_generation_provenance'\n    manifest: Mapped[bytes] = mapped_column('signed_manifest')\n")),
+                "dependency" => { fs::remove_file(dir.path().join(GATEWAY_BASE)).unwrap(); }
+                "new-coverage" => {
+                    write(dir.path(), "pyproject.toml", &gateway_config(&format!("'{GATEWAY_BASE}', '{GATEWAY_OPERATIONS}'")));
+                    commit(dir.path());
+                    git(dir.path(), &["branch", "-f", "origin/main", "HEAD"]);
+                    write(dir.path(), "pyproject.toml", &gateway_config(&format!("'{GATEWAY_BASE}', '{GATEWAY_MODEL}', '{GATEWAY_OPERATIONS}'")));
+                }
+                _ => unreachable!(),
+            }
+            gateway_drop(&dir, "migrations/beta_versions");
+            let result = gateway_check(&dir, staged, false);
+            if scenario == "reintroduce" || scenario == "duplicate" {
+                assert!(result
+                    .to_string()
+                    .contains("checked revision: column signed_manifest is still mapped"));
+            }
+        }
+    }
+}

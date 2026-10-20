@@ -139,10 +139,35 @@ fn run(cli: Cli) -> Result<ExitCode> {
     };
     let diff = diff_mode.map(DiffContext::new).transpose()?;
 
+    let current_dir = std::env::current_dir().map_err(|e| Error::io(e, PathBuf::from(".")))?;
+    let location_root = match &diff {
+        Some(diff) => diff.root.clone(),
+        None if config.alembic_version_locations.is_empty() => current_dir,
+        None => match GitRepo::open(&current_dir) {
+            // Normal scans read the filesystem: use one spelling for Windows
+            // short/verbatim paths (and other aliases) on both sides of matching.
+            // Diff paths stay rooted in Git and never consult dirty worktree paths.
+            Ok(repo) => normalize_existing_path(&repo.root()?)?,
+            Err(_) => normalize_existing_path(&current_dir)?,
+        },
+    };
+    let alembic_locations: Vec<_> = config
+        .alembic_version_locations
+        .iter()
+        .map(|path| location_root.join(path))
+        .collect();
+
     // Discover migration files (with exclude patterns from config)
-    let migration_paths = discover_migrations(&cli.paths, diff.as_ref(), &config.exclude)?;
+    let migration_paths = discover_migrations(
+        &cli.paths,
+        diff.as_ref(),
+        &config.exclude,
+        &alembic_locations,
+    )?;
     let changed_migration_paths = match diff.as_ref() {
-        Some(diff) => discover_migration_changes(diff, &cli.paths, &config.exclude)?,
+        Some(diff) => {
+            discover_migration_changes(diff, &cli.paths, &config.exclude, &alembic_locations)?
+        }
         None => Vec::new(),
     };
 
@@ -159,7 +184,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let rule_registry = RuleRegistry::new();
 
     for path in &migration_paths {
-        match parse_and_check_file(path, &rule_registry, &config, diff.as_ref()) {
+        match parse_and_check_file(
+            path,
+            &rule_registry,
+            &config,
+            diff.as_ref(),
+            &alembic_locations,
+        ) {
             Ok((migration, diagnostics)) => {
                 all_diagnostics.extend(diagnostics);
                 if diff.is_some() {
@@ -179,7 +210,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
     // Run changeset rules if in diff mode
     if let Some(diff) = diff.as_ref() {
-        let other_files = discover_non_migration_files(diff, &cli.paths, &config.exclude)?;
+        let other_files =
+            discover_non_migration_files(diff, &cli.paths, &config.exclude, &alembic_locations)?;
         let changeset_registry = ChangesetRuleRegistry::new();
         let migration_refs: Vec<&Migration> = migrations.iter().collect();
         let migration_path_refs: Vec<&Path> = changed_migration_paths
@@ -389,9 +421,14 @@ fn discover_migrations(
     paths: &[PathBuf],
     diff: Option<&DiffContext>,
     exclude_patterns: &[String],
+    alembic_locations: &[PathBuf],
 ) -> Result<Vec<PathBuf>> {
     if let Some(diff) = diff {
-        let migrations = diff.repo.paths_from(&diff.files, ChangedKind::Migrations)?;
+        let migrations = diff.repo.paths_from_with_locations(
+            &diff.files,
+            ChangedKind::Migrations,
+            alembic_locations,
+        )?;
         let migrations = filter_paths_by_cli_scope(migrations, paths, &diff.root)?;
 
         // Apply exclude patterns to diff mode as well
@@ -446,14 +483,24 @@ fn discover_migrations(
                                 discovery::path_matches_any_glob(&normalized, &roots, &patterns)
                             });
                     if !excluded {
-                        all_migrations.push(path.clone());
+                        all_migrations.push(if alembic_locations.is_empty() {
+                            path.clone()
+                        } else {
+                            normalize_existing_path(path)?
+                        });
                     }
                 }
             } else if is_directory {
                 // For directories, use pattern-based discovery with exclude
-                let migrations = discovery::discover_migrations_with_exclude(
-                    std::slice::from_ref(path),
+                let scan_path = if alembic_locations.is_empty() {
+                    path.clone()
+                } else {
+                    normalize_existing_path(path)?
+                };
+                let migrations = discovery::discover_migrations_with_locations(
+                    std::slice::from_ref(&scan_path),
                     exclude_patterns,
+                    alembic_locations,
                 )?;
                 all_migrations.extend(migrations);
             } else {
@@ -471,8 +518,11 @@ fn discover_migration_changes(
     diff: &DiffContext,
     paths: &[PathBuf],
     exclude_patterns: &[String],
+    alembic_locations: &[PathBuf],
 ) -> Result<Vec<PathBuf>> {
-    let touched = diff.repo.migration_touches_from(&diff.files)?;
+    let touched = diff
+        .repo
+        .migration_touches_with_locations(&diff.files, alembic_locations)?;
     let touched = filter_paths_by_cli_scope(touched, paths, &diff.root)?;
     if touched.is_empty() {
         return Ok(Vec::new());
@@ -594,10 +644,13 @@ fn discover_non_migration_files(
     diff: &DiffContext,
     paths: &[PathBuf],
     exclude_patterns: &[String],
+    alembic_locations: &[PathBuf],
 ) -> Result<Vec<PathBuf>> {
-    let absolute = diff
-        .repo
-        .paths_from(&diff.files, ChangedKind::NonMigrations)?;
+    let absolute = diff.repo.paths_from_with_locations(
+        &diff.files,
+        ChangedKind::NonMigrations,
+        alembic_locations,
+    )?;
     if absolute.is_empty() {
         return Ok(Vec::new());
     }
@@ -631,18 +684,21 @@ fn parse_and_check_file(
     rule_registry: &RuleRegistry,
     config: &Config,
     diff: Option<&DiffContext>,
+    alembic_locations: &[PathBuf],
 ) -> Result<(Migration, Vec<Diagnostic>)> {
     // Migration::from_source / from_path bundle size check +
     // parse + extract, returning a path-bearing error on syntax
     // failure either way. Staged content comes from the git
     // index blob (which has its own MAX_FILE_SIZE enforced by
     // GitRepo); disk content goes through parse_file.
+    let framework = discovery::migration_framework_with_locations(path, alembic_locations)
+        .unwrap_or(discovery::MigrationFramework::Django);
     let migration = match diff {
         Some(diff) => {
             let source = diff.read_file(path)?;
-            Migration::from_source(path, &source)?
+            Migration::from_source_with_framework(path, &source, framework)?
         }
-        _ => Migration::from_path(path)?,
+        _ => Migration::from_path_with_framework(path, framework)?,
     };
 
     // Run rules

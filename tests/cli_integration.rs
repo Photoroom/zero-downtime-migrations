@@ -1878,3 +1878,223 @@ class Migration(migrations.Migration):
         );
     }
 }
+
+#[test]
+fn configured_alembic_locations_select_the_parser_in_scan_and_diff_modes() {
+    for file_name in ["20261020_0044_probe.py", "custom_revision.py"] {
+        for mode in ["scan", "file", "head", "staged", "subdirectory"] {
+            let dir = TempDir::new().unwrap();
+            git_init(dir.path());
+            fs::write(dir.path().join("pyproject.toml"), "[tool.zdm]\nalembic-version-locations = ['migrations/beta_versions', 'custom/revisions']\n").unwrap();
+            fs::create_dir_all(dir.path().join("migrations/beta_versions")).unwrap();
+            fs::create_dir_all(dir.path().join("custom/revisions")).unwrap();
+            git_commit_all(dir.path(), "config");
+            set_base_to_head(dir.path());
+            let revision = format!("migrations/beta_versions/{file_name}");
+            let source = "from alembic import op\ndef upgrade():\n    op.drop_column('jobs', 'legacy')\ndef downgrade():\n    pass\n";
+            fs::write(dir.path().join(&revision), source).unwrap();
+            fs::write(dir.path().join("custom/revisions/custom.py"), source).unwrap();
+            fs::write(
+                dir.path().join("custom/revisions/__init__.py"),
+                "invalid python !!!",
+            )
+            .unwrap();
+            let mut cmd = zdm();
+            cmd.current_dir(dir.path())
+                .args(["--select", "R005", "--output-format", "json"]);
+            match mode {
+                "head" => {
+                    git_commit_all(dir.path(), "drop");
+                    cmd.args(["--diff", "origin/main"]);
+                }
+                "staged" => {
+                    git_stage(dir.path(), ".");
+                    fs::write(dir.path().join(&revision), "invalid python !!!").unwrap();
+                    cmd.args(["--diff-staged", "origin/main"]);
+                }
+                "file" => {
+                    cmd.arg(&revision);
+                }
+                "subdirectory" => {
+                    // Non-Unix deliberately disables parent-config lookup until
+                    // repository ownership/ACL checks are available.
+                    #[cfg(not(unix))]
+                    fs::copy(
+                        dir.path().join("pyproject.toml"),
+                        dir.path().join("migrations/pyproject.toml"),
+                    )
+                    .unwrap();
+                    cmd.current_dir(dir.path().join("migrations"));
+                }
+                _ => {}
+            }
+            let output = cmd.output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{mode}/{file_name}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let json = parse_json_output(&output.stdout);
+            assert!(diagnostics(&json).iter().all(|d| d["rule_id"] == "R005"));
+            assert_eq!(
+                diagnostics(&json).len(),
+                if matches!(mode, "file" | "subdirectory") {
+                    1
+                } else {
+                    2
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn custom_alembic_deleted_paths_still_enforce_file_separation() {
+    let dir = TempDir::new().unwrap();
+    git_init(dir.path());
+    fs::write(
+        dir.path().join("zero-downtime-migrations.toml"),
+        "alembic-version-locations = ['custom/revisions']\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("custom/revisions")).unwrap();
+    fs::write(
+        dir.path().join("custom/revisions/old.py"),
+        "from alembic import op\ndef upgrade():\n    pass\n",
+    )
+    .unwrap();
+    git_commit_all(dir.path(), "base");
+    set_base_to_head(dir.path());
+    fs::remove_file(dir.path().join("custom/revisions/old.py")).unwrap();
+    fs::write(dir.path().join("application.py"), "changed = True\n").unwrap();
+    git_commit_all(dir.path(), "delete revision with app change");
+    zdm()
+        .current_dir(dir.path())
+        .args(["--diff", "origin/main", "--select", "R008"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("R008"));
+}
+
+#[test]
+fn custom_alembic_revisions_are_not_application_changes_and_honor_excludes() {
+    let dir = TempDir::new().unwrap();
+    git_init(dir.path());
+    fs::write(
+        dir.path().join("zero-downtime-migrations.toml"),
+        "alembic-version-locations = ['custom/revisions']\nexclude = ['custom/revisions/excluded.py']\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("custom/revisions")).unwrap();
+    git_commit_all(dir.path(), "config");
+    set_base_to_head(dir.path());
+    fs::write(
+        dir.path().join("custom/revisions/excluded.py"),
+        "invalid python !!!",
+    )
+    .unwrap();
+    fs::write(dir.path().join("custom/revisions/checked.py"), "from alembic import op\ndef upgrade():\n    pass\ndef downgrade():\n    op.drop_column('jobs', 'old')\n").unwrap();
+    git_commit_all(dir.path(), "revisions");
+    zdm()
+        .current_dir(dir.path())
+        .args(["custom/revisions", "--select", "R005"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("R005"));
+    zdm()
+        .current_dir(dir.path())
+        .args(["custom/revisions/excluded.py", "--select", "R005"])
+        .assert()
+        .success();
+    zdm()
+        .current_dir(dir.path())
+        .args(["--diff", "origin/main", "--select", "R008"])
+        .assert()
+        .success();
+    zdm()
+        .current_dir(dir.path())
+        .args(["--diff", "origin/main", "--select", "R005"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("R005"));
+}
+
+#[test]
+fn configured_alembic_parent_relative_scopes_cannot_bypass_checks() {
+    for location in ["custom/revisions", "migrations/beta_versions"] {
+        for from_subdir in [false, true] {
+            for explicit_file in [false, true] {
+                let dir = TempDir::new().unwrap();
+                git_init(dir.path());
+                fs::write(
+                    dir.path().join("pyproject.toml"),
+                    format!("[tool.zdm]\nalembic-version-locations = ['{location}']\n"),
+                )
+                .unwrap();
+                fs::create_dir_all(dir.path().join(location)).unwrap();
+                fs::create_dir_all(dir.path().join("subdir")).unwrap();
+                #[cfg(not(unix))]
+                if from_subdir {
+                    fs::copy(
+                        dir.path().join("pyproject.toml"),
+                        dir.path().join("subdir/pyproject.toml"),
+                    )
+                    .unwrap();
+                }
+                fs::write(
+                    dir.path().join(location).join("drop.py"),
+                    "from alembic import op\ndef upgrade():\n    op.drop_column('jobs', 'old')\n",
+                )
+                .unwrap();
+                let mut scope = if from_subdir {
+                    format!("../{location}")
+                } else {
+                    format!("subdir/../{location}")
+                };
+                if explicit_file {
+                    scope.push_str("/drop.py");
+                }
+                zdm()
+                    .current_dir(if from_subdir {
+                        dir.path().join("subdir")
+                    } else {
+                        dir.path().to_path_buf()
+                    })
+                    .args([&scope, "--select", "R005"])
+                    .assert()
+                    .code(1)
+                    .stdout(predicate::str::contains("R005"));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_alembic_scan_path_aliases_match_the_repository_root() {
+    use std::os::unix::fs::symlink;
+    let dir = TempDir::new().unwrap();
+    git_init(dir.path());
+    fs::write(
+        dir.path().join("pyproject.toml"),
+        "[tool.zdm]\nalembic-version-locations = ['actual/custom/revisions']\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("actual/custom/revisions")).unwrap();
+    fs::write(
+        dir.path().join("actual/custom/revisions/drop.py"),
+        "from alembic import op\ndef upgrade():\n    op.drop_column('jobs', 'old')\n",
+    )
+    .unwrap();
+    symlink(dir.path().join("actual"), dir.path().join("alias")).unwrap();
+    for scope in ["alias/custom/revisions", "alias/custom/revisions/drop.py"] {
+        zdm()
+            .current_dir(dir.path())
+            .args([scope, "--select", "R005"])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains("R005"));
+    }
+}

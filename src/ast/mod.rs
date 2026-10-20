@@ -63,8 +63,19 @@ impl Migration {
     /// size cap, parses with tree-sitter, and returns the typed
     /// `Migration`. The recommended entry point for programmatic consumers.
     pub fn from_path(path: &std::path::Path) -> crate::error::Result<Self> {
+        Self::from_path_with_framework(
+            path,
+            migration_framework(path).unwrap_or(MigrationFramework::Django),
+        )
+    }
+
+    /// Parse a revision using an explicitly selected framework.
+    pub fn from_path_with_framework(
+        path: &std::path::Path,
+        framework: MigrationFramework,
+    ) -> crate::error::Result<Self> {
         let parsed = crate::parser::ParsedMigration::parse_file(path)?;
-        Self::from_parsed(path, &parsed)
+        Self::from_parsed(path, &parsed, framework)
     }
 
     /// Extract a migration from in-memory source. Same pipeline
@@ -73,6 +84,19 @@ impl Migration {
     /// git index blob) and for unit-testing custom rules with a
     /// string literal.
     pub fn from_source(path: &std::path::Path, source: &str) -> crate::error::Result<Self> {
+        Self::from_source_with_framework(
+            path,
+            source,
+            migration_framework(path).unwrap_or(MigrationFramework::Django),
+        )
+    }
+
+    /// Parse immutable revision source using an explicitly selected framework.
+    pub fn from_source_with_framework(
+        path: &std::path::Path,
+        source: &str,
+        framework: MigrationFramework,
+    ) -> crate::error::Result<Self> {
         crate::parser::check_size(path, source.len() as u64)?;
         let parsed = crate::parser::ParsedMigration::parse(source)
             .map_err(|e| crate::error::Error::parse(path.to_path_buf(), e.to_string()))?;
@@ -82,18 +106,19 @@ impl Migration {
                 "syntax error in migration file".to_string(),
             ));
         }
-        Self::from_parsed(path, &parsed)
+        Self::from_parsed(path, &parsed, framework)
     }
 
     fn from_parsed(
         path: &std::path::Path,
         parsed: &crate::parser::ParsedMigration,
+        framework: MigrationFramework,
     ) -> crate::error::Result<Self> {
-        let extracted = match migration_framework(path) {
-            Some(MigrationFramework::Alembic) => {
+        let extracted = match framework {
+            MigrationFramework::Alembic => {
                 alembic::AlembicMigrationExtractor::new(parsed).extract(path)
             }
-            Some(MigrationFramework::Aerich) => {
+            MigrationFramework::Aerich => {
                 aerich::AerichMigrationExtractor::new(parsed).extract(path)
             }
             _ => MigrationExtractor::new(parsed).extract(path),

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.1 - 2026-10-20
+
+### Gateway compatibility
+
+- Resolve nullable imported `Annotated` column aliases, including explicit name overrides, while retaining conservative handling of unknown expressions.
+- Resolve ordinary scalar module constants independently of source-file order.
+- Configure custom Alembic revision directories with `alembic-version-locations`, consistently across scans, diff/staged mode, parsing, and changeset rules.
+- Normalize parent-relative CLI paths and filesystem root aliases (including Windows path spellings) so custom revision directories cannot silently bypass Alembic checks; preserve anchored exclusions.
+- Cover Gateway's separately staged column contraction with real-source fixtures and immutable-history validation. Explicit model-source coverage remains required; broad Gateway application scans remain unsupported.
+
 ## 0.9.0 - 2026-10-20
 
 ### Column retirement checks

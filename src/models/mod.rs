@@ -34,10 +34,13 @@ enum Expr {
     Dict(HashMap<String, Expr>),
     Mapping(Vec<(Expr, Expr)>),
     Literal,
+    None,
     Limit,
     Tuple(Vec<Expr>),
     Union(Vec<Expr>),
+    Add(Vec<Expr>),
     Other,
+    Missing,
 }
 #[derive(Clone)]
 struct Attribute {
@@ -62,6 +65,7 @@ struct Sources {
     classes: HashMap<String, Class>,
     aliases: HashMap<String, (Expr, String)>,
     unknown: Vec<String>,
+    globals: Vec<(Expr, String, String)>,
 }
 #[derive(Default, Clone)]
 struct Resolved {
@@ -80,6 +84,13 @@ impl ModelIndex {
         let mut sources = Sources::default();
         for file in files {
             sources.read(file);
+        }
+        for (value, module, location) in &sources.globals {
+            if sources.dynamic_global(value, module) {
+                sources.unknown.push(format!(
+                    "{location}: dynamic module expression may construct mappings"
+                ));
+            }
         }
         let mut index = Self {
             mappings: vec![],
@@ -179,6 +190,28 @@ impl ModelIndex {
     }
 }
 
+// SQLAlchemy unwraps a single type plus None before inspecting Annotated metadata.
+fn non_nullable_type(value: &Expr) -> &Expr {
+    let args = match value {
+        Expr::Union(args) => args,
+        Expr::Subscript(inner, args)
+            if matches!(&**inner, Expr::Name(name) if name == "typing.Optional")
+                && args.len() == 1 =>
+        {
+            return non_nullable_type(&args[0])
+        }
+        Expr::Subscript(inner, args) if matches!(&**inner, Expr::Name(name) if name == "typing.Union") => {
+            args
+        }
+        _ => return value,
+    };
+    let mut types = args.iter().filter(|arg| !matches!(arg, Expr::None));
+    match (types.next(), types.next()) {
+        (Some(single), None) => non_nullable_type(single),
+        _ => value,
+    }
+}
+
 fn contains_limit(value: &Expr) -> bool {
     match value {
         Expr::Limit => true,
@@ -192,7 +225,9 @@ fn contains_limit(value: &Expr) -> bool {
         Expr::Mapping(values) => values
             .iter()
             .any(|(k, v)| contains_limit(k) || contains_limit(v)),
-        Expr::Tuple(values) | Expr::Union(values) => values.iter().any(contains_limit),
+        Expr::Tuple(values) | Expr::Union(values) | Expr::Add(values) => {
+            values.iter().any(contains_limit)
+        }
         _ => false,
     }
 }
@@ -245,7 +280,8 @@ fn expr(node: Node<'_>, source: &str) -> Expr {
                 Expr::Other
             }
         }
-        "integer" | "float" | "none" => Expr::Literal,
+        "integer" | "float" => Expr::Literal,
+        "none" => Expr::None,
         "tuple" | "list" => Expr::Tuple(named(node).iter().map(|n| expr(*n, source)).collect()),
         "true" => Expr::Bool(true),
         "false" => Expr::Bool(false),
@@ -279,6 +315,13 @@ fn expr(node: Node<'_>, source: &str) -> Expr {
                 .is_some_and(|n| text(n, source) == "|") =>
         {
             Expr::Union(named(node).iter().map(|n| expr(*n, source)).collect())
+        }
+        "binary_operator"
+            if node
+                .child_by_field_name("operator")
+                .is_some_and(|n| text(n, source) == "+") =>
+        {
+            Expr::Add(named(node).iter().map(|n| expr(*n, source)).collect())
         }
         "union_type" => Expr::Union(named(node).iter().map(|n| expr(*n, source)).collect()),
         "generic_type" => {
@@ -364,7 +407,7 @@ fn attrs(body: Node<'_>, source: &str, path: &std::path::Path) -> (Vec<Attribute
                             name: text(left, source).into(),
                             value: assignment
                                 .child_by_field_name("right")
-                                .map_or(Expr::Other, |n| expr(n, source)),
+                                .map_or(Expr::Missing, |n| expr(n, source)),
                             annotation: assignment
                                 .child_by_field_name("type")
                                 .map_or(Expr::Other, |n| expr(n, source)),
@@ -498,13 +541,15 @@ impl Sources {
                         ) {
                             if left.kind() == "identifier" {
                                 let value = expr(right, &file.source);
-                                if self.dynamic_global(&value, &module) {
-                                    self.unknown.push(format!(
-                                        "{}:{}: dynamic module expression may construct mappings",
+                                self.globals.push((
+                                    value.clone(),
+                                    module.clone(),
+                                    format!(
+                                        "{}:{}",
                                         file.path.display(),
                                         node.start_position().row + 1
-                                    ));
-                                }
+                                    ),
+                                ));
                                 if let Expr::Call(function, _, _) = &value {
                                     let name =
                                         self.symbol(function, &module, 0).unwrap_or_default();
@@ -602,10 +647,29 @@ impl Sources {
             _ => false,
         }
     }
+    fn static_scalar(&self, value: &Expr, module: &str) -> bool {
+        match self.expand(value, module, 0) {
+            Expr::String(_) | Expr::Literal => true,
+            Expr::Name(name) => matches!(name.as_str(), "string.ascii_letters" | "string.digits"),
+            Expr::Add(values) => values.iter().all(|v| self.static_scalar(v, module)),
+            Expr::Call(function, args, kwargs) => {
+                self.symbol(&function, module, 0).as_deref() == Some("len")
+                    && args.len() == 1
+                    && kwargs.is_empty()
+                    && self.static_scalar(&args[0], module)
+            }
+            _ => false,
+        }
+    }
     fn dynamic_global(&self, value: &Expr, module: &str) -> bool {
         match value {
             Expr::Call(function, args, kwargs) => {
                 let name = self.symbol(function, module, 0).unwrap_or_default();
+                if name == "len" {
+                    return args.len() != 1
+                        || !kwargs.is_empty()
+                        || !self.static_scalar(&args[0], module);
+                }
                 let known = matches!(
                     name.as_str(),
                     "sqlalchemy.orm.registry"
@@ -654,6 +718,7 @@ impl Sources {
                 self.dynamic_global(key, module) || self.dynamic_global(value, module)
             }),
             Expr::Subscript(_, values) => values.iter().any(|a| self.dynamic_global(a, module)),
+            Expr::Add(_) => !self.static_scalar(value, module),
             Expr::Other => true,
             _ => false,
         }
@@ -840,10 +905,13 @@ impl Sources {
                 {
                     return self.expand_bounded(alias, origin, depth + 1, budget);
                 }
-                Expr::Name(
-                    self.symbol(value, module, 0)
-                        .unwrap_or_else(|| name.clone()),
-                )
+                let symbol = self
+                    .symbol(value, module, 0)
+                    .unwrap_or_else(|| name.clone());
+                if let Some((alias, origin)) = self.aliases.get(&symbol) {
+                    return self.expand_bounded(alias, origin, depth + 1, budget);
+                }
+                Expr::Name(symbol)
             }
             Expr::Call(function, args, kwargs) => Expr::Call(
                 Box::new(self.expand_bounded(function, module, depth + 1, budget)),
@@ -870,6 +938,11 @@ impl Sources {
                             self.expand_bounded(value, module, depth + 1, budget),
                         )
                     })
+                    .collect(),
+            ),
+            Expr::Add(args) => Expr::Add(
+                args.iter()
+                    .map(|a| self.expand_bounded(a, module, depth + 1, budget))
                     .collect(),
             ),
             Expr::Union(args) => Expr::Union(
@@ -1211,7 +1284,7 @@ impl Sources {
                 !supported || args.iter().any(|arg| self.unknown_type(arg, module, true))
             }
             Expr::Union(args) => args.iter().any(|arg| self.unknown_type(arg, module, true)),
-            Expr::Literal => false,
+            Expr::Literal | Expr::None => false,
             _ => true,
         }
     }
@@ -1253,44 +1326,41 @@ impl Sources {
                 return;
             }
         }
+        let mut value = self.expand(&attr.value, &class.module, 0);
+        let mut annotated_column = None;
         if class.orm == ModelOrm::Sqlalchemy {
             if let Expr::Subscript(wrapper, args) = &annotation {
                 if self.symbol(wrapper, &class.module, 0).as_deref()
                     == Some("sqlalchemy.orm.Mapped")
                 {
-                    if args
-                        .iter()
-                        .any(|argument| self.unknown_type(argument, &class.module, false))
-                    {
+                    if args.len() != 1 {
                         result
                             .unknown
                             .push(format!("{}: unresolved mapped type alias", attr.location));
                     }
-                    for arg in args {
-                        if let Expr::Subscript(inner, metadata) = arg {
+                    for argument in args {
+                        let argument = non_nullable_type(argument);
+                        if self.unknown_type(argument, &class.module, false) {
+                            result
+                                .unknown
+                                .push(format!("{}: unresolved mapped type alias", attr.location));
+                        }
+                        if let Expr::Subscript(inner, metadata) = argument {
                             if matches!(
                                 self.symbol(inner, &class.module, 0).as_deref(),
                                 Some("typing.Annotated" | "typing_extensions.Annotated")
                             ) {
                                 for item in metadata.iter().skip(1) {
-                                    if let Expr::Call(function, _, _) = item {
-                                        if self.symbol(function, &class.module, 0).as_deref()
-                                            == Some("sqlalchemy.orm.mapped_column")
-                                        {
-                                            let field = Attribute {
-                                                name: attr.name.clone(),
-                                                value: item.clone(),
-                                                annotation: Expr::Other,
-                                                location: attr.location.clone(),
-                                            };
-                                            self.field(class, &field, result);
-                                            continue;
-                                        }
+                                    if matches!(item, Expr::Call(function, _, _) if self.symbol(function, &class.module, 0).as_deref() == Some("sqlalchemy.orm.mapped_column"))
+                                        && annotated_column.is_none()
+                                    {
+                                        annotated_column = Some(item.clone());
+                                    } else {
+                                        result.unknown.push(format!(
+                                            "{}: unresolved Annotated metadata",
+                                            attr.location
+                                        ));
                                     }
-                                    result.unknown.push(format!(
-                                        "{}: unresolved Annotated metadata",
-                                        attr.location
-                                    ));
                                 }
                             }
                         }
@@ -1298,7 +1368,51 @@ impl Sources {
                 }
             }
         }
-        let value = self.expand(&attr.value, &class.module, 0);
+        if let Some(Expr::Call(_, alias_args, alias_kwargs)) = &annotated_column {
+            match &mut value {
+                Expr::Missing => value = annotated_column.unwrap(),
+                Expr::Call(function, args, kwargs)
+                    if self.symbol(function, &class.module, 0).as_deref()
+                        == Some("sqlalchemy.orm.mapped_column") =>
+                {
+                    // Explicit options override the Annotated template; unnamed columns inherit its name.
+                    if !matches!(args.first(), Some(Expr::String(_))) {
+                        if args.first().is_some_and(|first| {
+                            let name = match first {
+                                Expr::Name(name) => Some(name.as_str()),
+                                Expr::Call(function, _, _) => {
+                                    if let Expr::Name(name) = &**function {
+                                        Some(name.as_str())
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            };
+                            !name.is_some_and(|name| name.starts_with("sqlalchemy."))
+                        }) {
+                            result.unknown.push(format!(
+                                "{}: unresolved explicit column name/type",
+                                attr.location
+                            ));
+                        }
+                        if let Some(Expr::String(name)) = alias_args.first() {
+                            args.insert(0, Expr::String(name.clone()));
+                        }
+                    }
+                    for (key, option) in alias_kwargs {
+                        if key == "name" && matches!(args.first(), Some(Expr::String(_))) {
+                            continue;
+                        }
+                        kwargs.entry(key.clone()).or_insert_with(|| option.clone());
+                    }
+                }
+                _ => result.unknown.push(format!(
+                    "{}: unresolved explicit Annotated column value",
+                    attr.location
+                )),
+            }
+        }
         if contains_limit(&value) {
             result.identity_unknown = true;
             result
@@ -1470,47 +1584,9 @@ impl Sources {
         }
         if class.orm == ModelOrm::Sqlalchemy {
             let annotation = self.expand(&attr.annotation, &class.module, 0);
-            if let Expr::Subscript(wrapper, arguments) = &annotation {
+            if let Expr::Subscript(wrapper, _) = &annotation {
                 let name = self.symbol(wrapper, &class.module, 0).unwrap_or_default();
                 if name == "sqlalchemy.orm.Mapped" {
-                    if arguments
-                        .iter()
-                        .any(|argument| self.unknown_type(argument, &class.module, false))
-                    {
-                        result
-                            .unknown
-                            .push(format!("{}: unresolved mapped type alias", attr.location));
-                    }
-                    for argument in arguments {
-                        let expanded = self.expand(argument, &class.module, 0);
-                        if let Expr::Subscript(inner, metadata) = expanded {
-                            if matches!(
-                                self.symbol(&inner, &class.module, 0).as_deref(),
-                                Some("typing.Annotated" | "typing_extensions.Annotated")
-                            ) {
-                                for item in metadata.iter().skip(1) {
-                                    if let Expr::Call(function, _, _) = item {
-                                        if self.symbol(function, &class.module, 0).as_deref()
-                                            == Some("sqlalchemy.orm.mapped_column")
-                                        {
-                                            let field = Attribute {
-                                                name: attr.name.clone(),
-                                                value: item.clone(),
-                                                annotation: Expr::Other,
-                                                location: attr.location.clone(),
-                                            };
-                                            self.field(class, &field, result);
-                                            return;
-                                        }
-                                    }
-                                    result.unknown.push(format!(
-                                        "{}: unresolved Annotated metadata",
-                                        attr.location
-                                    ));
-                                }
-                            }
-                        }
-                    }
                     result
                         .columns
                         .insert(attr.name.clone(), attr.location.clone());
@@ -1522,7 +1598,10 @@ impl Sources {
             }
         }
         // Literals are plain application constants; unknown descriptors are not.
-        if !matches!(value, Expr::String(_) | Expr::Bool(_) | Expr::Literal) {
+        if !matches!(
+            value,
+            Expr::String(_) | Expr::Bool(_) | Expr::Literal | Expr::None
+        ) {
             result
                 .unknown
                 .push(format!("{}: unresolved field annotation", attr.location));
@@ -1574,6 +1653,177 @@ mod tests {
                 .is_err());
         }
     }
+    #[test]
+    fn nullable_imported_annotated_aliases_resolve_names() {
+        for annotation in [
+            "Alias",
+            "Alias | None",
+            "None | Alias",
+            "Optional[Alias]",
+            "Union[Alias, None]",
+            "shared.Alias | None",
+        ] {
+            for assignment in [
+                "",
+                " = mapped_column()",
+                " = mapped_column(name='override')",
+            ] {
+                let sources = vec![
+                    ModelFile { path: "app/shared.py".into(), orm: ModelOrm::Sqlalchemy,
+                        source: "from typing import Annotated\nfrom sqlalchemy import BigInteger\nfrom sqlalchemy.orm import DeclarativeBase, mapped_column\nAlias = Annotated[int, mapped_column('signed_manifest', BigInteger)]\nclass Base(DeclarativeBase):\n    pass\n".into() },
+                    ModelFile { path: "app/models.py".into(), orm: ModelOrm::Sqlalchemy,
+                        source: format!("from typing import Optional, Union\nfrom sqlalchemy.orm import Mapped, mapped_column\nfrom .shared import Base, Alias\nfrom . import shared\nclass Job(Base):\n    __tablename__ = 'jobs'\n    manifest: Mapped[{annotation}]{assignment}\n") },
+                ];
+                let index = ModelIndex::build(sources);
+                assert!(
+                    index
+                        .column_absence(MigrationFramework::Alembic, &table("jobs"), "retired")
+                        .is_ok(),
+                    "{annotation}{assignment}"
+                );
+                let name = if assignment.contains("override") {
+                    "override"
+                } else {
+                    "signed_manifest"
+                };
+                let error = index
+                    .column_absence(MigrationFramework::Alembic, &table("jobs"), name)
+                    .unwrap_err();
+                assert!(
+                    error.contains("still mapped"),
+                    "{annotation}{assignment}: {error}"
+                );
+                if name == "override" {
+                    assert!(index
+                        .column_absence(
+                            MigrationFramework::Alembic,
+                            &table("jobs"),
+                            "signed_manifest"
+                        )
+                        .is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nullable_annotated_unknown_and_ambiguous_forms_fail_closed() {
+        for expression in [
+            "Alias | str",
+            "list[Alias]",
+            "Missing | None",
+            "Cycle | None",
+            "Annotated[Alias, mapped_column('other')] | None",
+        ] {
+            let source = format!("from typing import Annotated\nfrom sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column\nAlias = Annotated[bytes, mapped_column('signed_manifest')]\nCycle = Cycle\nclass Base(DeclarativeBase):\n    pass\nclass Job(Base):\n    __tablename__ = 'jobs'\n    value: Mapped[{expression}]\n");
+            assert!(
+                index(ModelOrm::Sqlalchemy, &source)
+                    .column_absence(
+                        MigrationFramework::Alembic,
+                        &table("jobs"),
+                        "signed_manifest"
+                    )
+                    .is_err(),
+                "{expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn annotated_alias_cannot_hide_dynamic_explicit_column_values() {
+        for assignment in [
+            "mapped_column(choose_name())",
+            "mapped_column(unknown_name)",
+            "unknown_descriptor",
+            "something if flag else other",
+            "mapped_column(name=choose_name())",
+        ] {
+            let source = format!("from typing import Annotated\nfrom sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column\nAlias = Annotated[bytes, mapped_column('template_name')]\nclass Base(DeclarativeBase):\n    pass\nclass Job(Base):\n    __tablename__ = 'jobs'\n    manifest: Mapped[Alias | None] = {assignment}\n");
+            assert!(
+                index(ModelOrm::Sqlalchemy, &source)
+                    .column_absence(
+                        MigrationFramework::Alembic,
+                        &table("jobs"),
+                        "signed_manifest"
+                    )
+                    .is_err(),
+                "{assignment}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_positional_name_overrides_keyword_template_name() {
+        let source = "from typing import Annotated\nfrom sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column\nAlias = Annotated[bytes, mapped_column(name='old')]\nclass Base(DeclarativeBase):\n    pass\nclass Job(Base):\n    __tablename__ = 'jobs'\n    manifest: Mapped[Alias | None] = mapped_column('signed_manifest')\n";
+        let index = index(ModelOrm::Sqlalchemy, source);
+        assert!(index
+            .column_absence(MigrationFramework::Alembic, &table("jobs"), "old")
+            .is_ok());
+        assert!(index
+            .column_absence(
+                MigrationFramework::Alembic,
+                &table("jobs"),
+                "signed_manifest"
+            )
+            .unwrap_err()
+            .contains("still mapped"));
+    }
+
+    #[test]
+    fn gateway_module_constants_are_static_in_either_file_order() {
+        let shared = "PREFIX = 'ai_tool_bundle'\nSUFFIX_LENGTH = 21\n";
+        let concrete = "import string\nfrom .constants import PREFIX, SUFFIX_LENGTH\nfrom sqlalchemy.orm import DeclarativeBase, Mapped\nLENGTH = len(PREFIX) + 1 + SUFFIX_LENGTH\n_BASE62 = string.ascii_letters + string.digits\nclass Base(DeclarativeBase):\n    pass\nclass Job(Base):\n    __tablename__ = 'jobs'\n    id: Mapped[int]\n";
+        for reverse in [false, true] {
+            let mut files = vec![
+                ModelFile {
+                    path: "app/constants.py".into(),
+                    orm: ModelOrm::Sqlalchemy,
+                    source: shared.into(),
+                },
+                ModelFile {
+                    path: "app/models.py".into(),
+                    orm: ModelOrm::Sqlalchemy,
+                    source: concrete.into(),
+                },
+            ];
+            if reverse {
+                files.reverse();
+            }
+            let index = ModelIndex::build(files);
+            assert!(index
+                .column_absence(
+                    MigrationFramework::Alembic,
+                    &table("jobs"),
+                    "signed_manifest"
+                )
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn scalar_lookalikes_and_side_effects_keep_coverage_unknown() {
+        for expression in [
+            "len(register_models()) + 1",
+            "len(unknown) + 1",
+            "custom + 1",
+            "string.unknown + string.digits",
+            "len = register_models\nLENGTH = len('prefix')",
+            "len = len\nLENGTH = len('prefix')",
+        ] {
+            let source = format!("import string\nfrom sqlalchemy.orm import DeclarativeBase\nclass Base(DeclarativeBase):\n    pass\nclass Job(Base):\n    __tablename__ = 'jobs'\nLENGTH = {expression}\n");
+            assert!(
+                index(ModelOrm::Sqlalchemy, &source)
+                    .column_absence(
+                        MigrationFramework::Alembic,
+                        &table("jobs"),
+                        "signed_manifest"
+                    )
+                    .is_err(),
+                "{expression}"
+            );
+        }
+    }
+
     #[test]
     fn annotated_metadata_name_is_present_even_with_explicit_column() {
         let index = index(
