@@ -32,6 +32,16 @@ pub fn discover_migrations_with_exclude(
     paths: &[PathBuf],
     exclude_patterns: &[String],
 ) -> Result<Vec<PathBuf>> {
+    discover_migrations_with_locations(paths, exclude_patterns, &[])
+}
+
+/// Discover revisions, giving explicitly configured Alembic directories precedence.
+/// Locations and paths must be relative to the same working directory or absolute.
+pub fn discover_migrations_with_locations(
+    paths: &[PathBuf],
+    exclude_patterns: &[String],
+    alembic_locations: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
     let mut migrations = Vec::new();
 
     // Compile exclude patterns here rather than assuming they came
@@ -49,7 +59,13 @@ pub fn discover_migrations_with_exclude(
 
     // Resolve once and reuse: `is_excluded` consults it for every file against
     // every pattern, so re-querying the OS per call would be wasteful.
-    let current_dir = std::env::current_dir().ok();
+    let current_dir = std::env::current_dir().ok().map(|dir| {
+        if alembic_locations.is_empty() {
+            dir
+        } else {
+            dir.canonicalize().unwrap_or(dir)
+        }
+    });
 
     for path in paths {
         // `path.is_file()` transparently follows symlinks, so an
@@ -59,11 +75,19 @@ pub fn discover_migrations_with_exclude(
         // (see `discover_in_directory` below); apply the same
         // policy here so the explicit-path branch matches.
         if is_regular_file(path) {
-            if is_migration_file(path) && !is_excluded(path, &patterns, current_dir.as_deref()) {
+            if migration_framework_with_locations(path, alembic_locations).is_some()
+                && !is_excluded(path, &patterns, current_dir.as_deref())
+            {
                 migrations.push(path.clone());
             }
         } else if is_directory(path) {
-            discover_in_directory(path, &mut migrations, &patterns, current_dir.as_deref())?;
+            discover_in_directory(
+                path,
+                &mut migrations,
+                &patterns,
+                current_dir.as_deref(),
+                alembic_locations,
+            )?;
         } else {
             return Err(Error::InvalidPath { path: path.clone() });
         }
@@ -133,6 +157,7 @@ fn discover_in_directory(
     migrations: &mut Vec<PathBuf>,
     exclude_patterns: &[Pattern],
     current_dir: Option<&Path>,
+    alembic_locations: &[PathBuf],
 ) -> Result<()> {
     // `follow_links(false)` stops WalkDir from traversing symlinks
     // during the walk, but each yielded entry's `path` could itself
@@ -147,7 +172,7 @@ fn discover_in_directory(
         let path = entry.path();
 
         if entry.file_type().is_file()
-            && is_migration_file(path)
+            && migration_framework_with_locations(path, alembic_locations).is_some()
             && !is_excluded(path, exclude_patterns, current_dir)
         {
             migrations.push(path.to_path_buf());
@@ -182,8 +207,48 @@ pub fn is_migration_file(path: &Path) -> bool {
 
 /// Identify the supported migration layout for a path.
 pub fn migration_framework(path: &Path) -> Option<MigrationFramework> {
+    migration_framework_with_locations(path, &[])
+}
+
+/// Classify a migration using configured locations before the default layouts.
+pub fn migration_framework_with_locations(
+    path: &Path,
+    alembic_locations: &[PathBuf],
+) -> Option<MigrationFramework> {
     if path.extension().is_none_or(|ext| ext != "py") || path.file_name()? == "__init__.py" {
         return None;
+    }
+    let current_dir = if alembic_locations.is_empty() {
+        None
+    } else {
+        std::env::current_dir().ok()
+    };
+    // Do not canonicalize against the worktree: staged/deleted revisions may not
+    // exist there, and dirty symlinks must not change immutable diff classification.
+    let absolute = |p: &Path| {
+        let path = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            current_dir.as_deref().unwrap_or(Path::new(".")).join(p)
+        };
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                _ => normalized.push(component.as_os_str()),
+            }
+        }
+        normalized
+    };
+    if path.parent().is_some_and(|parent| {
+        alembic_locations
+            .iter()
+            .any(|location| absolute(parent) == absolute(location))
+    }) {
+        return Some(MigrationFramework::Alembic);
     }
     if is_in_migrations_directory(path) {
         Some(MigrationFramework::Django)
@@ -543,5 +608,53 @@ mod tests {
         assert!(migrations[0]
             .to_string_lossy()
             .contains("0002_add_field.py"));
+    }
+}
+
+#[cfg(test)]
+mod configured_location_tests {
+    use super::*;
+
+    #[test]
+    fn locations_override_only_direct_python_children() {
+        let locations = vec![
+            PathBuf::from("migrations/beta_versions"),
+            PathBuf::from("custom/revisions"),
+        ];
+        for file in [
+            "migrations/beta_versions/20261020_0044_probe.py",
+            "migrations/beta_versions/random.py",
+            "custom/revisions/drop.py",
+        ] {
+            assert_eq!(
+                migration_framework_with_locations(Path::new(file), &locations),
+                Some(MigrationFramework::Alembic)
+            );
+        }
+        for file in [
+            "custom/revisions/__init__.py",
+            "custom/revisions/not_python.txt",
+            "custom/revisions/nested/drop.py",
+            "custom/elsewhere/drop.py",
+        ] {
+            assert_eq!(
+                migration_framework_with_locations(Path::new(file), &locations),
+                None
+            );
+        }
+        assert_eq!(
+            migration_framework_with_locations(
+                Path::new("migrations/models/1_init.py"),
+                &locations
+            ),
+            Some(MigrationFramework::Aerich)
+        );
+        assert_eq!(
+            migration_framework_with_locations(
+                Path::new("app/migrations/0001_init.py"),
+                &locations
+            ),
+            Some(MigrationFramework::Django)
+        );
     }
 }

@@ -5,7 +5,8 @@ Status: implementation in progress on `codex/gateway-compatibility`.
 Commit 1: complete. The regression failed before the fix; 493 tests, Clippy,
 and formatting pass. SQLAlchemy 2.0 declarative-table documentation confirms
 nullable Annotated templates and explicit option precedence.
-Commit 2: bounded scalar declaration support implemented; validation pending.
+Commit 2: complete; failing regression reproduced, 495 tests, Clippy, and
+formatting pass.
 Full runtime model-inventory probe at Gateway 888461880d79ee10fb5842a3cd05635fa0f153e1
 contains 17 declaration/base files. Arithmetic failures are fixed. Additional
 unsupported constructs include dataclass decorators, enum bases, Pydantic
@@ -17,7 +18,9 @@ against the repository declarations. This is a declared coverage boundary, not a
 claim of whole-service Python analysis; unrelated model inventories may still
 need future parser support. This narrows the earlier broad-inventory expectation
 without introducing suppressions or changing R005's evidence model.
-Commits 3–4: pending.
+Commit 3: complete; the scan initially missed the unsafe beta drop. All 501
+tests, Clippy, and formatting pass with configured discovery and parser routing.
+Commit 4: pending.
 
 ## Outcome and baseline
 

@@ -30,6 +30,21 @@ with op.get_context().autocommit_block():
 
 The Alembic path is intentionally static: zdm does not import or execute revision scripts, connect to a database, inspect SQLAlchemy models, resolve aliases/custom operations, or evaluate dynamic SQL. `op.execute` is inspected only when its first positional argument or `sqltext` keyword is a string literal; use explicit SQL when you want it checked. Literal `ALTER TABLE ... ADD CONSTRAINT ... CHECK` and validation before its `NOT VALID` addition commits are checked by R017. Separate revisions need separate transactions if applied together.
 
+For custom Alembic revision directories, configure their literal paths relative
+to the repository root (or the current directory outside Git):
+
+```toml
+[tool.zdm]
+alembic-version-locations = ["migrations/versions", "migrations/beta_versions"]
+```
+
+Use `alembic-version-locations = [...]` at the top level in
+`zero-downtime-migrations.toml`. Only direct `.py` children, excluding
+`__init__.py`, are revisions. Explicit locations override the default framework
+layout heuristics in scans, diff/staged selection, parsing, and changeset rules.
+Default Django, Alembic, and Aerich layouts remain recognized. Locations must
+stay inside the repository; globs and parent traversal are rejected.
+
 ### Aerich/Tortoise support
 
 zdm discovers Aerich revisions under `migrations/<app>/<number>_*.py`. Aerich's documented migration contract is a SQL string returned by `upgrade()`; zdm also supports the local-helper `execute_statement(connection, sql)` convention, including callbacks such as `run_with_lock_timeout(db, _upgrade_attempt)`. It maps PostgreSQL `CREATE/DROP INDEX`, `CREATE TABLE`, and `ALTER TABLE` column and constraint statements to the same safety rules used for Django and Alembic.

@@ -15,7 +15,7 @@ use std::path::{Component, Path, PathBuf};
 
 use git2::{DiffOptions, Repository};
 
-use crate::discovery::is_migration_file;
+use crate::discovery::migration_framework_with_locations;
 use crate::error::{Error, Result};
 
 /// Status of a file in the git diff.
@@ -406,12 +406,25 @@ impl GitRepo {
     /// non-migration paths. Deleted paths remain visible to changeset rules but
     /// are excluded from the migration files that the parser must open.
     pub fn paths_from(&self, files: &[ChangedFile], kind: ChangedKind) -> Result<Vec<PathBuf>> {
+        self.paths_from_with_locations(files, kind, &[])
+    }
+
+    /// Project a diff with the same configured framework classification as parsing.
+    pub fn paths_from_with_locations(
+        &self,
+        files: &[ChangedFile],
+        kind: ChangedKind,
+        alembic_locations: &[PathBuf],
+    ) -> Result<Vec<PathBuf>> {
         let root = self.root()?;
         let want_migrations = matches!(kind, ChangedKind::Migrations);
         Ok(files
             .iter()
             .filter(|f| !want_migrations || f.status != FileStatus::Deleted)
-            .filter(|f| is_migration_file(&f.path) == want_migrations)
+            .filter(|f| {
+                migration_framework_with_locations(&root.join(&f.path), alembic_locations).is_some()
+                    == want_migrations
+            })
             .map(|f| root.join(&f.path))
             .collect())
     }
@@ -419,10 +432,22 @@ impl GitRepo {
     /// Absolute paths of migration files touched by an already-computed diff,
     /// including deletions.
     pub fn migration_touches_from(&self, files: &[ChangedFile]) -> Result<Vec<PathBuf>> {
+        self.migration_touches_with_locations(files, &[])
+    }
+
+    /// Include deleted revisions from configured Alembic locations.
+    pub fn migration_touches_with_locations(
+        &self,
+        files: &[ChangedFile],
+        alembic_locations: &[PathBuf],
+    ) -> Result<Vec<PathBuf>> {
         let root = self.root()?;
         Ok(files
             .iter()
-            .filter(|file| is_migration_file(&file.path))
+            .filter(|file| {
+                migration_framework_with_locations(&root.join(&file.path), alembic_locations)
+                    .is_some()
+            })
             .map(|file| root.join(&file.path))
             .collect())
     }

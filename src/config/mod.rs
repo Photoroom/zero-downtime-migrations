@@ -83,6 +83,8 @@ pub struct Config {
     pub allowed_file_patterns: Vec<String>,
     /// ORM source coverage (historical settings authorize diff-mode checks).
     pub model_sources: Vec<ModelSource>,
+    /// Repository-relative directories containing Alembic revisions.
+    pub alembic_version_locations: Vec<PathBuf>,
 }
 
 impl Config {
@@ -208,6 +210,16 @@ impl Config {
                 message: e.to_string(),
             })?;
         }
+        for path in &self.alembic_version_locations {
+            if path.as_os_str().is_empty()
+                || path
+                    .components()
+                    .any(|c| !matches!(c, Component::Normal(_)))
+                || path.to_string_lossy().contains(['*', '?', '[', ']', '\\'])
+            {
+                return Err(Error::cli_usage(format!("alembic-version-locations path '{}' must be a literal repository-relative directory", path.display())));
+            }
+        }
         for source in &self.model_sources {
             source.validate().map_err(Error::cli_usage)?;
         }
@@ -244,6 +256,9 @@ impl Config {
         }
         if let Some(exclude) = other.exclude {
             self.exclude = exclude;
+        }
+        if let Some(locations) = other.alembic_version_locations {
+            self.alembic_version_locations = locations;
         }
         if let Some(sources) = other.model_sources {
             self.model_sources = sources;
@@ -347,6 +362,8 @@ pub struct FileConfig {
     pub allowed_file_patterns: Option<Vec<String>>,
     /// ORM source coverage for historical column-removal checks.
     pub model_sources: Option<Vec<ModelSource>>,
+    /// Explicit Alembic revision directories.
+    pub alembic_version_locations: Option<Vec<PathBuf>>,
 }
 
 #[cfg(test)]
@@ -940,6 +957,57 @@ paths = ["service"]
                 paths: vec![path.into()],
             };
             assert!(scope.validate().is_err(), "{path}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod alembic_location_tests {
+    use super::*;
+
+    #[test]
+    fn locations_load_in_both_formats_and_standalone_takes_precedence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[tool.zdm]\nalembic-version-locations = ['migrations/beta_versions']\n",
+        )
+        .unwrap();
+        assert_eq!(
+            Config::load_from_exact_directory(dir.path())
+                .unwrap()
+                .alembic_version_locations,
+            vec![PathBuf::from("migrations/beta_versions")]
+        );
+        std::fs::write(
+            dir.path().join("zero-downtime-migrations.toml"),
+            "alembic-version-locations = ['custom/revisions']\n",
+        )
+        .unwrap();
+        assert_eq!(
+            Config::load_from_exact_directory(dir.path())
+                .unwrap()
+                .alembic_version_locations,
+            vec![PathBuf::from("custom/revisions")]
+        );
+    }
+
+    #[test]
+    fn locations_reject_unsafe_and_nonliteral_paths() {
+        for path in [
+            "",
+            ".",
+            "../revisions",
+            "/revisions",
+            "custom/../outside",
+            "custom/*",
+            "custom/?",
+            "custom/[ab]",
+            "custom\\revisions",
+        ] {
+            let mut config = Config::default();
+            config.alembic_version_locations.push(path.into());
+            assert!(config.validate_glob_patterns().is_err(), "{path}");
         }
     }
 }
