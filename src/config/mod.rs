@@ -83,6 +83,8 @@ pub struct Config {
     pub allowed_file_patterns: Vec<String>,
     /// ORM source coverage (historical settings authorize diff-mode checks).
     pub model_sources: Vec<ModelSource>,
+    /// Exact ancestral commit containing the pre-retirement mappings.
+    pub model_retirement_ref: Option<String>,
     /// Repository-relative directories containing Alembic revisions.
     pub alembic_version_locations: Vec<PathBuf>,
 }
@@ -260,6 +262,9 @@ impl Config {
         if let Some(locations) = other.alembic_version_locations {
             self.alembic_version_locations = locations;
         }
+        if let Some(reference) = other.model_retirement_ref {
+            self.model_retirement_ref = Some(reference);
+        }
         if let Some(sources) = other.model_sources {
             self.model_sources = sources;
         }
@@ -362,6 +367,8 @@ pub struct FileConfig {
     pub allowed_file_patterns: Option<Vec<String>>,
     /// ORM source coverage for historical column-removal checks.
     pub model_sources: Option<Vec<ModelSource>>,
+    /// Historical witness for native table retirement, trusted only from the merge-base.
+    pub model_retirement_ref: Option<String>,
     /// Explicit Alembic revision directories.
     pub alembic_version_locations: Option<Vec<PathBuf>>,
 }

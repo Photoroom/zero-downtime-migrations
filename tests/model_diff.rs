@@ -758,3 +758,208 @@ fn gateway_reintroduction_duplicate_and_missing_dependency_cannot_authorize_drop
         }
     }
 }
+
+fn table_check(dir: &TempDir, args: &[&str], allowed: bool) {
+    let output = cargo_bin_cmd!("zdm")
+        .current_dir(dir.path())
+        .args(args)
+        .args(["--select", "R019", "--output-format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(if allowed { 0 } else { 1 }),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["diagnostics"].as_array().unwrap().is_empty(), allowed);
+}
+
+fn table_retirement(orm: Orm) -> TempDir {
+    let dir = repo(orm, &orm.model(""));
+    let prior = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    write(
+        dir.path(),
+        "zero-downtime-migrations.toml",
+        &format!(
+            "model-retirement-ref = '{}'\n",
+            String::from_utf8(prior.stdout).unwrap().trim()
+        ),
+    );
+    write(dir.path(), "app/models.py", "# retired mappings\n");
+    commit(dir.path());
+    git(dir.path(), &["branch", "-f", "origin/main", "HEAD"]);
+    let drop = match orm {
+        Orm::SqlAlchemy => "from alembic import op\ndef upgrade():\n    op.drop_table('jobs')\n",
+        Orm::Tortoise => "async def upgrade(db):\n    return 'DROP TABLE jobs;'\n",
+    };
+    write(dir.path(), orm.migration(), drop);
+    dir
+}
+
+#[test]
+fn table_retirement_requires_prior_mapping_and_earlier_removal() {
+    for orm in [Orm::SqlAlchemy, Orm::Tortoise] {
+        let dir = table_retirement(orm);
+        commit(dir.path());
+        table_check(&dir, &["--diff", "origin/main"], true);
+        write(
+            dir.path(),
+            "app/models.py",
+            &orm.model("").replace("jobs", "other"),
+        );
+        commit(dir.path());
+        table_check(&dir, &["--diff", "origin/main"], true);
+        table_check(&dir, &[orm.migration()], false);
+        write(dir.path(), "app/models.py", &orm.model(""));
+        commit(dir.path());
+        table_check(&dir, &["--diff", "origin/main"], false);
+        write(dir.path(), "app/models.py", "# retired\n");
+        commit(dir.path());
+        git(dir.path(), &["branch", "-f", "origin/main", "HEAD~1"]);
+        // Keep migration in diff after making the mapped revision the base.
+        write(
+            dir.path(),
+            orm.migration(),
+            &format!(
+                "{}\n# changed\n",
+                fs::read_to_string(dir.path().join(orm.migration())).unwrap()
+            ),
+        );
+        commit(dir.path());
+        table_check(&dir, &["--diff", "origin/main"], false);
+    }
+}
+
+#[test]
+fn table_retirement_uses_index_and_base_established_configuration() {
+    let dir = table_retirement(Orm::SqlAlchemy);
+    git(dir.path(), &["add", "."]);
+    write(dir.path(), "app/models.py", &Orm::SqlAlchemy.model(""));
+    table_check(&dir, &["--diff-staged", "origin/main"], true);
+    git(dir.path(), &["add", "."]);
+    write(dir.path(), "app/models.py", "# retired\n");
+    table_check(&dir, &["--diff-staged", "origin/main"], false);
+}
+
+#[test]
+fn table_retirement_rejects_unknown_coverage_and_retained_references() {
+    for model in [
+        "from sqlalchemy.orm import DeclarativeBase, mapped_column\nfrom sqlalchemy import Integer\nfrom missing import foreign_keys\nclass Base(DeclarativeBase):\n    pass\nclass Other(Base):\n    __tablename__ = 'other'\n    job = mapped_column(Integer, foreign_keys[0])\n",
+        "from sqlalchemy.orm import DeclarativeBase, mapped_column\nfrom sqlalchemy.sql.schema import ForeignKey\nclass Base(DeclarativeBase):\n    pass\nclass Other(Base):\n    __tablename__ = 'other'\n    job = mapped_column(ForeignKey('jobs.id'))\n",
+        "from sqlalchemy.orm import DeclarativeBase, mapped_column\nfrom sqlalchemy import Integer, ForeignKey\ndef make_fk():\n    return ForeignKey('jobs.id')\nclass Base(DeclarativeBase):\n    pass\nclass Other(Base):\n    __tablename__ = 'other'\n    job = mapped_column(Integer, make_fk())\n",
+        "from sqlalchemy.orm import DeclarativeBase, mapped_column\nfrom sqlalchemy import Integer\nfrom missing import foreign_key\nclass Base(DeclarativeBase):\n    pass\nclass Other(Base):\n    __tablename__ = 'other'\n    job = mapped_column(Integer, foreign_key)\n",
+        "from missing import Base\nclass Unknown(Base):\n    __tablename__ = 'other'\n",
+        "from sqlalchemy.orm import DeclarativeBase, mapped_column\nfrom sqlalchemy import ForeignKey\nclass Base(DeclarativeBase):\n    pass\nclass Other(Base):\n    __tablename__ = 'other'\n    job = mapped_column(ForeignKey('jobs.id'))\n",
+        "from sqlalchemy.orm import DeclarativeBase, relationship\nclass Base(DeclarativeBase):\n    pass\nclass Other(Base):\n    __tablename__ = 'other'\n    job = relationship('Job')\n",
+    ] {
+        let dir = table_retirement(Orm::SqlAlchemy);
+        write(dir.path(), "app/models.py", model);
+        commit(dir.path());
+        table_check(&dir, &["--diff", "origin/main"], false);
+    }
+}
+
+#[test]
+fn table_retirement_never_authorizes_a_rename() {
+    let dir = table_retirement(Orm::SqlAlchemy);
+    write(
+        dir.path(),
+        Orm::SqlAlchemy.migration(),
+        "from alembic import op\ndef upgrade():\n    op.rename_table('jobs', 'other')\n",
+    );
+    commit(dir.path());
+    table_check(&dir, &["--diff", "origin/main"], false);
+}
+
+#[test]
+fn table_retirement_cannot_fabricate_or_replace_the_historical_witness() {
+    for witness in [
+        "HEAD",
+        "0000000000000000000000000000000000000000",
+        "base",
+        "missing",
+        "unknown",
+        "absent",
+    ] {
+        let dir = table_retirement(Orm::SqlAlchemy);
+        if matches!(witness, "unknown" | "absent") {
+            // Make a different ancestral snapshot with no usable historical mapping.
+            write(
+                dir.path(),
+                "app/models.py",
+                if witness == "unknown" {
+                    "from missing import Base\nclass Job(Base):\n    __tablename__ = 'jobs'\n"
+                } else {
+                    "# no mapping\n"
+                },
+            );
+            commit(dir.path());
+        }
+        let value = if matches!(witness, "base" | "unknown" | "absent") {
+            let output = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        } else {
+            witness.into()
+        };
+        write(
+            dir.path(),
+            "zero-downtime-migrations.toml",
+            &if witness == "missing" {
+                String::new()
+            } else {
+                format!("model-retirement-ref = '{value}'\n")
+            },
+        );
+        write(dir.path(), "app/models.py", "# retired\n");
+        commit(dir.path());
+        git(dir.path(), &["branch", "-f", "origin/main", "HEAD"]);
+        write(
+            dir.path(),
+            Orm::SqlAlchemy.migration(),
+            "from alembic import op\ndef upgrade():\n    op.drop_table('jobs')\n# contraction\n",
+        );
+        // A good SHA added only in this PR cannot replace a bad base setting.
+        let output = Command::new("git")
+            .args(["rev-list", "--max-parents=0", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        write(
+            dir.path(),
+            "zero-downtime-migrations.toml",
+            &format!(
+                "model-retirement-ref = '{}'\n",
+                String::from_utf8(output.stdout).unwrap().trim()
+            ),
+        );
+        commit(dir.path());
+        table_check(&dir, &["--diff", "origin/main"], false);
+    }
+}
+
+#[test]
+fn table_retirement_proof_rejects_schema_ambiguity_and_unresolved_relations() {
+    for (orm, model, allowed) in [
+        (Orm::SqlAlchemy, "from sqlalchemy.orm import DeclarativeBase\nclass Base(DeclarativeBase):\n    pass\nclass Other(Base):\n    __tablename__ = 'jobs'\n    __table_args__ = {'schema': 'other'}\n", false),
+        (Orm::SqlAlchemy, "from sqlalchemy.orm import DeclarativeBase\nfrom sqlalchemy import ForeignKeyConstraint\nclass Base(DeclarativeBase):\n    pass\nclass Other(Base):\n    __tablename__ = 'other'\n    __table_args__ = (ForeignKeyConstraint(['job'], ['jobs.id']),)\n", false),
+        (Orm::SqlAlchemy, "from sqlalchemy.orm import DeclarativeBase, mapped_column\nfrom sqlalchemy import ForeignKey\nclass Base(DeclarativeBase):\n    pass\nclass Other(Base):\n    __tablename__ = 'other'\n    job = mapped_column(ForeignKey(target()))\n", false),
+        (Orm::SqlAlchemy, "from sqlalchemy.orm import DeclarativeBase, mapped_column\nfrom sqlalchemy import ForeignKey\nclass Base(DeclarativeBase):\n    pass\nclass Other(Base):\n    __tablename__ = 'other'\n    job = mapped_column(ForeignKey('retained.id'))\n", true),
+        (Orm::Tortoise, "from tortoise import models, fields\nclass Other(models.Model):\n    job = fields.ForeignKeyField('models.Job')\n    class Meta:\n        table = 'other'\n", false),
+    ] {
+        let dir = table_retirement(orm);
+        write(dir.path(), "app/models.py", model);
+        commit(dir.path());
+        table_check(&dir, &["--diff", "origin/main"], allowed);
+    }
+}
