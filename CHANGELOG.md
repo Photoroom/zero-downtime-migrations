@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.0 - 2026-11-10
+
+- Add native R019 table-retirement proof for Alembic and Aerich using a base-configured immutable ancestor, historical mapping, and complete merge-base/HEAD or index absence.
+- Reject retained foreign keys, unresolved relationships or mappings, same-PR removal, untrusted configuration and table renames; retain the existing R005 contract.
+- Upgrade libz-sys to address RUSTSEC-2026-0418 without disabling the security audit.
+
 ## 0.9.1 - 2026-10-20
 
 ### Gateway compatibility
