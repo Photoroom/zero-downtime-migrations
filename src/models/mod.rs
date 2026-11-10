@@ -18,11 +18,17 @@ pub struct ModelIndex {
     mappings: Vec<Mapping>,
     unknown: Vec<String>,
 }
+#[derive(Default, Clone)]
+struct TableReferences {
+    targets: Vec<TableIdentity>,
+    unknown: Vec<String>,
+}
 struct Mapping {
     orm: ModelOrm,
     table: TableIdentity,
     columns: HashMap<String, String>,
     unknown: Vec<String>,
+    references: TableReferences,
 }
 #[derive(Clone, Debug)]
 enum Expr {
@@ -74,6 +80,7 @@ struct Resolved {
     schema: Option<String>,
     columns: HashMap<String, String>,
     unknown: Vec<String>,
+    references: TableReferences,
     abstract_model: bool,
     primary_key: bool,
     identity_unknown: bool,
@@ -123,6 +130,7 @@ impl ModelIndex {
                     },
                     columns: resolved.columns,
                     unknown: resolved.unknown,
+                    references: resolved.references,
                 });
             } else if !resolved.abstract_model || !resolved.unknown.is_empty() {
                 index.unknown.push(format!(
@@ -133,6 +141,73 @@ impl ModelIndex {
             }
         }
         index
+    }
+
+    fn complete_tables(&self) -> Result<(), String> {
+        let reasons: Vec<_> = self
+            .unknown
+            .iter()
+            .chain(self.mappings.iter().flat_map(|m| m.unknown.iter()))
+            .cloned()
+            .collect();
+        if !reasons.is_empty() {
+            return Err(format!(
+                "model coverage is unresolved: {}",
+                describe(&reasons)
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn table_presence(
+        &self,
+        framework: MigrationFramework,
+        table: &TableIdentity,
+    ) -> Result<(), String> {
+        let required = match framework {
+            MigrationFramework::Alembic => ModelOrm::Sqlalchemy,
+            MigrationFramework::Aerich => ModelOrm::Tortoise,
+            _ => return Err("ORM model evidence is unavailable for this framework".into()),
+        };
+        self.complete_tables()?;
+        if !self
+            .mappings
+            .iter()
+            .any(|m| m.orm == required && m.table == *table)
+        {
+            return Err(format!(
+                "no complete {:?} mapping for table {}",
+                required, table.name
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn table_absence(&self, table: &TableIdentity) -> Result<(), String> {
+        self.complete_tables()?;
+        for mapping in &self.mappings {
+            if tables_overlap(&mapping.table, table) {
+                return Err(format!("table {} is still mapped", table.name));
+            }
+            if !mapping.references.unknown.is_empty() {
+                return Err(format!(
+                    "table references are unresolved: {}",
+                    describe(&mapping.references.unknown)
+                ));
+            }
+            if mapping
+                .references
+                .targets
+                .iter()
+                .any(|target| tables_overlap(target, table))
+            {
+                return Err(format!(
+                    "table {} is still referenced by {}",
+                    table.name, mapping.table.name
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn column_absence(
@@ -187,6 +262,214 @@ impl ModelIndex {
             }
         }
         Ok(())
+    }
+}
+
+fn tables_overlap(left: &TableIdentity, right: &TableIdentity) -> bool {
+    left.name == right.name
+        && (left.schema == right.schema || left.schema.is_none() || right.schema.is_none())
+}
+
+const TORTOISE_FIELDS: &[&str] = &[
+    "IntField",
+    "SmallIntField",
+    "BigIntField",
+    "CharField",
+    "TextField",
+    "BooleanField",
+    "DecimalField",
+    "FloatField",
+    "DatetimeField",
+    "DateField",
+    "TimeDeltaField",
+    "TimeField",
+    "JSONField",
+    "UUIDField",
+    "BinaryField",
+    "ForeignKeyField",
+    "OneToOneField",
+    "IntEnumField",
+    "CharEnumField",
+];
+
+fn safe_schema_call(name: &str) -> bool {
+    name.strip_prefix("tortoise.fields.")
+        .is_some_and(|field| TORTOISE_FIELDS.contains(&field))
+        || matches!(
+            name,
+            "sqlalchemy.orm.mapped_column"
+                | "sqlalchemy.func.now"
+                | "dict"
+                | "list"
+                | "tuple"
+                | "set"
+                | "frozenset"
+        )
+        || [
+            "sqlalchemy.",
+            "sqlalchemy.schema.",
+            "sqlalchemy.sql.schema.",
+            "sqlalchemy.types.",
+            "sqlalchemy.sql.sqltypes.",
+        ]
+        .iter()
+        .any(|prefix| {
+            name.strip_prefix(prefix).is_some_and(|name| {
+                matches!(
+                    name,
+                    "Column"
+                        | "Index"
+                        | "UniqueConstraint"
+                        | "CheckConstraint"
+                        | "PrimaryKeyConstraint"
+                        | "Identity"
+                        | "Sequence"
+                        | "Computed"
+                        | "text"
+                        | "BigInteger"
+                        | "Integer"
+                        | "SmallInteger"
+                        | "String"
+                        | "Text"
+                        | "Boolean"
+                        | "DateTime"
+                        | "Date"
+                        | "Time"
+                        | "LargeBinary"
+                        | "UUID"
+                        | "Float"
+                        | "Numeric"
+                        | "JSON"
+                        | "Enum"
+                )
+            })
+        })
+}
+
+impl TableReferences {
+    fn foreign_key(&mut self, value: Option<&Expr>) {
+        if let Some(Expr::String(target)) = value {
+            let parts: Vec<_> = target.split('.').collect();
+            if (2..=3).contains(&parts.len())
+                && parts.iter().all(|part| {
+                    !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                })
+            {
+                self.targets.push(TableIdentity {
+                    name: parts[parts.len() - 2].into(),
+                    schema: (parts.len() == 3).then(|| parts[0].into()),
+                });
+                return;
+            }
+        }
+        self.unknown.push("unsupported foreign-key target".into());
+    }
+
+    /// Inspect expanded expressions separately: column retirement does not need target resolution.
+    fn collect(&mut self, value: &Expr) {
+        match value {
+            Expr::Call(function, args, kwargs) => {
+                if let Expr::Name(name) = &**function {
+                    match name.as_str() {
+                        "sqlalchemy.ForeignKey"
+                        | "sqlalchemy.schema.ForeignKey"
+                        | "sqlalchemy.sql.schema.ForeignKey" => {
+                            self.foreign_key(args.first().or_else(|| kwargs.get("column")));
+                            if kwargs.contains_key("**") {
+                                self.unknown.push("dynamic foreign-key options".into());
+                            }
+                        }
+                        "sqlalchemy.ForeignKeyConstraint"
+                        | "sqlalchemy.schema.ForeignKeyConstraint" => {
+                            match args.get(1).or_else(|| kwargs.get("refcolumns")) {
+                                Some(Expr::Tuple(targets)) if !targets.is_empty() => {
+                                    for target in targets {
+                                        self.foreign_key(Some(target));
+                                    }
+                                }
+                                _ => self
+                                    .unknown
+                                    .push("unsupported foreign-key constraint targets".into()),
+                            }
+                            if kwargs.contains_key("**") {
+                                self.unknown.push("dynamic foreign-key options".into());
+                            }
+                        }
+                        "sqlalchemy.orm.relationship" => self
+                            .unknown
+                            .push("relationship target is unresolved".into()),
+                        _ if name.starts_with("tortoise.fields.")
+                            && matches!(
+                                name.rsplit('.').next(),
+                                Some(
+                                    "ForeignKeyField"
+                                        | "OneToOneField"
+                                        | "ManyToManyField"
+                                        | "BackwardFKRelation"
+                                        | "BackwardOneToOneRelation"
+                                )
+                            ) =>
+                        {
+                            self.unknown
+                                .push("Tortoise relationship target is unresolved".into())
+                        }
+                        _ if safe_schema_call(name) => {
+                            if matches!(
+                                name.as_str(),
+                                "sqlalchemy.orm.mapped_column"
+                                    | "sqlalchemy.Column"
+                                    | "sqlalchemy.schema.Column"
+                                    | "sqlalchemy.sql.schema.Column"
+                            ) {
+                                for arg in args {
+                                    if !matches!(arg, Expr::String(_) | Expr::Call(_, _, _))
+                                        && !matches!(arg, Expr::Name(name) if safe_schema_call(name))
+                                    {
+                                        self.unknown
+                                            .push("unresolved column schema argument".into());
+                                    }
+                                }
+                            }
+                        }
+                        _ => self
+                            .unknown
+                            .push(format!("unsupported reference expression {name}")),
+                    }
+                } else {
+                    self.unknown.push("unresolved reference expression".into());
+                }
+                self.collect(function);
+                for value in args.iter().chain(kwargs.values()) {
+                    self.collect(value);
+                }
+            }
+            Expr::Subscript(inner, args) => {
+                self.collect(inner);
+                for value in args {
+                    self.collect(value);
+                }
+            }
+            Expr::Dict(values) => {
+                for value in values.values() {
+                    self.collect(value);
+                }
+            }
+            Expr::Mapping(values) => {
+                for (key, value) in values {
+                    self.collect(key);
+                    self.collect(value);
+                }
+            }
+            Expr::Tuple(values) | Expr::Union(values) | Expr::Add(values) => {
+                for value in values {
+                    self.collect(value);
+                }
+            }
+            Expr::Limit => self
+                .unknown
+                .push("reference expansion limit exceeded".into()),
+            _ => {}
+        }
     }
 }
 
@@ -1031,6 +1314,14 @@ impl Sources {
                 result.schema = inherited.schema.or(result.schema);
                 result.columns.extend(inherited.columns);
                 result.unknown.extend(inherited.unknown);
+                result
+                    .references
+                    .targets
+                    .extend(inherited.references.targets);
+                result
+                    .references
+                    .unknown
+                    .extend(inherited.references.unknown);
                 result.primary_key |= inherited.primary_key;
                 result.identity_unknown |= inherited.identity_unknown;
             } else {
@@ -1065,6 +1356,12 @@ impl Sources {
             result.abstract_model = false;
         }
         for attr in &class.attrs {
+            result
+                .references
+                .collect(&self.expand(&attr.value, &class.module, 0));
+            result
+                .references
+                .collect(&self.expand(&attr.annotation, &class.module, 0));
             match attr.name.as_str() {
                 "__tablename__" => match &attr.value {
                     Expr::String(value) => result.table = Some(value.clone()),
@@ -1478,28 +1775,7 @@ impl Sources {
                             }
                             return;
                         }
-                        const FIELDS: &[&str] = &[
-                            "IntField",
-                            "SmallIntField",
-                            "BigIntField",
-                            "CharField",
-                            "TextField",
-                            "BooleanField",
-                            "DecimalField",
-                            "FloatField",
-                            "DatetimeField",
-                            "DateField",
-                            "TimeDeltaField",
-                            "TimeField",
-                            "JSONField",
-                            "UUIDField",
-                            "BinaryField",
-                            "ForeignKeyField",
-                            "OneToOneField",
-                            "IntEnumField",
-                            "CharEnumField",
-                        ];
-                        if FIELDS.contains(&field) {
+                        if TORTOISE_FIELDS.contains(&field) {
                             column_call = Some((
                                 args,
                                 kwargs,

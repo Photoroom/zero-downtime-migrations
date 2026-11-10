@@ -1,4 +1,4 @@
-//! Historical ORM evidence for R005. Never imports or executes application code.
+//! Historical ORM evidence for R005 and R019. Never imports or executes application code.
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -10,6 +10,7 @@ use crate::models::{ModelFile, ModelIndex};
 
 /// Evidence built once from immutable Git objects, using base-established scopes.
 pub struct ModelEvidence {
+    prior: Result<ModelIndex, String>,
     base: Result<ModelIndex, String>,
     target: Result<ModelIndex, String>,
 }
@@ -22,22 +23,56 @@ impl ModelEvidence {
             let base = repo
                 .model_snapshot(Some(base_ref), source)
                 .map_err(|e| e.to_string())?;
-            let scopes = model_sources(repo, &base)?;
+            let (scopes, witness) = model_sources(repo, &base)?;
             let target = repo
                 .model_snapshot(None, source)
                 .map_err(|e| e.to_string())?;
-            Ok::<_, String>((base, target, scopes))
+            Ok::<_, String>((base, target, scopes, witness))
         })();
         match snapshots {
-            Ok((base, target, scopes)) => Self {
+            Ok((base, target, scopes, witness)) => Self {
+                prior: witness
+                    .ok_or_else(|| {
+                        "no model-retirement-ref configured at the merge-base".to_string()
+                    })
+                    .and_then(|witness| {
+                        repo.retirement_snapshot(base_ref, &witness)
+                            .map_err(|e| e.to_string())
+                    })
+                    .and_then(|snapshot| build_index(repo, &snapshot, &scopes)),
                 base: build_index(repo, &base, &scopes),
                 target: build_index(repo, &target, &scopes),
             },
             Err(reason) => Self {
+                prior: Err(reason.clone()),
                 base: Err(reason.clone()),
                 target: Err(reason),
             },
         }
+    }
+
+    /// Require a known historical table and absence before the contraction change.
+    pub fn table_absence(
+        &self,
+        framework: MigrationFramework,
+        table: &TableIdentity,
+    ) -> Result<(), String> {
+        self.prior
+            .as_ref()
+            .map_err(|reason| format!("historical witness: {reason}"))?
+            .table_presence(framework, table)
+            .map_err(|reason| format!("historical witness: {reason}"))?;
+        for (snapshot, evidence) in [
+            ("merge-base", &self.base),
+            ("checked revision", &self.target),
+        ] {
+            evidence
+                .as_ref()
+                .map_err(|reason| format!("{snapshot}: {reason}"))?
+                .table_absence(table)
+                .map_err(|reason| format!("{snapshot}: {reason}"))?;
+        }
+        Ok(())
     }
 
     /// Establish that every supported mapping excludes the exact physical column.
@@ -62,8 +97,12 @@ impl ModelEvidence {
     }
 }
 
-fn model_sources(repo: &GitRepo, base: &GitSnapshot) -> Result<Vec<ModelSource>, String> {
+fn model_sources(
+    repo: &GitRepo,
+    base: &GitSnapshot,
+) -> Result<(Vec<ModelSource>, Option<String>), String> {
     let mut scopes = Vec::new();
+    let mut witness = None;
     for name in ["pyproject.toml", "zero-downtime-migrations.toml"] {
         let Some(content) = repo
             .read_snapshot_file(base, Path::new(name))
@@ -83,6 +122,9 @@ fn model_sources(repo: &GitRepo, base: &GitSnapshot) -> Result<Vec<ModelSource>,
             value = zdm.clone();
         }
         let config: FileConfig = value.try_into().map_err(|e| format!("{name}: {e}"))?;
+        if let Some(reference) = config.model_retirement_ref {
+            witness = Some(reference);
+        }
         if let Some(model_sources) = config.model_sources {
             scopes = model_sources;
         }
@@ -96,7 +138,7 @@ fn model_sources(repo: &GitRepo, base: &GitSnapshot) -> Result<Vec<ModelSource>,
     for scope in &scopes {
         scope.validate()?;
     }
-    Ok(scopes)
+    Ok((scopes, witness))
 }
 
 fn build_index(

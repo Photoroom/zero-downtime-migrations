@@ -51,6 +51,37 @@ zdm discovers Aerich revisions under `migrations/<app>/<number>_*.py`. Aerich's 
 
 The Aerich path is static: zdm does not import Tortoise, execute migrations, connect to a database, resolve imports, or evaluate variables and f-strings. Direct `db.execute_script()` and `db.execute_query()` calls, qualified helpers, keyword arguments, and dynamically assembled SQL are not checked. Generated modern revisions with `MODELS_STATE` may exempt their `CREATE TABLE IF NOT EXISTS` tables, including later newly-created models; hand-written files do not receive that exemption. R004 accepts `RUN_IN_TRANSACTION = False` only in that generated format, and concurrent SQL must be its script's only statement. Tortoise's built-in migration file layout is detected, but Tortoise 1.x projects are unsupported.
 
+### Table drops after an earlier model removal (R019)
+
+In diff modes, Alembic and Aerich table drops can use native historical evidence.
+Establish `model-sources` and `model-retirement-ref` in the repository-root
+configuration in an earlier PR. The latter must be a full 40-character commit
+SHA strictly ancestral to the migration's actual merge-base. That exact commit
+must contain a completely resolved mapping for the physical table in the
+migration's ORM. The merge-base and checked HEAD/index must both have complete
+coverage and no possibly overlapping mapping or retained foreign-key reference.
+
+```toml
+# In zero-downtime-migrations.toml, alongside the audited model-sources inventory:
+model-retirement-ref = "<full ancestral commit SHA containing the old mappings>"
+```
+
+The same merge-base source inventory is applied to all three snapshots. Audit
+that inventory for historical and current consumers, including other ORM providers,
+bases, aliases and mixins; the witness need not itself contain the configuration.
+A source path missing from any snapshot is unknown: use a containing directory
+when a retirement deletes an entire model file. Unresolved mappings, dynamic
+foreign-key targets, unsupported relationship targets and incomplete Git history
+remain errors. New configuration in the contraction PR cannot authorize its drop.
+This evidence does not authorize renames or standalone scans and does not change
+R005's column-retirement contract.
+
+Static ORM evidence does not prove deployment completion, reader absence outside
+the audited inventory, or retirement of rollback images. Verify those separately
+before the later migration-only PR is merged. In particular, retaining unsupported
+custom mapping hooks or metadata in the historical model remains blocking; do not
+suppress R019 to bypass missing proof.
+
 ### Column drops after an earlier model removal (R005)
 
 Alembic and Aerich can drop a column after a separate change has removed it from

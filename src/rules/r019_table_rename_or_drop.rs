@@ -35,6 +35,19 @@ impl Rule for R019TableRenameOrDrop {
             {
                 return;
             }
+            let mut help = "Deploy compatible application code first; use a staged migration. Renames cannot use table-retirement evidence.".to_string();
+            if op.op_type == OperationType::DeleteModel
+                && migration.framework.uses_sql_table_identity()
+            {
+                help = match (&op.table_identity, ctx.model_evidence) {
+                    (Some(table), Some(evidence)) => match evidence.table_absence(migration.framework, table) {
+                        Ok(()) => return,
+                        Err(reason) => reason,
+                    },
+                    (None, _) => "cannot establish an unambiguous database table identity".into(),
+                    _ => "historical table evidence requires --diff or --diff-staged, model-sources and model-retirement-ref configured in an earlier PR".into(),
+                };
+            }
             diagnostics.push(
                 Diagnostic::new(
                     self.id(),
@@ -44,9 +57,7 @@ impl Rule for R019TableRenameOrDrop {
                     ctx.path.to_path_buf(),
                     op.span,
                 )
-                .with_help(
-                    "Deploy compatible application code first; use a staged migration. The eventual physical drop remains deliberate and may need an inline `# zdm: ignore R019` only after the compatible rollout is complete.",
-                ),
+                .with_help(help),
             );
         });
         diagnostics
@@ -75,9 +86,10 @@ class Migration(migrations.Migration):
 "#,
         );
         assert_eq!(diagnostics.len(), 3);
-        assert!(diagnostics[0].help.as_deref().is_some_and(|help| {
-            help.contains("compatible rollout") && help.contains("# zdm: ignore R019")
-        }));
+        assert!(diagnostics[0]
+            .help
+            .as_deref()
+            .is_some_and(|help| { help.contains("staged migration") && !help.contains("ignore") }));
     }
 
     #[test]

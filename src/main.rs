@@ -704,19 +704,21 @@ fn parse_and_check_file(
     // Run rules
     let evidence = diff
         .filter(|_| {
-            config.is_rule_enabled("R005")
-                && matches!(
-                    migration.framework,
-                    zero_downtime_migrations::discovery::MigrationFramework::Alembic
-                        | zero_downtime_migrations::discovery::MigrationFramework::Aerich
-                )
-                && migration
-                    .operations
-                    .iter()
-                    .chain(&migration.downgrade_operations)
-                    .any(|op| {
-                        op.op_type == zero_downtime_migrations::ast::OperationType::RemoveField
-                    })
+            matches!(
+                migration.framework,
+                zero_downtime_migrations::discovery::MigrationFramework::Alembic
+                    | zero_downtime_migrations::discovery::MigrationFramework::Aerich
+            ) && migration
+                .operations
+                .iter()
+                .chain(&migration.downgrade_operations)
+                .any(|op| {
+                    (config.is_rule_enabled("R005")
+                        && op.op_type == zero_downtime_migrations::ast::OperationType::RemoveField)
+                        || (config.is_rule_enabled("R019")
+                            && op.op_type
+                                == zero_downtime_migrations::ast::OperationType::DeleteModel)
+                })
         })
         .map(|diff| {
             diff.model_evidence

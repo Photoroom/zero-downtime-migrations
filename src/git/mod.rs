@@ -278,29 +278,68 @@ impl GitRepo {
                 Some(reference) => self.merge_base_tree(reference)?,
                 None => self.head_tree()?,
             };
-            let mut invalid_path = false;
-            tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-                if entry.kind() == Some(git2::ObjectType::Tree) {
-                    return git2::TreeWalkResult::Ok;
-                }
-                let Ok(name) = entry.name() else {
-                    invalid_path = true;
-                    return git2::TreeWalkResult::Abort;
-                };
-                let path = Path::new(root).join(name);
-                if validate_repo_relative_path(&path).is_err() {
-                    invalid_path = true;
-                    return git2::TreeWalkResult::Abort;
-                }
-                entries.insert(path, (entry.id(), entry.filemode() as u32));
-                git2::TreeWalkResult::Ok
-            })
-            .map_err(|e| Error::git_error_msg(format!("Cannot enumerate model snapshot: {e}")))?;
-            if invalid_path {
-                return Err(Error::git_error_msg("Unsafe path in model snapshot"));
-            }
+            return self.snapshot_tree(&tree);
         }
         Ok(GitSnapshot { entries })
+    }
+
+    fn snapshot_tree(&self, tree: &git2::Tree<'_>) -> Result<GitSnapshot> {
+        let mut entries = BTreeMap::new();
+        let mut invalid_path = false;
+        tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            if entry.kind() == Some(git2::ObjectType::Tree) {
+                return git2::TreeWalkResult::Ok;
+            }
+            let Ok(name) = entry.name() else {
+                invalid_path = true;
+                return git2::TreeWalkResult::Abort;
+            };
+            let path = Path::new(root).join(name);
+            if validate_repo_relative_path(&path).is_err() {
+                invalid_path = true;
+                return git2::TreeWalkResult::Abort;
+            }
+            entries.insert(path, (entry.id(), entry.filemode() as u32));
+            git2::TreeWalkResult::Ok
+        })
+        .map_err(|e| Error::git_error_msg(format!("Cannot enumerate model snapshot: {e}")))?;
+        if invalid_path {
+            return Err(Error::git_error_msg("Unsafe path in model snapshot"));
+        }
+        Ok(GitSnapshot { entries })
+    }
+
+    /// Validate an immutable witness strictly before the actual migration merge-base.
+    pub(crate) fn retirement_snapshot(&self, base_ref: &str, witness: &str) -> Result<GitSnapshot> {
+        if witness.len() != 40 || !witness.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::git_error_msg(
+                "model-retirement-ref must be a full commit SHA",
+            ));
+        }
+        let oid = git2::Oid::from_str(witness).map_err(|e| Error::git_error_msg(e.to_string()))?;
+        let prior = self
+            .repo
+            .find_commit(oid)
+            .map_err(|e| Error::git_error_msg(e.to_string()))?;
+        let base = self
+            .repo
+            .merge_base(self.commit_at(base_ref)?.id(), self.head_commit()?.id())
+            .map_err(|e| Error::git_error_msg(e.to_string()))?;
+        if prior.id() == base
+            || !self
+                .repo
+                .graph_descendant_of(base, prior.id())
+                .map_err(|e| Error::git_error_msg(e.to_string()))?
+        {
+            return Err(Error::git_error_msg(
+                "model-retirement-ref must be a strict ancestor of the merge-base",
+            ));
+        }
+        self.snapshot_tree(
+            &prior
+                .tree()
+                .map_err(|e| Error::git_error_msg(e.to_string()))?,
+        )
     }
 
     pub(crate) fn read_snapshot_file(
@@ -539,6 +578,35 @@ mod tests {
 
         let repo = GitRepo::open(temp.path()).unwrap();
         (temp, repo)
+    }
+
+    #[test]
+    fn retirement_witness_is_an_exact_strict_ancestor() {
+        let (temp, repo) = create_test_repo();
+        std::fs::write(temp.path().join("models.py"), "# prior").unwrap();
+        commit(&temp, "prior");
+        let prior = repo.head_commit().unwrap().id();
+        assert!(repo
+            .retirement_snapshot("HEAD", &prior.to_string())
+            .is_err());
+        let fake = "0000000000000000000000000000000000000000";
+        repo.repo
+            .tag_lightweight(
+                fake,
+                repo.repo.find_commit(prior).unwrap().as_object(),
+                false,
+            )
+            .unwrap();
+        std::fs::write(temp.path().join("models.py"), "# retired").unwrap();
+        commit(&temp, "retired");
+        assert!(repo.retirement_snapshot("HEAD", fake).is_err());
+        let base = repo.head_commit().unwrap().id();
+        assert!(repo.retirement_snapshot("HEAD", &prior.to_string()).is_ok());
+        std::fs::write(temp.path().join("models.py"), "# side branch mapping").unwrap();
+        commit(&temp, "side branch");
+        let side = repo.head_commit().unwrap().id();
+        repo.repo.set_head_detached(base).unwrap();
+        assert!(repo.retirement_snapshot("HEAD", &side.to_string()).is_err());
     }
 
     /// Helper to create a commit.
