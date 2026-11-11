@@ -293,7 +293,13 @@ impl ModelIndex {
             mappings: vec![],
             unknown: sources.unknown.clone(),
         };
-        for class in sources.classes.values().filter(|class| class.audited) {
+        let mut classes: Vec<_> = sources
+            .classes
+            .values()
+            .filter(|class| class.audited)
+            .collect();
+        classes.sort_by(|a, b| (&a.module, &a.name).cmp(&(&b.module, &b.name)));
+        for class in classes {
             let resolved = sources.resolve_class(class, &mut HashSet::new(), true);
             if resolved.eager_unknown {
                 index.unknown.push(format!(
@@ -711,6 +717,12 @@ impl TableReferences {
                     self.collect(value);
                 }
             }
+            Expr::Subscript(inner, _) if matches!(&**inner, Expr::Name(name) if matches!(name.as_str(), "typing.Literal" | "typing_extensions.Literal")) => {
+                if !string_literal_annotation(value) {
+                    self.unknown
+                        .push("unsupported eager reference expression".into());
+                }
+            }
             Expr::Subscript(inner, args) => {
                 self.collect(inner);
                 for value in args {
@@ -766,7 +778,16 @@ fn non_nullable_type(value: &Expr) -> &Expr {
     }
 }
 
+fn string_literal_annotation(value: &Expr) -> bool {
+    matches!(value, Expr::Subscript(inner, choices)
+        if matches!(&**inner, Expr::Name(name) if matches!(name.as_str(), "typing.Literal" | "typing_extensions.Literal"))
+            && !choices.is_empty() && choices.iter().all(|choice| matches!(choice, Expr::String(_))))
+}
+
 fn unsafe_forward_annotation(value: &Expr) -> bool {
+    if string_literal_annotation(value) {
+        return false;
+    }
     match value {
         Expr::String(name) => name.split('.').any(|part| {
             let mut chars = part.chars();
@@ -1403,6 +1424,17 @@ impl Sources {
         if !self.proof_step() {
             return false;
         }
+        if class.orm == ModelOrm::Sqlalchemy {
+            let mut names = class
+                .attrs
+                .iter()
+                .filter(|attr| attr.name == "__tablename__");
+            if let (Some(attr), None) = (names.next(), names.next()) {
+                if matches!(&attr.value, Expr::String(name) if name != &table.name) {
+                    return false;
+                }
+            }
+        }
         let name = format!("{}.{}", class.module, class.name);
         let cached = self.resolved_classes.borrow();
         if let Some(summary) = cached
@@ -1423,6 +1455,52 @@ impl Sources {
             && summary.unknown.is_empty()
             && summary.table.as_deref() == Some(&table.name)
             && summary.schema == table.schema
+    }
+
+    fn relationship_target(&self, class: &Class, order: Option<&Expr>) -> Option<TableIdentity> {
+        if !self.proof_step() {
+            return None;
+        }
+        let target = format!("{}.{}", class.module, class.name);
+        let project = |resolved: &Resolved| {
+            if !resolved.model
+                || resolved.abstract_model
+                || resolved.identity_unknown
+                || !resolved.unknown.is_empty()
+            {
+                return None;
+            }
+            if let Some(order) = order {
+                let Expr::Name(name) = order else {
+                    return None;
+                };
+                let (owner, column) = name.rsplit_once('.')?;
+                if owner != target || !resolved.mapped_attributes.contains(column) {
+                    return None;
+                }
+            }
+            let name = resolved.table.as_ref()?;
+            let cost = 1 + usize::from(resolved.schema.is_some());
+            let remaining = self.proof_work.get();
+            if cost >= remaining {
+                self.proof_work.set(0);
+                return None;
+            }
+            self.proof_work.set(remaining - cost);
+            Some(TableIdentity {
+                name: name.clone(),
+                schema: resolved.schema.clone(),
+            })
+        };
+        let cached = self.resolved_classes.borrow();
+        if let Some(summary) = cached
+            .get(&(target.clone(), false, 127))
+            .or_else(|| cached.get(&(target.clone(), true, 127)))
+        {
+            return project(summary);
+        }
+        drop(cached);
+        project(&self.resolve_class(class, &mut HashSet::new(), false))
     }
 
     fn relationship(&self, value: &Expr, annotation: &Expr) -> Option<TableReferences> {
@@ -1450,37 +1528,20 @@ impl Sources {
         {
             return None;
         }
-        let Expr::Subscript(list, targets) = &args[0] else {
-            return None;
+        let target_type = non_nullable_type(&args[0]);
+        let target_type = match target_type {
+            Expr::Subscript(list, targets)
+                if matches!(&**list, Expr::Name(name) if name == "list") && targets.len() == 1 =>
+            {
+                &targets[0]
+            }
+            other => other,
         };
-        if !matches!(&**list, Expr::Name(name) if name == "list") || targets.len() != 1 {
-            return None;
-        }
-        let Expr::Name(target) = &targets[0] else {
+        let Expr::Name(target) = target_type else {
             return None;
         };
         let target_class = self.classes.get(target).filter(|c| c.audited)?;
-        let resolved = self.resolve_class(target_class, &mut HashSet::new(), false);
-        if !resolved.model
-            || resolved.abstract_model
-            || resolved.identity_unknown
-            || !resolved.unknown.is_empty()
-        {
-            return None;
-        }
-        let table = TableIdentity {
-            name: resolved.table?,
-            schema: resolved.schema,
-        };
-        if let Some(order) = kwargs.get("order_by") {
-            let Expr::Name(name) = order else {
-                return None;
-            };
-            let (owner, column) = name.rsplit_once('.')?;
-            if owner != target || !resolved.mapped_attributes.contains(column) {
-                return None;
-            }
-        }
+        let table = self.relationship_target(target_class, kwargs.get("order_by"))?;
         let mut references = TableReferences {
             targets: vec![table],
             unknown: vec![],
@@ -2745,10 +2806,7 @@ impl Sources {
         }
         for attr in &class.attrs {
             let annotation = self.expand(&attr.annotation, &class.module, 0);
-            if class.orm == ModelOrm::Sqlalchemy
-                && (unsafe_forward_annotation(&attr.annotation)
-                    || unsafe_forward_annotation(&annotation))
-            {
+            if class.orm == ModelOrm::Sqlalchemy && unsafe_forward_annotation(&annotation) {
                 result.identity_unknown = true;
                 result.eager_unknown = true;
                 result.unknown.push(format!(
@@ -2886,6 +2944,10 @@ impl Sources {
                         }
                     }
                 }
+                "__mapper_args__"
+                    if class.orm == ModelOrm::Sqlalchemy
+                        && matches!(&attr.value, Expr::Dict(options) if options.len() == 1 && matches!(options.get("eager_defaults"), Some(Expr::Bool(_)))) =>
+                    {}
                 "__table__" | "metadata" | "__mapper_args__" | "type_annotation_map" => {
                     result.identity_unknown = true;
                     result
@@ -3039,8 +3101,11 @@ impl Sources {
             ),
             Expr::Subscript(inner, args) => {
                 let name = self.symbol(inner, module, 0).unwrap_or_default();
-                if name == "typing.Literal" {
-                    return false;
+                if matches!(
+                    name.as_str(),
+                    "typing.Literal" | "typing_extensions.Literal"
+                ) {
+                    return !string_literal_annotation(value);
                 }
                 if matches!(
                     name.as_str(),

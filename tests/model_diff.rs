@@ -1064,7 +1064,7 @@ fn metadata_retirement_scoped(
     paths: &str,
 ) -> TempDir {
     let orm = Orm::SqlAlchemy;
-    let current = format!("from typing import Annotated, ClassVar\nfrom sqlalchemy import ForeignKey\nfrom .records import Field\n{}\nJobRef = Annotated[int, mapped_column(ForeignKey('jobs.id'))]\nclass Other(Base):\n    __tablename__ = 'other'\n    id: Mapped[int] = mapped_column(primary_key=True)\n    {}\n", orm.model(""), metadata);
+    let current = format!("from typing import Annotated, ClassVar, Literal\nfrom typing_extensions import Literal as ExtensionLiteral\nfrom sqlalchemy import ForeignKey, String\nfrom .records import Field\n{}\nJobRef = Annotated[int, mapped_column(ForeignKey('jobs.id'))]\nclass Other(Base):\n    __tablename__ = 'other'\n    id: Mapped[int] = mapped_column(primary_key=True)\n    {}\n", orm.model(""), metadata);
     let dir = repo(orm, &current);
     write(dir.path(), "app/__init__.py", "");
     write(dir.path(), "app/records.py", context);
@@ -1143,6 +1143,67 @@ fn tortoise_meta_objects_cannot_authorize_table_retirement() {
 
 #[test]
 fn audited_static_metadata_uses_complete_immutable_constructor_context() {
+    for (declaration, allowed, reason) in [
+        ("__mapper_args__ = {'eager_defaults': True}\n    kind: Mapped[Literal['in progress', 'ready!'] | None] = mapped_column(String())", true, ""),
+        (
+            "__mapper_args__: ClassVar = {'eager_defaults': False}\n    kind: Mapped[ExtensionLiteral['in progress', 'ready!']] = mapped_column(String())",
+            true,
+            "",
+        ),
+        (
+            "__mapper_args__ = {'eager_defaults': choose()}",
+            false,
+            "eager attribute expression",
+        ),
+        (
+            "__mapper_args__: ClassVar = {'eager_defaults': True, 'polymorphic_on': 'kind'}",
+            false,
+            "unsupported mapping metadata",
+        ),
+        (
+            "__mapper_args__ = [('eager_defaults', True)]",
+            false,
+            "unsupported mapping metadata",
+        ),
+        (
+            "kind: Mapped[Literal[True]] = mapped_column(String())",
+            false,
+            "eager attribute expression",
+        ),
+        (
+            "kind: Mapped[Literal[()]] = mapped_column(String())",
+            false,
+            "eager attribute expression",
+        ),
+        (
+            "kind: Mapped[Literal[choose()]] = mapped_column(String())",
+            false,
+            "eager attribute expression",
+        ),
+        (
+            "kind: Mapped[Literal['ready']] = mapped_column(String())\nLiteral = replacement",
+            false,
+            "unresolved mapped type alias",
+        ),
+    ] {
+        let dir = metadata_retirement(
+            RECORD_CONTEXT,
+            declaration,
+            "class ServiceError(Exception):\n    pass\n",
+        );
+        commit(dir.path());
+        let result = table_check(&dir, &["--diff", "origin/main"], allowed);
+        if !allowed {
+            assert!(
+                result.to_string().contains(reason),
+                "{declaration}: {result}"
+            );
+            assert!(
+                !result.to_string().contains("work limit exceeded"),
+                "{declaration}: {result}"
+            );
+        }
+    }
     let metadata = "public_id: Mapped[str] = mapped_column(default=lambda: make_id())\n    def helper(self, value=initialize()):\n        pass\n    __labels__: ClassVar[dict[str, Field]] = {'title': Field('translated', description='Display text')}\n    __lookup__: ClassVar[str] = 'key'\n    __strict__: ClassVar[bool] = True\n    __bare__: ClassVar = 'literal'";
     let dependency = "class ServiceError(Exception):\n    def __init__(self, message: str) -> None:\n        self.message = message\n";
     for (staged, paths) in [
@@ -1510,7 +1571,39 @@ fn table_references_resolve_registry_scalars_and_inferred_relationships() {
     );
     commit(dir.path());
     table_check(&dir, &["--diff", "origin/main"], true);
+    let scalar = REFERENCE_MODELS.replace("list[Label]", "Label | None");
+    let warmed_scalar = format!("{scalar}    another: Mapped[Label | None] = relationship(lazy='raise', order_by=Label.key)\n");
+    for source in [&warmed_scalar, &warmed_scalar.replace("Label", "ZLabel")] {
+        write(dir.path(), "app/models.py", source);
+        commit(dir.path());
+        table_check(&dir, &["--diff", "origin/main"], true);
+    }
     for (name, source, reason) in [
+        (
+            "scalar-target",
+            REFERENCE_MODELS.replace("list[Label]", "Label | None").replace("'labels'", "'jobs'"),
+            "still",
+        ),
+        (
+            "warmed-order-owner",
+            format!("{scalar}    another: Mapped[Label | None] = relationship(lazy='raise', order_by=Link.id)\n"),
+            "relationship",
+        ),
+        (
+            "inherited-duplicate-target",
+            format!("{scalar}\nclass AlsoLabel(Label):\n    pass\n"),
+            "relationship",
+        ),
+        (
+            "nonmatching-invalid-mapping",
+            format!("{scalar}\nclass Unrelated(Base):\n    __tablename__ = 'unrelated'\n    __mapper_args__ = choose()\n"),
+            "eager attribute expression",
+        ),
+        (
+            "ambiguous-scalar-target",
+            REFERENCE_MODELS.replace("list[Label]", "Label | Link | None"),
+            "relationship",
+        ),
         (
             "target",
             REFERENCE_MODELS.replace("'labels'", "'jobs'"),
