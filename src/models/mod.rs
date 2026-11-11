@@ -1,4 +1,5 @@
 //! Conservative, non-executing ORM mapping analysis of immutable Python sources.
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tree_sitter::Node;
@@ -6,6 +7,33 @@ use tree_sitter::Node;
 use crate::ast::TableIdentity;
 use crate::config::ModelOrm;
 use crate::discovery::MigrationFramework;
+
+pub(crate) const TRUSTED_ROOTS: &[&str] = &[
+    "typing",
+    "typing_extensions",
+    "dataclasses",
+    "re",
+    "sqlalchemy",
+    "functools",
+    "contextlib",
+    "string",
+    "datetime",
+    "uuid",
+    "decimal",
+    "contextvars",
+    "pydantic",
+    "tortoise",
+];
+
+const RESERVED_BINDINGS: &[&str] = &[
+    "__builtins__",
+    "__name__",
+    "__package__",
+    "__loader__",
+    "__spec__",
+    "__path__",
+    "__getattr__",
+];
 
 pub struct ModelFile {
     pub path: PathBuf,
@@ -47,6 +75,7 @@ enum Expr {
     Add(Vec<Expr>),
     Other,
     Missing,
+    DeferredDefault,
 }
 #[derive(Clone)]
 struct Attribute {
@@ -64,6 +93,10 @@ struct Class {
     attrs: Vec<Attribute>,
     meta: Vec<Attribute>,
     unsupported: bool,
+    decorators: Vec<Expr>,
+    has_methods: bool,
+    data_body: bool,
+    audited: bool,
     location: String,
 }
 #[derive(Default)]
@@ -71,40 +104,204 @@ struct Sources {
     classes: HashMap<String, Class>,
     aliases: HashMap<String, (Expr, String)>,
     unknown: Vec<String>,
-    globals: Vec<(Expr, String, String)>,
+    proof_work: Cell<usize>,
+    inert_records: RefCell<HashSet<(String, usize)>>,
+    resolved_classes: RefCell<HashMap<(String, bool, usize), Resolved>>,
+    symbol_cache: RefCell<HashMap<(String, String, usize), String>>,
+    cache_symbols: bool,
+    mutated: HashSet<String>,
+    mutation_aliases: Vec<(String, String)>,
+    mutation_calls: HashSet<String>,
+    ambiguous: HashSet<String>,
+    imported_modules: HashMap<String, (PathBuf, ModelOrm)>,
 }
 #[derive(Default, Clone)]
 struct Resolved {
     model: bool,
+    has_relationships: bool,
     table: Option<String>,
     schema: Option<String>,
     columns: HashMap<String, String>,
+    mapped_attributes: HashSet<String>,
     unknown: Vec<String>,
     references: TableReferences,
     abstract_model: bool,
     primary_key: bool,
     identity_unknown: bool,
+    eager_unknown: bool,
 }
 
 impl ModelIndex {
     pub fn build(files: Vec<ModelFile>) -> Self {
-        let mut sources = Sources::default();
+        Self::build_with_dependencies(files, |_| Ok(None))
+    }
+
+    pub(crate) fn build_with_dependencies(
+        files: Vec<ModelFile>,
+        mut dependency: impl FnMut(&str) -> Result<Option<ModelFile>, String>,
+    ) -> Self {
+        let mut sources = Sources {
+            proof_work: Cell::new(4096),
+            ..Sources::default()
+        };
         for file in files {
-            sources.read(file);
-        }
-        for (value, module, location) in &sources.globals {
-            if sources.dynamic_global(value, module) {
+            if TRUSTED_ROOTS.contains(&module(&file.path).split('.').next().unwrap_or("")) {
                 sources.unknown.push(format!(
-                    "{location}: dynamic module expression may construct mappings"
+                    "{}: repository shadows a supported library",
+                    file.path.display()
                 ));
+            }
+            sources.read(file, None);
+        }
+        let mut requested: HashSet<String> = HashSet::new();
+        let mut discovered = HashSet::new();
+        let mut discovered_aliases = HashSet::new();
+        loop {
+            let mut names = Vec::new();
+            for (key, class) in &sources.classes {
+                if (!class.audited && !requested.contains(key)) || !discovered.insert(key.clone()) {
+                    continue;
+                }
+                for base in &class.bases {
+                    sources.constructor_names(base, &class.module, &mut names);
+                }
+                if !class.audited
+                    && !class.bases.iter().any(|base| {
+                        sources.symbol(base, &class.module, 0).as_deref()
+                            == Some("typing.NamedTuple")
+                    })
+                {
+                    continue;
+                }
+                for attr in &class.attrs {
+                    sources.constructor_names(&attr.value, &class.module, &mut names);
+                    sources.constructor_names(&attr.annotation, &class.module, &mut names);
+                }
+            }
+            // Follow selected alias expressions without expanding unrelated module values.
+            for name in &requested {
+                if let Some((value, origin)) = sources.aliases.get(name) {
+                    if discovered_aliases.insert(name.clone()) {
+                        sources.constructor_names(value, origin, &mut names);
+                    }
+                }
+            }
+            let mut progress = false;
+            for name in names {
+                if !name.contains('.') || !requested.insert(name.clone()) {
+                    continue;
+                }
+                if requested.len() > 4096 {
+                    sources
+                        .unknown
+                        .push("dependency resolution work limit exceeded".into());
+                    break;
+                }
+                if !sources.proof_step() {
+                    sources
+                        .unknown
+                        .push("dependency resolution work limit exceeded".into());
+                    break;
+                }
+                progress = true;
+                match dependency(&name) {
+                    Ok(Some(file)) => {
+                        sources.read(file, Some(&name));
+                        progress = true;
+                    }
+                    Ok(None) => {}
+                    Err(reason) => sources.unknown.push(reason),
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+        for name in &sources.ambiguous {
+            if requested.contains(name)
+                || sources.classes.get(name).is_some_and(|class| class.audited)
+            {
+                sources.unknown.push(format!("symbol {name} rebound"));
+            }
+        }
+        sources.cache_symbols = true;
+        let mut mutations: Vec<_> = std::mem::take(&mut sources.mutated)
+            .into_iter()
+            .map(|name| (name, false, 0))
+            .chain(
+                sources
+                    .mutation_calls
+                    .iter()
+                    .cloned()
+                    .map(|name| (name, true, 0)),
+            )
+            .collect();
+        let mut seen_mutations = HashSet::new();
+        while let Some((name, call, depth)) = mutations.pop() {
+            if !seen_mutations.insert((name.clone(), call)) {
+                continue;
+            }
+            if depth > 32 || !sources.proof_step() {
+                sources
+                    .unknown
+                    .push("mutation binding resolution work limit exceeded".into());
+                break;
+            }
+            if let Some(target) = sources.symbol(&Expr::Name(name.clone()), "", 0) {
+                if call {
+                    if matches!(
+                        target.as_str(),
+                        "setattr"
+                            | "delattr"
+                            | "exec"
+                            | "eval"
+                            | "builtins.setattr"
+                            | "builtins.delattr"
+                            | "builtins.exec"
+                            | "builtins.eval"
+                    ) {
+                        sources
+                            .unknown
+                            .push(format!("{name}: explicit namespace mutation"));
+                    }
+                } else {
+                    let mut prefix = target.as_str();
+                    loop {
+                        if sources.classes.contains_key(prefix) {
+                            sources.mutated.insert(prefix.to_owned());
+                            break;
+                        }
+                        let Some((parent, _)) = prefix.rsplit_once('.') else {
+                            break;
+                        };
+                        prefix = parent;
+                    }
+                }
+            }
+            for (alias, target) in &sources.mutation_aliases {
+                if name == *alias {
+                    mutations.push((target.clone(), call, depth + 1));
+                } else if let Some(suffix) = name
+                    .strip_prefix(alias)
+                    .filter(|suffix| suffix.starts_with('.'))
+                {
+                    mutations.push((format!("{target}{suffix}"), call, depth + 1));
+                }
             }
         }
         let mut index = Self {
             mappings: vec![],
             unknown: sources.unknown.clone(),
         };
-        for class in sources.classes.values() {
-            let resolved = sources.resolve_class(class, &mut HashSet::new(), &mut 4096);
+        for class in sources.classes.values().filter(|class| class.audited) {
+            let resolved = sources.resolve_class(class, &mut HashSet::new(), true);
+            if resolved.eager_unknown {
+                index.unknown.push(format!(
+                    "{}: eager class expression is unresolved ({})",
+                    class.location,
+                    describe(&resolved.unknown)
+                ));
+            }
             if !resolved.model || resolved.abstract_model {
                 continue;
             }
@@ -117,8 +314,9 @@ impl ModelIndex {
             }
             if resolved.identity_unknown {
                 index.unknown.push(format!(
-                    "{}: model table identity is unresolved",
-                    class.location
+                    "{}: model table identity is unresolved ({})",
+                    class.location,
+                    describe(&resolved.unknown)
                 ));
             }
             if let Some(table) = resolved.table {
@@ -139,6 +337,11 @@ impl ModelIndex {
                     describe(&resolved.unknown)
                 ));
             }
+        }
+        if sources.proof_work.get() == 0 {
+            index
+                .unknown
+                .push("shared model resolution/expansion work limit exceeded".into());
         }
         index
     }
@@ -292,6 +495,61 @@ const TORTOISE_FIELDS: &[&str] = &[
     "CharEnumField",
 ];
 
+fn sql_type(name: &str) -> bool {
+    name == "sqlalchemy.dialects.postgresql.JSONB"
+        || [
+            "sqlalchemy.",
+            "sqlalchemy.types.",
+            "sqlalchemy.sql.sqltypes.",
+        ]
+        .iter()
+        .any(|prefix| {
+            name.strip_prefix(prefix).is_some_and(|name| {
+                matches!(
+                    name,
+                    "BigInteger"
+                        | "Integer"
+                        | "SmallInteger"
+                        | "String"
+                        | "Text"
+                        | "Boolean"
+                        | "DateTime"
+                        | "Date"
+                        | "Time"
+                        | "LargeBinary"
+                        | "UUID"
+                        | "Float"
+                        | "Numeric"
+                        | "JSON"
+                        | "Enum"
+                )
+            })
+        })
+}
+
+fn registry_key(value: &Expr) -> bool {
+    match value {
+        Expr::Name(name) => matches!(
+            name.as_str(),
+            "str"
+                | "int"
+                | "bool"
+                | "float"
+                | "bytes"
+                | "dict"
+                | "list"
+                | "tuple"
+                | "datetime.datetime"
+        ),
+        Expr::Subscript(inner, args) => {
+            matches!(&**inner, Expr::Name(name) if matches!(name.as_str(), "dict" | "list" | "tuple"))
+                && !args.is_empty()
+                && args.iter().all(registry_key)
+        }
+        _ => false,
+    }
+}
+
 fn safe_schema_call(name: &str) -> bool {
     name.strip_prefix("tortoise.fields.")
         .is_some_and(|field| TORTOISE_FIELDS.contains(&field))
@@ -299,6 +557,7 @@ fn safe_schema_call(name: &str) -> bool {
             name,
             "sqlalchemy.orm.mapped_column"
                 | "sqlalchemy.func.now"
+                | "sqlalchemy.dialects.postgresql.JSONB"
                 | "dict"
                 | "list"
                 | "tuple"
@@ -439,7 +698,16 @@ impl TableReferences {
                     self.unknown.push("unresolved reference expression".into());
                 }
                 self.collect(function);
-                for value in args.iter().chain(kwargs.values()) {
+                for value in args {
+                    self.collect(value);
+                }
+                for (key, value) in kwargs {
+                    if key == "default"
+                        && matches!(value, Expr::DeferredDefault)
+                        && matches!(&**function, Expr::Name(name) if matches!(name.as_str(), "sqlalchemy.orm.mapped_column" | "sqlalchemy.Column" | "sqlalchemy.schema.Column" | "sqlalchemy.sql.schema.Column"))
+                    {
+                        continue;
+                    }
                     self.collect(value);
                 }
             }
@@ -460,11 +728,14 @@ impl TableReferences {
                     self.collect(value);
                 }
             }
-            Expr::Tuple(values) | Expr::Union(values) | Expr::Add(values) => {
+            Expr::Tuple(values) | Expr::Union(values) => {
                 for value in values {
                     self.collect(value);
                 }
             }
+            Expr::Other | Expr::DeferredDefault | Expr::Add(_) => self
+                .unknown
+                .push("unsupported eager reference expression".into()),
             Expr::Limit => self
                 .unknown
                 .push("reference expansion limit exceeded".into()),
@@ -495,6 +766,24 @@ fn non_nullable_type(value: &Expr) -> &Expr {
     }
 }
 
+fn unsafe_forward_annotation(value: &Expr) -> bool {
+    match value {
+        Expr::String(name) => name.split('.').any(|part| {
+            let mut chars = part.chars();
+            !chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }),
+        Expr::Subscript(inner, args) => {
+            unsafe_forward_annotation(inner) || args.iter().any(unsafe_forward_annotation)
+        }
+        Expr::Tuple(args) | Expr::Union(args) => args.iter().any(unsafe_forward_annotation),
+        Expr::Literal => true,
+        _ => false,
+    }
+}
+
 fn contains_limit(value: &Expr) -> bool {
     match value {
         Expr::Limit => true,
@@ -516,6 +805,9 @@ fn contains_limit(value: &Expr) -> bool {
 }
 
 fn describe(reasons: &[String]) -> String {
+    let mut reasons: Vec<_> = reasons.iter().collect();
+    reasons.sort();
+    reasons.dedup();
     let mut result = reasons
         .iter()
         .take(3)
@@ -549,9 +841,45 @@ fn named(node: Node<'_>) -> Vec<Node<'_>> {
 }
 fn expr(node: Node<'_>, source: &str) -> Expr {
     match node.kind() {
-        "identifier" | "attribute" => Expr::Name(text(node, source).to_owned()),
+        "identifier" => Expr::Name(text(node, source).to_owned()),
+        "attribute" => {
+            let mut parts = Vec::new();
+            let mut current = node;
+            loop {
+                match current.kind() {
+                    "attribute" => {
+                        let (Some(object), Some(attribute)) = (
+                            current.child_by_field_name("object"),
+                            current.child_by_field_name("attribute"),
+                        ) else {
+                            return Expr::Other;
+                        };
+                        parts.push(text(attribute, source));
+                        current = object;
+                    }
+                    "parenthesized_expression" => {
+                        let children = named(current);
+                        if children.len() != 1 {
+                            return Expr::Other;
+                        }
+                        current = children[0];
+                    }
+                    "identifier" => {
+                        parts.push(text(current, source));
+                        break;
+                    }
+                    _ => return Expr::Other,
+                }
+            }
+            parts.reverse();
+            Expr::Name(parts.join("."))
+        }
         "string" => {
             let raw = text(node, source);
+            let raw = raw
+                .strip_prefix('r')
+                .or_else(|| raw.strip_prefix('R'))
+                .unwrap_or(raw);
             if raw.len() >= 2
                 && (raw.starts_with('\'') || raw.starts_with('"'))
                 && !raw.contains('\\')
@@ -559,9 +887,25 @@ fn expr(node: Node<'_>, source: &str) -> Expr {
                 && !raw.starts_with("'''")
             {
                 Expr::String(raw[1..raw.len() - 1].into())
+            } else if literal_docstring(node) {
+                Expr::Literal
             } else {
                 Expr::Other
             }
+        }
+        "concatenated_string" if named(node).iter().all(|node| literal_docstring(*node)) => {
+            Expr::Literal
+        }
+        "lambda"
+            if node.child_by_field_name("parameters").is_none()
+                && node.parent().is_some_and(|parent| {
+                    parent.kind() == "keyword_argument"
+                        && parent
+                            .child_by_field_name("name")
+                            .is_some_and(|name| text(name, source) == "default")
+                }) =>
+        {
+            Expr::DeferredDefault
         }
         "integer" | "float" => Expr::Literal,
         "none" => Expr::None,
@@ -645,6 +989,13 @@ fn expr(node: Node<'_>, source: &str) -> Expr {
                 pairs.push((expr(key, source), expr(value, source)));
             }
             if pairs.iter().all(|(key, _)| matches!(key, Expr::String(_))) {
+                let mut keys = HashSet::new();
+                if pairs
+                    .iter()
+                    .any(|(key, _)| matches!(key, Expr::String(key) if !keys.insert(key)))
+                {
+                    return Expr::Other;
+                }
                 Expr::Dict(
                     pairs
                         .into_iter()
@@ -671,6 +1022,10 @@ fn module(path: &std::path::Path) -> String {
         .replace(['/', '\\'], ".");
     name.strip_suffix(".__init__").unwrap_or(&name).to_owned()
 }
+fn literal_docstring(node: Node<'_>) -> bool {
+    node.kind() == "string" && named(node).iter().all(|n| n.kind() != "interpolation")
+}
+
 fn attrs(body: Node<'_>, source: &str, path: &std::path::Path) -> (Vec<Attribute>, bool) {
     let mut result = vec![];
     let mut unsupported = false;
@@ -680,7 +1035,11 @@ fn attrs(body: Node<'_>, source: &str, path: &std::path::Path) -> (Vec<Attribute
         }
         if statement.kind() == "expression_statement" {
             let children = named(statement);
-            if children.first().is_some_and(|n| n.kind() == "string") {
+            if children.len() != 1 {
+                unsupported = true;
+                continue;
+            }
+            if children.first().is_some_and(|n| literal_docstring(*n)) {
                 continue;
             }
             if let Some(assignment) = children.first().filter(|n| n.kind() == "assignment") {
@@ -693,7 +1052,7 @@ fn attrs(body: Node<'_>, source: &str, path: &std::path::Path) -> (Vec<Attribute
                                 .map_or(Expr::Missing, |n| expr(n, source)),
                             annotation: assignment
                                 .child_by_field_name("type")
-                                .map_or(Expr::Other, |n| expr(n, source)),
+                                .map_or(Expr::Missing, |n| expr(n, source)),
                             location: format!(
                                 "{}:{} ({})",
                                 path.display(),
@@ -716,6 +1075,11 @@ fn attrs(body: Node<'_>, source: &str, path: &std::path::Path) -> (Vec<Attribute
                         | "__mapper_cls__"
                         | "__new__"
                         | "__class_getitem__"
+                        | "__declare_first__"
+                        | "__declare_last__"
+                        | "__sa_decl_prepare__"
+                        | "__sa_decl_prepare_nocascade__"
+                        | "__set_name__"
                 )
             })
         {
@@ -729,8 +1093,722 @@ fn attrs(body: Node<'_>, source: &str, path: &std::path::Path) -> (Vec<Attribute
     (result, unsupported)
 }
 
+fn binding_target(node: Node<'_>, source: &str, name: &str) -> bool {
+    match node.kind() {
+        "identifier" => text(node, source) == name,
+        "attribute" => node
+            .child_by_field_name("object")
+            .is_some_and(|n| binding_target(n, source, name)),
+        "subscript" => node
+            .child_by_field_name("value")
+            .is_some_and(|n| binding_target(n, source, name)),
+        _ => named(node)
+            .into_iter()
+            .any(|n| binding_target(n, source, name)),
+    }
+}
+
+fn assignment_names(node: Node<'_>, source: &str, attributes_only: bool, names: &mut Vec<String>) {
+    match node.kind() {
+        "attribute" => {
+            if let Expr::Name(name) = expr(node, source) {
+                names.push(name.split('.').next().unwrap_or("").to_owned());
+            }
+        }
+        "identifier" if !attributes_only => names.push(text(node, source).to_owned()),
+        "subscript" => {
+            if let Some(value) = node.child_by_field_name("value") {
+                assignment_names(value, source, attributes_only, names);
+            }
+        }
+        "pattern_list"
+        | "tuple_pattern"
+        | "list_pattern"
+        | "tuple"
+        | "list"
+        | "parenthesized_expression" => {
+            for child in named(node) {
+                assignment_names(child, source, attributes_only, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn alias_targets(value: &Expr, names: &mut Vec<String>) {
+    match value {
+        Expr::Name(name) => names.push(name.clone()),
+        Expr::Tuple(values) => {
+            for value in values {
+                alias_targets(value, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn mentions_binding(node: Node<'_>, source: &str, name: &str) -> bool {
+    if node.kind() == "function_definition" {
+        return node
+            .child_by_field_name("name")
+            .is_some_and(|n| text(n, source) == name);
+    }
+    if matches!(
+        node.kind(),
+        "assignment" | "augmented_assignment" | "named_expression"
+    ) {
+        return node
+            .child_by_field_name("left")
+            .or_else(|| node.child_by_field_name("name"))
+            .is_some_and(|n| binding_target(n, source, name));
+    }
+    if node.kind() == "delete_statement" {
+        return named(node).iter().any(|n| binding_target(*n, source, name));
+    }
+    if matches!(node.kind(), "import_from_statement" | "import_statement") {
+        let mut context = Sources::default();
+        context.import(node, source, "context", false);
+        return context.aliases.contains_key(&format!("context.{name}"));
+    }
+    (node.kind() == "class_definition"
+        && node
+            .child_by_field_name("name")
+            .is_some_and(|n| text(n, source) == name))
+        || named(node)
+            .into_iter()
+            .any(|n| mentions_binding(n, source, name))
+}
+
+fn namespace_mutation(node: Node<'_>, source: &str, binding: Option<&str>) -> bool {
+    if let (Some(required), Some(left)) = (binding, node.child_by_field_name("left")) {
+        if let Expr::Subscript(owner, keys) = expr(left, source) {
+            if matches!(&*owner, Expr::Call(f, args, kwargs) if matches!(&**f, Expr::Name(name) if matches!(name.as_str(), "globals" | "locals")) && args.is_empty() && kwargs.is_empty())
+                && matches!(keys.as_slice(), [Expr::String(key)] if key != required && !RESERVED_BINDINGS.contains(&key.as_str()))
+            {
+                return node
+                    .child_by_field_name("right")
+                    .is_some_and(|right| namespace_mutation(right, source, binding));
+            }
+        }
+    }
+    (node.kind() == "call"
+        && node
+            .child_by_field_name("function")
+            .is_some_and(|n| matches!(text(n, source), "exec" | "eval" | "setattr" | "delattr")))
+        || (matches!(
+            node.kind(),
+            "assignment" | "augmented_assignment" | "named_expression" | "delete_statement"
+        ) && named(node).first().is_some_and(|n| {
+            let target = text(*n, source);
+            binding_target(*n, source, "globals")
+                || binding_target(*n, source, "locals")
+                || RESERVED_BINDINGS
+                    .iter()
+                    .any(|name| binding_target(*n, source, name))
+                || [
+                    ".modules",
+                    ".meta_path",
+                    ".path_hooks",
+                    ".__dict__",
+                    ".__path__",
+                    ".__loader__",
+                    ".__spec__",
+                    ".__package__",
+                ]
+                .iter()
+                .any(|part| target.contains(part))
+        }))
+        || named(node)
+            .into_iter()
+            .any(|n| namespace_mutation(n, source, binding))
+}
+
+fn data_body(body: Node<'_>) -> bool {
+    named(body).into_iter().all(|node| match node.kind() {
+        "function_definition" | "pass_statement" => true,
+        "decorated_definition" => node
+            .child_by_field_name("definition")
+            .is_some_and(|n| n.kind() == "function_definition"),
+        "expression_statement" => {
+            named(node).len() == 1
+                && named(node).first().is_some_and(|child| {
+                    literal_docstring(*child)
+                        || (child.kind() == "assignment"
+                            && child
+                                .child_by_field_name("left")
+                                .is_some_and(|left| left.kind() == "identifier"))
+                })
+        }
+        _ => false,
+    })
+}
+
+/// Package context cannot silently redirect the exact imported submodule.
+pub(crate) fn check_package(
+    path: &std::path::Path,
+    parsed: &crate::parser::ParsedMigration,
+    child: &str,
+    _required: &str,
+) -> Result<(), String> {
+    if parsed.has_errors() {
+        return Err(format!("{}: invalid package context", path.display()));
+    }
+    for node in named(parsed.root_node()) {
+        if matches!(node.kind(), "import_from_statement" | "import_statement") {
+            let mut context = Sources::default();
+            let module = module(path);
+            context.import(node, &parsed.source, &module, true);
+            if !context.unknown.is_empty() {
+                return Err(format!("{}: ambiguous package import", path.display()));
+            }
+            let child_module = format!("{module}.{child}");
+            if let Some((target, origin)) = context.aliases.get(&child_module) {
+                if !matches!(target, Expr::Name(name) if origin.is_empty() && name == &child_module)
+                {
+                    return Err(format!(
+                        "{}: package binding {child} is redirected",
+                        path.display()
+                    ));
+                }
+            }
+            continue;
+        }
+        if mentions_binding(node, &parsed.source, child)
+            || namespace_mutation(node, &parsed.source, Some(child))
+        {
+            return Err(format!(
+                "{}: package binding {child} is unresolved",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl Resolved {
+    fn copy_cost(&self) -> usize {
+        1 + usize::from(self.table.is_some())
+            + usize::from(self.schema.is_some())
+            + 2 * self.columns.len()
+            + self.mapped_attributes.len()
+            + self
+                .references
+                .targets
+                .iter()
+                .map(|target| 1 + usize::from(target.schema.is_some()))
+                .sum::<usize>()
+    }
+}
+
 impl Sources {
-    fn read(&mut self, file: ModelFile) {
+    fn registry(&self, value: &Expr, module: &str) -> bool {
+        let Expr::Call(function, args, kwargs) = self.expand(value, module, 0) else {
+            return false;
+        };
+        self.symbol(&function, module, 0).as_deref() == Some("sqlalchemy.orm.registry")
+            && args.is_empty()
+            && kwargs.keys().all(|key| key == "type_annotation_map")
+            && kwargs.get("type_annotation_map").is_none_or(|map| {
+                matches!(map, Expr::Mapping(values)
+                if values.iter().all(|(key, value)| registry_key(key) && self.schema_type(value)))
+            })
+    }
+
+    fn schema_type(&self, value: &Expr) -> bool {
+        match value {
+            Expr::Name(name) => sql_type(name),
+            Expr::Call(function, args, kwargs) => {
+                matches!(&**function, Expr::Name(name) if sql_type(name))
+                    && !kwargs.contains_key("**")
+                    && args.iter().chain(kwargs.values()).all(|v| {
+                        self.static_scalar(v, "") || matches!(v, Expr::Bool(_) | Expr::None)
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn eager_effects(&self, value: &Expr) -> bool {
+        let value = self.reference_value(value);
+        let mut effects = TableReferences::default();
+        if let Expr::Call(function, args, kwargs) = &value {
+            if matches!(&**function, Expr::Name(name) if matches!(name.as_str(),
+                "sqlalchemy.orm.relationship" | "sqlalchemy.orm.column_property" |
+                "sqlalchemy.orm.synonym" | "sqlalchemy.orm.registry"))
+            {
+                for value in args.iter().chain(kwargs.values()) {
+                    effects.collect(value);
+                }
+            } else {
+                effects.collect(&value);
+            }
+        } else {
+            effects.collect(&value);
+        }
+        effects.unknown.iter().any(|reason| {
+            reason.starts_with("unsupported reference expression")
+                || matches!(
+                    reason.as_str(),
+                    "unresolved reference expression"
+                        | "unsupported eager reference expression"
+                        | "reference expansion limit exceeded"
+                        | "unresolved column schema argument"
+                )
+        })
+    }
+
+    fn reference_value(&self, value: &Expr) -> Expr {
+        if (matches!(value, Expr::Add(_))
+            || matches!(value, Expr::Call(function, _, _) if matches!(&**function, Expr::Name(name) if name == "len")))
+            && self.static_scalar(value, "")
+        {
+            return Expr::Literal;
+        }
+        match value {
+            Expr::Call(function, args, kwargs) => Expr::Call(
+                function.clone(),
+                args.iter().map(|v| self.reference_value(v)).collect(),
+                kwargs
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.reference_value(v)))
+                    .collect(),
+            ),
+            Expr::Subscript(inner, args) => Expr::Subscript(
+                Box::new(self.reference_value(inner)),
+                args.iter().map(|v| self.reference_value(v)).collect(),
+            ),
+            Expr::Tuple(values) => {
+                Expr::Tuple(values.iter().map(|v| self.reference_value(v)).collect())
+            }
+            Expr::Union(values) => {
+                Expr::Union(values.iter().map(|v| self.reference_value(v)).collect())
+            }
+            Expr::Dict(values) => Expr::Dict(
+                values
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.reference_value(v)))
+                    .collect(),
+            ),
+            Expr::Mapping(values) => Expr::Mapping(
+                values
+                    .iter()
+                    .map(|(k, v)| (self.reference_value(k), self.reference_value(v)))
+                    .collect(),
+            ),
+            _ => value.clone(),
+        }
+    }
+
+    fn maps_table(&self, class: &Class, table: &TableIdentity) -> bool {
+        if !self.proof_step() {
+            return false;
+        }
+        let name = format!("{}.{}", class.module, class.name);
+        let cached = self.resolved_classes.borrow();
+        if let Some(summary) = cached
+            .get(&(name.clone(), false, 127))
+            .or_else(|| cached.get(&(name, true, 127)))
+        {
+            return summary.model
+                && !summary.abstract_model
+                && !summary.identity_unknown
+                && summary.table.as_deref() == Some(&table.name)
+                && summary.schema == table.schema;
+        }
+        drop(cached);
+        let summary = self.resolve_class(class, &mut HashSet::new(), false);
+        summary.model
+            && !summary.abstract_model
+            && !summary.identity_unknown
+            && summary.unknown.is_empty()
+            && summary.table.as_deref() == Some(&table.name)
+            && summary.schema == table.schema
+    }
+
+    fn relationship(&self, value: &Expr, annotation: &Expr) -> Option<TableReferences> {
+        let Expr::Call(_, args, kwargs) = value else {
+            return None;
+        };
+        if !args.is_empty()
+            || kwargs
+                .keys()
+                .any(|key| !matches!(key.as_str(), "secondary" | "lazy" | "viewonly" | "order_by"))
+            || kwargs
+                .get("lazy")
+                .is_some_and(|v| !matches!(v, Expr::String(s) if s == "raise"))
+            || kwargs
+                .get("viewonly")
+                .is_some_and(|v| !matches!(v, Expr::Bool(true)))
+        {
+            return None;
+        }
+        let Expr::Subscript(mapped, args) = annotation else {
+            return None;
+        };
+        if !matches!(&**mapped, Expr::Name(name) if name == "sqlalchemy.orm.Mapped")
+            || args.len() != 1
+        {
+            return None;
+        }
+        let Expr::Subscript(list, targets) = &args[0] else {
+            return None;
+        };
+        if !matches!(&**list, Expr::Name(name) if name == "list") || targets.len() != 1 {
+            return None;
+        }
+        let Expr::Name(target) = &targets[0] else {
+            return None;
+        };
+        let target_class = self.classes.get(target).filter(|c| c.audited)?;
+        let resolved = self.resolve_class(target_class, &mut HashSet::new(), false);
+        if !resolved.model
+            || resolved.abstract_model
+            || resolved.identity_unknown
+            || !resolved.unknown.is_empty()
+        {
+            return None;
+        }
+        let table = TableIdentity {
+            name: resolved.table?,
+            schema: resolved.schema,
+        };
+        if let Some(order) = kwargs.get("order_by") {
+            let Expr::Name(name) = order else {
+                return None;
+            };
+            let (owner, column) = name.rsplit_once('.')?;
+            if owner != target || !resolved.mapped_attributes.contains(column) {
+                return None;
+            }
+        }
+        let mut references = TableReferences {
+            targets: vec![table],
+            unknown: vec![],
+        };
+        if let Some(secondary) = kwargs.get("secondary") {
+            let Expr::String(name) = secondary else {
+                return None;
+            };
+            let parts: Vec<_> = name.split('.').collect();
+            if !(1..=2).contains(&parts.len())
+                || parts.iter().any(|part| {
+                    part.is_empty() || !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                })
+            {
+                return None;
+            }
+            references.targets.push(TableIdentity {
+                name: parts.last()?.to_string(),
+                schema: (parts.len() == 2).then(|| parts[0].to_string()),
+            });
+        }
+        for table in &references.targets {
+            let count = self
+                .classes
+                .values()
+                .filter(|c| c.audited)
+                .filter(|candidate| self.maps_table(candidate, table))
+                .take(2)
+                .count();
+            if count != 1 {
+                return None;
+            }
+        }
+        Some(references)
+    }
+
+    fn mapping_expression(&self, value: &Expr, module: &str) -> bool {
+        match value {
+            Expr::Name(_) => self.symbol(value, module, 0).is_some_and(|name| {
+                ((name.starts_with("sqlalchemy.") || !name.contains('.'))
+                    && matches!(
+                        name.rsplit('.').next(),
+                        Some(
+                            "Mapped"
+                                | "Column"
+                                | "mapped_column"
+                                | "relationship"
+                                | "column_property"
+                                | "synonym"
+                                | "declared_attr"
+                                | "Table"
+                                | "ForeignKey"
+                                | "ForeignKeyConstraint"
+                        )
+                    ))
+                    || name.starts_with("tortoise.fields.")
+            }),
+            Expr::Call(f, args, kwargs) => {
+                self.mapping_expression(f, module)
+                    || args
+                        .iter()
+                        .chain(kwargs.values())
+                        .any(|v| self.mapping_expression(v, module))
+            }
+            Expr::Subscript(f, args) => {
+                self.mapping_expression(f, module)
+                    || args.iter().any(|v| self.mapping_expression(v, module))
+            }
+            Expr::Tuple(values) | Expr::Union(values) | Expr::Add(values) => {
+                values.iter().any(|v| self.mapping_expression(v, module))
+            }
+            Expr::Dict(values) => values.values().any(|v| self.mapping_expression(v, module)),
+            Expr::Mapping(values) => values.iter().any(|(k, v)| {
+                self.mapping_expression(k, module) || self.mapping_expression(v, module)
+            }),
+            _ => false,
+        }
+    }
+
+    fn constructor_names(&self, value: &Expr, module: &str, names: &mut Vec<String>) {
+        match value {
+            Expr::Name(name) => {
+                let local = format!("{module}.{name}");
+                if self.aliases.contains_key(&local) || self.classes.contains_key(&local) {
+                    names.push(local);
+                } else if self.aliases.contains_key(name)
+                    || self.classes.contains_key(name)
+                    || name.contains('.')
+                {
+                    names.push(name.clone());
+                }
+            }
+            Expr::Call(f, args, kwargs) => {
+                self.constructor_names(f, module, names);
+                for value in args.iter().chain(kwargs.values()) {
+                    self.constructor_names(value, module, names);
+                }
+            }
+            Expr::Subscript(f, args) => {
+                self.constructor_names(f, module, names);
+                for value in args {
+                    self.constructor_names(value, module, names);
+                }
+            }
+            Expr::Tuple(values) | Expr::Union(values) | Expr::Add(values) => {
+                for value in values {
+                    self.constructor_names(value, module, names);
+                }
+            }
+            Expr::Dict(values) => {
+                for value in values.values() {
+                    self.constructor_names(value, module, names);
+                }
+            }
+            Expr::Mapping(values) => {
+                for (key, value) in values {
+                    self.constructor_names(key, module, names);
+                    self.constructor_names(value, module, names);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn proof_step(&self) -> bool {
+        let left = self.proof_work.get();
+        self.proof_work.set(left.saturating_sub(1));
+        left > 0
+    }
+
+    fn data_type(&self, value: &Expr, visiting: &mut HashSet<String>) -> bool {
+        if !self.proof_step() {
+            return false;
+        }
+        match value {
+            Expr::Name(name) => {
+                matches!(
+                    name.as_str(),
+                    "str"
+                        | "int"
+                        | "float"
+                        | "bool"
+                        | "bytes"
+                        | "object"
+                        | "dict"
+                        | "list"
+                        | "tuple"
+                        | "set"
+                        | "typing.Any"
+                        | "typing.Self"
+                ) || self
+                    .classes
+                    .get(name)
+                    .is_some_and(|class| self.data_class(class, visiting))
+            }
+            Expr::None => true,
+            Expr::Union(values) => values.iter().all(|v| self.data_type(v, visiting)),
+            Expr::Subscript(inner, args) => {
+                matches!(&**inner, Expr::Name(name) if matches!(name.as_str(), "dict" | "list" | "tuple" | "set" | "typing.Optional" | "typing.Union" | "typing.ClassVar"))
+                    && !args.is_empty()
+                    && args.iter().all(|v| self.data_type(v, visiting))
+            }
+            _ => false,
+        }
+    }
+
+    fn inert_value(&self, value: &Expr, module: &str, visiting: &mut HashSet<String>) -> bool {
+        if !self.proof_step() {
+            return false;
+        }
+        match value {
+            Expr::String(_) | Expr::Bool(_) | Expr::Literal | Expr::None => true,
+            Expr::Tuple(values) => values.iter().all(|v| self.inert_value(v, module, visiting)),
+            Expr::Dict(values) => values
+                .values()
+                .all(|v| self.inert_value(v, module, visiting)),
+            Expr::Mapping(values) => values.iter().all(|(k, v)| {
+                self.inert_value(k, module, visiting) && self.inert_value(v, module, visiting)
+            }),
+            Expr::Call(function, args, kwargs) => {
+                let Some(name) = self.symbol(function, module, 0) else {
+                    return false;
+                };
+                let Some(class) = self.classes.get(&name) else {
+                    return false;
+                };
+                if class.bases.len() != 1
+                    || self.symbol(&class.bases[0], &class.module, 0).as_deref()
+                        != Some("typing.NamedTuple")
+                    || !self.data_class(class, visiting)
+                    || args.len() > class.attrs.len()
+                    || kwargs.contains_key("**")
+                {
+                    return false;
+                }
+                let mut fields = HashSet::new();
+                for attr in class.attrs.iter().take(args.len()) {
+                    fields.insert(attr.name.as_str());
+                }
+                for key in kwargs.keys() {
+                    if !class.attrs.iter().any(|a| &a.name == key) || !fields.insert(key.as_str()) {
+                        return false;
+                    }
+                }
+                class
+                    .attrs
+                    .iter()
+                    .all(|a| fields.contains(a.name.as_str()) || !matches!(a.value, Expr::Missing))
+                    && args
+                        .iter()
+                        .chain(kwargs.values())
+                        .all(|v| self.inert_value(v, module, visiting))
+            }
+            _ => false,
+        }
+    }
+
+    fn inert_metadata(
+        &self,
+        class: &Class,
+        attr: &Attribute,
+        annotation: &Expr,
+        value: &Expr,
+    ) -> bool {
+        // ORM construction/mapping protocols never become application metadata.
+        if matches!(
+            attr.name.as_str(),
+            "metadata"
+                | "registry"
+                | "type_annotation_map"
+                | "__allow_unmapped__"
+                | "__doc__"
+                | "__module__"
+                | "__qualname__"
+                | "__match_args__"
+                | "__mro_entries__"
+                | "__orig_bases__"
+                | "__classcell__"
+                | "__bases__"
+                | "__annotations__"
+                | "__slots__"
+                | "__dict__"
+                | "__tablename__"
+                | "__table_args__"
+                | "__table__"
+                | "__mapper_args__"
+                | "__abstract__"
+                | "__mapper__"
+                | "__table_cls__"
+                | "__mapper_cls__"
+                | "__declare_first__"
+                | "__declare_last__"
+                | "__sa_decl_prepare__"
+                | "__sa_decl_prepare_nocascade__"
+                | "__init__"
+                | "__new__"
+                | "__init_subclass__"
+                | "__class_getitem__"
+                | "__set_name__"
+        ) || (class.orm == ModelOrm::Tortoise && attr.name == "Meta")
+            || attr.name.starts_with("_sa_")
+            || attr.name.starts_with("__sa_")
+        {
+            return false;
+        }
+        (matches!(annotation, Expr::Name(name) if name == "typing.ClassVar")
+            || (matches!(annotation, Expr::Subscript(inner, args) if matches!(&**inner, Expr::Name(name) if name == "typing.ClassVar") && args.len() == 1)
+                && self.data_type(annotation, &mut HashSet::new())))
+            && self.inert_value(value, &class.module, &mut HashSet::new())
+    }
+
+    fn data_class(&self, class: &Class, visiting: &mut HashSet<String>) -> bool {
+        let key = format!("{}.{}", class.module, class.name);
+        if !self.proof_step() || visiting.len() >= 32 || !visiting.insert(key.clone()) {
+            return false;
+        }
+        let cache_key = (key.clone(), 32 - visiting.len());
+        if self.inert_records.borrow().contains(&cache_key) {
+            visiting.remove(&key);
+            return true;
+        }
+        if self.mutated.contains(&key) {
+            visiting.remove(&key);
+            return false;
+        }
+        let record = class.bases.len() == 1
+            && self.symbol(&class.bases[0], &class.module, 0).as_deref()
+                == Some("typing.NamedTuple");
+        let result = class.data_body
+            && class.meta.is_empty()
+            && (record && class.decorators.is_empty() && !class.has_methods)
+            && class
+                .attrs
+                .iter()
+                .map(|a| &a.name)
+                .collect::<HashSet<_>>()
+                .len()
+                == class.attrs.len()
+            && class.attrs.iter().all(|a| {
+                !a.name.starts_with('_')
+                    && self.data_type(&self.expand(&a.annotation, &class.module, 0), visiting)
+                    && (matches!(a.value, Expr::Missing)
+                        || self.inert_value(
+                            &self.expand(&a.value, &class.module, 0),
+                            &class.module,
+                            visiting,
+                        ))
+            });
+        visiting.remove(&key);
+        if result {
+            self.inert_records.borrow_mut().insert(cache_key);
+        }
+        result
+    }
+
+    fn read(&mut self, file: ModelFile, selected: Option<&str>) {
+        let package = file.path.file_name().is_some_and(|n| n == "__init__.py");
+        let module = module(&file.path);
+        if let Some((path, orm)) = self.imported_modules.get(&module) {
+            if path != &file.path || *orm != file.orm {
+                self.unknown
+                    .push(format!("{module}: ambiguous module/package source"));
+            }
+            return;
+        }
+        self.imported_modules
+            .insert(module.clone(), (file.path.clone(), file.orm));
+
         let parsed = match crate::parser::ParsedMigration::parse(file.source.clone()) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -744,8 +1822,35 @@ impl Sources {
                 .push(format!("{}: invalid Python source", file.path.display()));
             return;
         }
-        let module = module(&file.path);
-        let mut pending = vec![(parsed.root_node(), false)];
+        for node in named(parsed.root_node()) {
+            if namespace_mutation(node, &file.source, None) {
+                self.unknown
+                    .push(format!("{module}: dynamic module namespace"));
+            }
+            let definition = if node.kind() == "decorated_definition" {
+                named(node)
+                    .into_iter()
+                    .find(|n| matches!(n.kind(), "function_definition" | "class_definition"))
+            } else {
+                Some(node)
+            };
+            if definition.is_some_and(|n| {
+                matches!(n.kind(), "function_definition" | "class_definition")
+                    && n.child_by_field_name("name").is_some_and(|name| {
+                        RESERVED_BINDINGS.contains(&text(name, &file.source))
+                            && text(name, &file.source) != "__getattr__"
+                    })
+            }) {
+                self.unknown.push(format!(
+                    "{module}: reserved definition binding is unresolved"
+                ));
+            }
+        }
+        let mut pending = if selected.is_none() {
+            vec![(parsed.root_node(), false)]
+        } else {
+            vec![]
+        };
         while let Some((node, in_function)) = pending.pop() {
             if in_function && node.kind() == "class_definition" {
                 self.unknown.push(format!(
@@ -763,38 +1868,28 @@ impl Sources {
         }
         for node in named(parsed.root_node()) {
             match node.kind() {
-                "import_from_statement" | "import_statement" => self.import(
-                    node,
-                    &file.source,
-                    &module,
-                    file.path.file_name().is_some_and(|n| n == "__init__.py"),
-                ),
-                "class_definition" => self.read_class(node, &file, &module, false),
+                "import_from_statement" | "import_statement" => {
+                    self.import(node, &file.source, &module, package);
+                }
+                "class_definition" => {
+                    self.read_class(node, &file, &module, vec![], selected.is_none())
+                }
                 "decorated_definition" => {
                     if let Some(class) = named(node)
                         .into_iter()
                         .find(|n| n.kind() == "class_definition")
                     {
-                        self.unknown.push(format!(
-                            "{}:{}: unsupported class decorator may register mappings",
-                            file.path.display(),
-                            node.start_position().row + 1
-                        ));
-                        self.read_class(class, &file, &module, true);
+                        let decorators = named(node)
+                            .into_iter()
+                            .filter(|n| n.kind() == "decorator")
+                            .map(|n| {
+                                named(n)
+                                    .first()
+                                    .map_or(Expr::Other, |n| expr(*n, &file.source))
+                            })
+                            .collect();
+                        self.read_class(class, &file, &module, decorators, selected.is_none());
                     } else {
-                        for decorator in named(node).into_iter().filter(|n| n.kind() == "decorator")
-                        {
-                            let expression = named(decorator)
-                                .first()
-                                .map_or(Expr::Other, |n| expr(*n, &file.source));
-                            if !self.safe_decorator(&expression, &module) {
-                                self.unknown.push(format!(
-                                    "{}:{}: unsupported module decorator may mutate mappings",
-                                    file.path.display(),
-                                    node.start_position().row + 1
-                                ));
-                            }
-                        }
                         if let Some(function) = named(node)
                             .into_iter()
                             .find(|n| n.kind() == "function_definition")
@@ -804,10 +1899,7 @@ impl Sources {
                                 if self.aliases.contains_key(&key)
                                     || self.classes.contains_key(&key)
                                 {
-                                    self.unknown.push(format!(
-                                        "{}: symbol {key} rebound",
-                                        file.path.display()
-                                    ));
+                                    self.ambiguous.insert(key.clone());
                                 }
                                 self.aliases.insert(key, (Expr::Other, module.clone()));
                             }
@@ -815,6 +1907,14 @@ impl Sources {
                     }
                 }
                 "expression_statement" => {
+                    if named(node).len() != 1 {
+                        self.unknown.push(format!(
+                            "{}:{}: unsupported multi-expression module statement",
+                            file.path.display(),
+                            node.start_position().row + 1
+                        ));
+                        continue;
+                    }
                     if let Some(assignment) =
                         named(node).first().filter(|n| n.kind() == "assignment")
                     {
@@ -823,16 +1923,13 @@ impl Sources {
                             assignment.child_by_field_name("right"),
                         ) {
                             if left.kind() == "identifier" {
+                                if RESERVED_BINDINGS.contains(&text(left, &file.source)) {
+                                    self.unknown.push(format!(
+                                        "{}: dynamic module namespace",
+                                        file.path.display()
+                                    ));
+                                }
                                 let value = expr(right, &file.source);
-                                self.globals.push((
-                                    value.clone(),
-                                    module.clone(),
-                                    format!(
-                                        "{}:{}",
-                                        file.path.display(),
-                                        node.start_position().row + 1
-                                    ),
-                                ));
                                 if let Expr::Call(function, _, _) = &value {
                                     let name =
                                         self.symbol(function, &module, 0).unwrap_or_default();
@@ -851,13 +1948,10 @@ impl Sources {
                                 if self.aliases.contains_key(&key)
                                     || self.classes.contains_key(&key)
                                 {
-                                    self.unknown.push(format!(
-                                        "{}: symbol {key} rebound",
-                                        file.path.display()
-                                    ));
+                                    self.ambiguous.insert(key.clone());
                                 }
                                 self.aliases.insert(key, (value, module.clone()));
-                            } else {
+                            } else if selected.is_none() {
                                 self.unknown.push(format!(
                                     "{}:{}: dynamic attribute assignment",
                                     file.path.display(),
@@ -865,28 +1959,55 @@ impl Sources {
                                 ));
                             }
                         }
-                    } else if named(node).first().is_none_or(|n| n.kind() != "string") {
-                        self.unknown.push(format!(
-                            "{}:{}: top-level call may mutate mappings",
-                            file.path.display(),
-                            node.start_position().row + 1
-                        ));
                     }
                 }
                 "if_statement" | "for_statement" | "try_statement" | "with_statement"
                 | "while_statement" | "match_statement" => {
-                    self.unknown.push(format!(
-                        "{}:{}: conditional/dynamic module definitions",
-                        file.path.display(),
-                        node.start_position().row + 1
-                    ));
+                    if selected.is_none() {
+                        self.unknown.push(format!(
+                            "{}:{}: conditional/dynamic module definitions",
+                            file.path.display(),
+                            node.start_position().row + 1
+                        ));
+                    } else {
+                        let keys: Vec<_> = self
+                            .aliases
+                            .keys()
+                            .chain(self.classes.keys())
+                            .filter(|key| key.starts_with(&format!("{module}.")))
+                            .cloned()
+                            .collect();
+                        for key in keys {
+                            if mentions_binding(
+                                node,
+                                &file.source,
+                                key.rsplit('.').next().unwrap_or(""),
+                            ) {
+                                self.unknown.push(format!(
+                                    "{}: conditional binding {key}",
+                                    file.path.display()
+                                ));
+                            }
+                        }
+                        if selected.is_some_and(|key| {
+                            mentions_binding(
+                                node,
+                                &file.source,
+                                key.rsplit('.').next().unwrap_or(""),
+                            )
+                        }) {
+                            self.unknown.push(format!(
+                                "{}: conditional required definition",
+                                file.path.display()
+                            ));
+                        }
+                    }
                 }
                 "function_definition" => {
                     if let Some(name) = node.child_by_field_name("name") {
                         let key = format!("{module}.{}", text(name, &file.source));
                         if self.aliases.contains_key(&key) || self.classes.contains_key(&key) {
-                            self.unknown
-                                .push(format!("{}: symbol {key} rebound", file.path.display()));
+                            self.ambiguous.insert(key.clone());
                         }
                         self.aliases.insert(key, (Expr::Other, module.clone()));
                     }
@@ -899,35 +2020,148 @@ impl Sources {
                 )),
             }
         }
-    }
-    fn safe_decorator(&self, expression: &Expr, module: &str) -> bool {
-        match expression {
-            Expr::Name(_) => matches!(
-                self.symbol(expression, module, 0).as_deref(),
-                Some(
-                    "staticmethod"
-                        | "classmethod"
-                        | "contextlib.contextmanager"
-                        | "contextlib.asynccontextmanager"
-                        | "functools.cache"
-                        | "typing.overload"
-                )
-            ),
-            Expr::Call(function, args, kwargs) => {
-                let name = self.symbol(function, module, 0).unwrap_or_default();
-                // This Session event runs on queries, not during mapping construction.
-                if name == "sqlalchemy.event.listens_for" && args.len() == 2 && kwargs.is_empty() {
-                    return self.symbol(&args[0], module, 0).as_deref()
-                        == Some("sqlalchemy.orm.Session")
-                        && matches!(&args[1], Expr::String(event) if event == "do_orm_execute");
+        let mut mutations = vec![parsed.root_node()];
+        while let Some(node) = mutations.pop() {
+            if node.kind() == "assignment" {
+                if let (Some(left), Some(right)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    let mut bindings = Vec::new();
+                    assignment_names(left, &file.source, false, &mut bindings);
+                    let mut targets = Vec::new();
+                    alias_targets(&expr(right, &file.source), &mut targets);
+                    for binding in bindings {
+                        for target in &targets {
+                            let target = if matches!(
+                                target.as_str(),
+                                "setattr" | "delattr" | "exec" | "eval"
+                            ) {
+                                target.clone()
+                            } else {
+                                format!("{module}.{target}")
+                            };
+                            self.mutation_aliases
+                                .push((format!("{module}.{binding}"), target));
+                        }
+                    }
                 }
-                name == "functools.lru_cache"
-                    && args.iter().all(|arg| matches!(arg, Expr::Literal))
-                    && kwargs
-                        .values()
-                        .all(|arg| matches!(arg, Expr::Literal | Expr::Bool(_)))
             }
-            _ => false,
+            if matches!(
+                node.kind(),
+                "assignment" | "augmented_assignment" | "delete_statement"
+            ) {
+                if let Some(target) = node
+                    .child_by_field_name("left")
+                    .or_else(|| named(node).first().copied())
+                {
+                    let mut roots = Vec::new();
+                    assignment_names(target, &file.source, true, &mut roots);
+                    self.mutated
+                        .extend(roots.into_iter().map(|name| format!("{module}.{name}")));
+                }
+            }
+            mutations.extend(named(node));
+        }
+        {
+            let mut imported_names = Vec::new();
+            let mut imports = vec![parsed.root_node()];
+            while let Some(node) = imports.pop() {
+                if matches!(node.kind(), "import_statement" | "import_from_statement") {
+                    let mut context = Sources::default();
+                    context.import(node, &file.source, &module, package);
+                    for (name, (target, _)) in context.aliases {
+                        if let Expr::Name(target) = target {
+                            imported_names
+                                .push((name.rsplit('.').next().unwrap_or("").to_owned(), target));
+                        }
+                    }
+                }
+                imports.extend(named(node));
+            }
+            let mut pending = vec![(parsed.root_node(), false)];
+            while let Some((node, deferred)) = pending.pop() {
+                if node.kind() == "call" {
+                    if let Some(function) = node.child_by_field_name("function") {
+                        let raw = text(function, &file.source);
+                        let symbol = self
+                            .symbol(&expr(function, &file.source), &module, 0)
+                            .unwrap_or_default();
+                        let mutation_call = matches!(
+                            symbol.as_str(),
+                            "setattr"
+                                | "delattr"
+                                | "exec"
+                                | "eval"
+                                | "builtins.setattr"
+                                | "builtins.delattr"
+                                | "builtins.exec"
+                                | "builtins.eval"
+                        );
+                        if let Expr::Name(name) = expr(function, &file.source) {
+                            let name = format!("{module}.{name}");
+                            if self.mutation_aliases.iter().any(|(alias, _)| {
+                                name == *alias
+                                    || name
+                                        .strip_prefix(alias)
+                                        .is_some_and(|suffix| suffix.starts_with('.'))
+                            }) {
+                                self.mutation_calls.insert(name);
+                            }
+                        }
+                        let explicit = matches!(
+                            symbol.as_str(),
+                            "sqlalchemy.Table" | "sqlalchemy.schema.Table"
+                        ) || (symbol == "type"
+                            && node
+                                .child_by_field_name("arguments")
+                                .is_some_and(|args| named(args).len() > 1))
+                            || [
+                                "map_imperatively",
+                                "automap_base",
+                                "mapped",
+                                "mapped_as_dataclass",
+                            ]
+                            .iter()
+                            .any(|name| {
+                                raw.rsplit('.').next() == Some(name)
+                                    || symbol.rsplit('.').next() == Some(name)
+                            })
+                            || (deferred
+                                && self.mapping_expression(&expr(function, &file.source), &module));
+                        let imported_mapping = imported_names.iter().any(|(binding, target)| {
+                            let target = if raw == binding {
+                                target.clone()
+                            } else if let Some(suffix) = raw.strip_prefix(&format!("{binding}.")) {
+                                format!("{target}.{suffix}")
+                            } else {
+                                return false;
+                            };
+                            matches!(
+                                target.as_str(),
+                                "builtins.setattr"
+                                    | "builtins.delattr"
+                                    | "builtins.exec"
+                                    | "builtins.eval"
+                            ) || (selected.is_none()
+                                && (matches!(
+                                    target.as_str(),
+                                    "sqlalchemy.Table" | "sqlalchemy.schema.Table"
+                                ) || (deferred
+                                    && self.mapping_expression(&Expr::Name(target), ""))))
+                        });
+                        if mutation_call || (explicit && selected.is_none()) || imported_mapping {
+                            self.unknown.push(format!(
+                                "{}:{}: unsupported explicit ORM declaration",
+                                file.path.display(),
+                                node.start_position().row + 1
+                            ));
+                        }
+                    }
+                }
+                let deferred = deferred || matches!(node.kind(), "function_definition" | "lambda");
+                pending.extend(named(node).into_iter().map(|child| (child, deferred)));
+            }
         }
     }
     fn static_scalar(&self, value: &Expr, module: &str) -> bool {
@@ -944,7 +2178,7 @@ impl Sources {
             _ => false,
         }
     }
-    fn dynamic_global(&self, value: &Expr, module: &str) -> bool {
+    fn dynamic_mapping_value(&self, value: &Expr, module: &str) -> bool {
         match value {
             Expr::Call(function, args, kwargs) => {
                 let name = self.symbol(function, module, 0).unwrap_or_default();
@@ -990,19 +2224,26 @@ impl Sources {
                     )
                 ) || name.starts_with("sqlalchemy.dialects.");
                 !known
-                    || args.iter().any(|a| self.dynamic_global(a, module))
-                    || kwargs.values().any(|a| self.dynamic_global(a, module))
+                    || args.iter().any(|a| self.dynamic_mapping_value(a, module))
+                    || kwargs
+                        .values()
+                        .any(|a| self.dynamic_mapping_value(a, module))
             }
             Expr::Tuple(values) | Expr::Union(values) => {
-                values.iter().any(|a| self.dynamic_global(a, module))
+                values.iter().any(|a| self.dynamic_mapping_value(a, module))
             }
-            Expr::Dict(values) => values.values().any(|a| self.dynamic_global(a, module)),
+            Expr::Dict(values) => values
+                .values()
+                .any(|a| self.dynamic_mapping_value(a, module)),
             Expr::Mapping(values) => values.iter().any(|(key, value)| {
-                self.dynamic_global(key, module) || self.dynamic_global(value, module)
+                self.dynamic_mapping_value(key, module) || self.dynamic_mapping_value(value, module)
             }),
-            Expr::Subscript(_, values) => values.iter().any(|a| self.dynamic_global(a, module)),
+            Expr::Subscript(inner, values) => {
+                self.dynamic_mapping_value(inner, module)
+                    || values.iter().any(|a| self.dynamic_mapping_value(a, module))
+            }
             Expr::Add(_) => !self.static_scalar(value, module),
-            Expr::Other => true,
+            Expr::Other | Expr::Limit => true,
             _ => false,
         }
     }
@@ -1038,10 +2279,13 @@ impl Sources {
                     continue;
                 }
                 let alias = if parts.len() == 3 { parts[2] } else { parts[0] };
+                if RESERVED_BINDINGS.contains(&alias) {
+                    self.unknown
+                        .push(format!("{module}: reserved import binding is unresolved"));
+                }
                 let key = format!("{module}.{alias}");
                 if self.aliases.contains_key(&key) || self.classes.contains_key(&key) {
-                    self.unknown
-                        .push(format!("{module}: imported symbol {alias} rebound"));
+                    self.ambiguous.insert(key.clone());
                 }
                 self.aliases.insert(
                     key,
@@ -1062,17 +2306,27 @@ impl Sources {
                         parts[0].split('.').next().unwrap_or(parts[0]),
                     )
                 };
+                if RESERVED_BINDINGS.contains(&alias) {
+                    self.unknown
+                        .push(format!("{module}: reserved import binding is unresolved"));
+                }
                 let key = format!("{module}.{alias}");
                 if self.aliases.contains_key(&key) || self.classes.contains_key(&key) {
-                    self.unknown
-                        .push(format!("{module}: imported symbol {alias} rebound"));
+                    self.ambiguous.insert(key.clone());
                 }
                 self.aliases
                     .insert(key, (Expr::Name(target.into()), String::new()));
             }
         }
     }
-    fn read_class(&mut self, node: Node<'_>, file: &ModelFile, module: &str, decorated: bool) {
+    fn read_class(
+        &mut self,
+        node: Node<'_>,
+        file: &ModelFile,
+        module: &str,
+        decorators: Vec<Expr>,
+        audited: bool,
+    ) {
         let (Some(name), Some(body)) = (
             node.child_by_field_name("name"),
             node.child_by_field_name("body"),
@@ -1092,10 +2346,13 @@ impl Sources {
                 if let Some(body) = nested.child_by_field_name("body") {
                     let (meta_attrs, meta_unsupported) = attrs_fn(body, &file.source, &file.path);
                     meta = meta_attrs;
-                    let meta_unsupported =
-                        meta_unsupported || nested.child_by_field_name("superclasses").is_some();
+                    let meta_unsupported = meta_unsupported
+                        || nested.child_by_field_name("superclasses").is_some()
+                        || named(body).iter().any(|node| {
+                            matches!(node.kind(), "class_definition" | "decorated_definition")
+                        });
                     unsupported |= meta_unsupported;
-                    if meta_unsupported {
+                    if meta_unsupported && audited {
                         self.unknown.push(format!(
                             "{}:{}: dynamic nested Meta class",
                             file.path.display(),
@@ -1104,11 +2361,7 @@ impl Sources {
                     }
                 }
             } else {
-                self.unknown.push(format!(
-                    "{}:{}: nested class may declare additional mappings",
-                    file.path.display(),
-                    nested.start_position().row + 1
-                ));
+                unsupported = true;
             }
         }
         let bases = node
@@ -1118,10 +2371,7 @@ impl Sources {
             });
         let key = format!("{module}.{}", text(name, &file.source));
         if self.aliases.remove(&key).is_some() {
-            self.unknown.push(format!(
-                "{}: class {key} shadows another symbol",
-                file.path.display()
-            ));
+            self.ambiguous.insert(key.clone());
         }
         let class = Class {
             name: text(name, &file.source).into(),
@@ -1130,14 +2380,17 @@ impl Sources {
             attrs,
             meta,
             bases,
-            unsupported: unsupported || decorated,
+            unsupported,
+            decorators,
+            has_methods: named(body)
+                .iter()
+                .any(|n| matches!(n.kind(), "function_definition" | "decorated_definition")),
+            data_body: data_body(body),
+            audited,
             location: format!("{}:{}", file.path.display(), node.start_position().row + 1),
         };
-        if self.classes.insert(key, class).is_some() {
-            self.unknown.push(format!(
-                "{}: duplicate class definition",
-                file.path.display()
-            ));
+        if self.classes.insert(key.clone(), class).is_some() {
+            self.ambiguous.insert(key);
         }
     }
     fn symbol(&self, value: &Expr, module: &str, depth: usize) -> Option<String> {
@@ -1147,38 +2400,57 @@ impl Sources {
         let Expr::Name(name) = value else {
             return None;
         };
-        let (head, suffix) = name
-            .split_once('.')
-            .map_or((name.as_str(), ""), |(h, s)| (h, s));
-        let local = format!("{module}.{head}");
-        if let Some((alias, origin)) = self.aliases.get(&local) {
-            let target = self.symbol(alias, origin, depth + 1)?;
-            return Some(if suffix.is_empty() {
-                target
-            } else {
-                format!("{target}.{suffix}")
-            });
+        let key = (name.clone(), module.to_owned(), depth);
+        if self.cache_symbols {
+            if let Some(result) = self.symbol_cache.borrow().get(&key) {
+                return Some(result.clone());
+            }
         }
-        if self.classes.contains_key(&local) {
-            return Some(if suffix.is_empty() {
-                local
-            } else {
-                format!("{local}.{suffix}")
-            });
+        if !self.proof_step() {
+            return None;
         }
-        if let Some((alias, origin)) = self.aliases.get(name) {
-            return self.symbol(alias, origin, depth + 1);
+        let result = (|| {
+            let (head, suffix) = name
+                .split_once('.')
+                .map_or((name.as_str(), ""), |(h, s)| (h, s));
+            let local = format!("{module}.{head}");
+            if self.ambiguous.contains(&local) || self.ambiguous.contains(name) {
+                return None;
+            }
+            if let Some((alias, origin)) = self.aliases.get(&local) {
+                let target = self.symbol(alias, origin, depth + 1)?;
+                return Some(if suffix.is_empty() {
+                    target
+                } else {
+                    format!("{target}.{suffix}")
+                });
+            }
+            if self.classes.contains_key(&local) {
+                return Some(if suffix.is_empty() {
+                    local
+                } else {
+                    format!("{local}.{suffix}")
+                });
+            }
+            if let Some((alias, origin)) = self.aliases.get(name) {
+                return self.symbol(alias, origin, depth + 1);
+            }
+            Some(name.clone())
+        })();
+        if self.cache_symbols {
+            if let Some(result) = &result {
+                self.symbol_cache.borrow_mut().insert(key, result.clone());
+            }
         }
-        Some(name.clone())
+        result
     }
     fn expand(&self, value: &Expr, module: &str, depth: usize) -> Expr {
-        self.expand_bounded(value, module, depth, &mut 4096)
+        self.expand_bounded(value, module, depth)
     }
-    fn expand_bounded(&self, value: &Expr, module: &str, depth: usize, budget: &mut usize) -> Expr {
-        if depth > 32 || *budget == 0 {
+    fn expand_bounded(&self, value: &Expr, module: &str, depth: usize) -> Expr {
+        if depth > 32 || !self.proof_step() {
             return Expr::Limit;
         }
-        *budget -= 1;
         match value {
             Expr::Name(name) => {
                 if let Some((alias, origin)) = self
@@ -1186,30 +2458,30 @@ impl Sources {
                     .get(&format!("{module}.{name}"))
                     .or_else(|| self.aliases.get(name))
                 {
-                    return self.expand_bounded(alias, origin, depth + 1, budget);
+                    return self.expand_bounded(alias, origin, depth + 1);
                 }
                 let symbol = self
                     .symbol(value, module, 0)
                     .unwrap_or_else(|| name.clone());
                 if let Some((alias, origin)) = self.aliases.get(&symbol) {
-                    return self.expand_bounded(alias, origin, depth + 1, budget);
+                    return self.expand_bounded(alias, origin, depth + 1);
                 }
                 Expr::Name(symbol)
             }
             Expr::Call(function, args, kwargs) => Expr::Call(
-                Box::new(self.expand_bounded(function, module, depth + 1, budget)),
+                Box::new(self.expand_bounded(function, module, depth + 1)),
                 args.iter()
-                    .map(|a| self.expand_bounded(a, module, depth + 1, budget))
+                    .map(|a| self.expand_bounded(a, module, depth + 1))
                     .collect(),
                 kwargs
                     .iter()
-                    .map(|(k, v)| (k.clone(), self.expand_bounded(v, module, depth + 1, budget)))
+                    .map(|(k, v)| (k.clone(), self.expand_bounded(v, module, depth + 1)))
                     .collect(),
             ),
             Expr::Dict(values) => Expr::Dict(
                 values
                     .iter()
-                    .map(|(k, v)| (k.clone(), self.expand_bounded(v, module, depth + 1, budget)))
+                    .map(|(k, v)| (k.clone(), self.expand_bounded(v, module, depth + 1)))
                     .collect(),
             ),
             Expr::Mapping(values) => Expr::Mapping(
@@ -1217,31 +2489,31 @@ impl Sources {
                     .iter()
                     .map(|(key, value)| {
                         (
-                            self.expand_bounded(key, module, depth + 1, budget),
-                            self.expand_bounded(value, module, depth + 1, budget),
+                            self.expand_bounded(key, module, depth + 1),
+                            self.expand_bounded(value, module, depth + 1),
                         )
                     })
                     .collect(),
             ),
             Expr::Add(args) => Expr::Add(
                 args.iter()
-                    .map(|a| self.expand_bounded(a, module, depth + 1, budget))
+                    .map(|a| self.expand_bounded(a, module, depth + 1))
                     .collect(),
             ),
             Expr::Union(args) => Expr::Union(
                 args.iter()
-                    .map(|a| self.expand_bounded(a, module, depth + 1, budget))
+                    .map(|a| self.expand_bounded(a, module, depth + 1))
                     .collect(),
             ),
             Expr::Tuple(args) => Expr::Tuple(
                 args.iter()
-                    .map(|a| self.expand_bounded(a, module, depth + 1, budget))
+                    .map(|a| self.expand_bounded(a, module, depth + 1))
                     .collect(),
             ),
             Expr::Subscript(inner, args) => Expr::Subscript(
-                Box::new(self.expand_bounded(inner, module, depth + 1, budget)),
+                Box::new(self.expand_bounded(inner, module, depth + 1)),
                 args.iter()
-                    .map(|a| self.expand_bounded(a, module, depth + 1, budget))
+                    .map(|a| self.expand_bounded(a, module, depth + 1))
                     .collect(),
             ),
             _ => value.clone(),
@@ -1251,10 +2523,10 @@ impl Sources {
         &self,
         class: &Class,
         visiting: &mut HashSet<String>,
-        budget: &mut usize,
+        relationships: bool,
     ) -> Resolved {
         let key = format!("{}.{}", class.module, class.name);
-        if *budget == 0 {
+        if !self.proof_step() {
             return Resolved {
                 model: true,
                 identity_unknown: true,
@@ -1265,7 +2537,6 @@ impl Sources {
                 ..Resolved::default()
             };
         }
-        *budget -= 1;
         if visiting.len() >= 128 || !visiting.insert(key.clone()) {
             return Resolved {
                 model: true,
@@ -1273,9 +2544,85 @@ impl Sources {
                 ..Resolved::default()
             };
         }
+        let cache_key = (key.clone(), relationships, 128 - visiting.len());
+        let cached = self.resolved_classes.borrow();
+        if let Some(cached) = cached.get(&cache_key).or_else(|| {
+            cached
+                .get(&(key.clone(), !relationships, 128 - visiting.len()))
+                .filter(|summary| !summary.has_relationships)
+        }) {
+            let cost = cached.copy_cost();
+            let remaining = self.proof_work.get();
+            visiting.remove(&key);
+            if cost >= remaining {
+                self.proof_work.set(0);
+                return Resolved {
+                    identity_unknown: true,
+                    unknown: vec![format!(
+                        "{}: model summary copy work limit exceeded",
+                        class.location
+                    )],
+                    ..Resolved::default()
+                };
+            }
+            self.proof_work.set(remaining - cost);
+            return cached.clone();
+        }
+        drop(cached);
         let mut result = Resolved::default();
+        if self.mutated.contains(&key) {
+            visiting.remove(&key);
+            return Resolved {
+                eager_unknown: true,
+                identity_unknown: true,
+                unknown: vec![format!(
+                    "{}: required class binding is mutated",
+                    class.location
+                )],
+                ..Resolved::default()
+            };
+        }
+        let dataclass = class.decorators.len() == 1
+            && matches!(&class.decorators[0], Expr::Call(f, args, kw)
+                if self.symbol(f, &class.module, 0).as_deref() == Some("dataclasses.dataclass") && args.is_empty() && kw.len() == 2
+                    && matches!(kw.get("frozen"), Some(Expr::Bool(true))) && matches!(kw.get("slots"), Some(Expr::Bool(true))))
+            && class
+                .bases
+                .iter()
+                .all(|base| self.symbol(base, &class.module, 0).as_deref() == Some("object"));
+        if !class.decorators.is_empty() && !dataclass {
+            result.eager_unknown = true;
+            result
+                .unknown
+                .push(format!("{}: unresolved class decorator", class.location));
+        }
+
+        for attr in &class.meta {
+            if self.eager_effects(&self.expand(&attr.value, &class.module, 0))
+                || self.eager_effects(&self.expand(&attr.annotation, &class.module, 0))
+            {
+                result.identity_unknown = true;
+                result.eager_unknown = true;
+                result.unknown.push(format!(
+                    "{}: eager Meta expression is unresolved",
+                    attr.location
+                ));
+            }
+        }
         let mut terminal_base = false;
         for base in &class.bases {
+            let expanded = self.expand(base, &class.module, 0);
+            let static_factory = matches!(&expanded, Expr::Call(function, args, kwargs)
+                if matches!(&**function, Expr::Name(name) if matches!(name.as_str(), "sqlalchemy.orm.declarative_base" | "sqlalchemy.ext.declarative.declarative_base"))
+                    && args.is_empty() && kwargs.is_empty());
+            if !static_factory && self.eager_effects(&expanded) {
+                result.identity_unknown = true;
+                result.eager_unknown = true;
+                result.unknown.push(format!(
+                    "{}: eager base expression is unresolved",
+                    class.location
+                ));
+            }
             let symbol = self.symbol(base, &class.module, 0).unwrap_or_default();
             let terminal = match class.orm {
                 ModelOrm::Sqlalchemy => matches!(
@@ -1308,11 +2655,14 @@ impl Sources {
                 continue;
             }
             if let Some(parent) = self.classes.get(&symbol) {
-                let inherited = self.resolve_class(parent, visiting, budget);
+                let inherited = self.resolve_class(parent, visiting, relationships);
                 result.model |= inherited.model;
+                result.has_relationships |= inherited.has_relationships;
+                result.eager_unknown |= inherited.eager_unknown;
                 result.table = inherited.table.or(result.table);
                 result.schema = inherited.schema.or(result.schema);
                 result.columns.extend(inherited.columns);
+                result.mapped_attributes.extend(inherited.mapped_attributes);
                 result.unknown.extend(inherited.unknown);
                 result
                     .references
@@ -1346,6 +2696,44 @@ impl Sources {
                     .push(format!("{}: unresolved base {symbol}", class.location));
             }
         }
+        let mapping = !result.model
+            && (class.attrs.iter().any(|attr| {
+                matches!(
+                    attr.name.as_str(),
+                    "__tablename__"
+                        | "__table__"
+                        | "registry"
+                        | "__mapper_args__"
+                        | "type_annotation_map"
+                ) || self.mapping_expression(&attr.value, &class.module)
+                    || self.mapping_expression(&attr.annotation, &class.module)
+            }) || !class.meta.is_empty());
+        if !result.model && !mapping {
+            if class.unsupported && !dataclass {
+                result.eager_unknown = true;
+                result.unknown.push(format!(
+                    "{}: unsupported class-body construct or decorator",
+                    class.location
+                ));
+            }
+            visiting.remove(&key);
+            return result;
+        }
+        if dataclass && mapping {
+            result.eager_unknown = true;
+            result.unknown.push(format!(
+                "{}: mapping-bearing class has no supported ORM ancestry",
+                class.location
+            ));
+        }
+        if !class.audited {
+            result.identity_unknown = true;
+            result.eager_unknown = true;
+            result.unknown.push(format!(
+                "{}: dependency is outside audited model sources",
+                class.location
+            ));
+        }
         if terminal_base && class.orm == ModelOrm::Sqlalchemy && result.table.is_none() {
             result.abstract_model = true;
         }
@@ -1356,12 +2744,73 @@ impl Sources {
             result.abstract_model = false;
         }
         for attr in &class.attrs {
+            let annotation = self.expand(&attr.annotation, &class.module, 0);
+            if class.orm == ModelOrm::Sqlalchemy
+                && (unsafe_forward_annotation(&attr.annotation)
+                    || unsafe_forward_annotation(&annotation))
+            {
+                result.identity_unknown = true;
+                result.eager_unknown = true;
+                result.unknown.push(format!(
+                    "{}: executable forward annotation is unresolved",
+                    attr.location
+                ));
+                continue;
+            }
+            if attr.name.starts_with("__")
+                && !matches!(attr.annotation, Expr::Missing)
+                && !matches!(&annotation, Expr::Name(name) if name == "typing.ClassVar")
+                && !self.data_type(&annotation, &mut HashSet::new())
+            {
+                result.identity_unknown = true;
+                result.eager_unknown = true;
+                result.unknown.push(format!(
+                    "{}: mapping annotation is not proven inert",
+                    attr.location
+                ));
+                continue;
+            }
+            let expanded = self.expand(&attr.value, &class.module, 0);
+            if self.inert_metadata(class, attr, &annotation, &expanded)
+                || (attr.name == "registry"
+                    && self.registry(&attr.value, &class.module)
+                    && (matches!(attr.annotation, Expr::Missing)
+                        || matches!(&annotation, Expr::Name(name) if name == "typing.ClassVar")))
+            {
+                result.mapped_attributes.remove(&attr.name);
+                continue;
+            }
+            if self.eager_effects(&expanded) || self.eager_effects(&annotation) {
+                result.identity_unknown = true;
+                result.eager_unknown = true;
+                result.unknown.push(format!(
+                    "{}: eager attribute expression is unresolved",
+                    attr.location
+                ));
+                continue;
+            }
+            if matches!(&expanded, Expr::Call(f, _, _) if self.symbol(f, &class.module, 0).as_deref() == Some("sqlalchemy.orm.relationship"))
+            {
+                result.has_relationships = true;
+                if relationships {
+                    if let Some(references) = self.relationship(&expanded, &annotation) {
+                        result.references.targets.extend(references.targets);
+                    } else {
+                        result.references.unknown.push(format!(
+                            "{}: relationship evidence is unresolved",
+                            attr.location
+                        ));
+                        // Column evidence retains its existing secondary-table guard;
+                        // unresolved endpoint references belong to table retirement.
+                        self.field(class, attr, annotation, expanded, &mut result);
+                    }
+                }
+                continue;
+            }
+            result.references.collect(&self.reference_value(&expanded));
             result
                 .references
-                .collect(&self.expand(&attr.value, &class.module, 0));
-            result
-                .references
-                .collect(&self.expand(&attr.annotation, &class.module, 0));
+                .collect(&self.reference_value(&annotation));
             match attr.name.as_str() {
                 "__tablename__" => match &attr.value {
                     Expr::String(value) => result.table = Some(value.clone()),
@@ -1384,7 +2833,6 @@ impl Sources {
                 "__table_args__" => {
                     // An own __table_args__ replaces inherited options, including schema.
                     result.schema = None;
-                    let expanded = self.expand(&attr.value, &class.module, 0);
                     let mut values = vec![];
                     match &expanded {
                         Expr::Dict(items) => values.push(items),
@@ -1438,20 +2886,44 @@ impl Sources {
                         }
                     }
                 }
-                "__table__" | "metadata" | "__mapper_args__" => {
+                "__table__" | "metadata" | "__mapper_args__" | "type_annotation_map" => {
                     result.identity_unknown = true;
                     result
                         .unknown
                         .push(format!("{}: unsupported mapping metadata", attr.location));
                 }
-                "__allow_unmapped__" | "__doc__" | "__module__" | "__qualname__" => {}
+                "Meta" if class.orm == ModelOrm::Tortoise => {
+                    result.identity_unknown = true;
+                    result.eager_unknown = true;
+                    result
+                        .unknown
+                        .push(format!("{}: unresolved Meta metadata", attr.location));
+                }
+                "__allow_unmapped__" if matches!(attr.value, Expr::Bool(_)) => {}
+                "__doc__" if matches!(attr.value, Expr::String(_) | Expr::None) => {}
                 name if name.starts_with("__") => {
                     result.identity_unknown = true;
+                    result.eager_unknown |= self.dynamic_mapping_value(&expanded, &class.module);
                     result
                         .unknown
                         .push(format!("{}: unsupported mapping hook", attr.location));
                 }
-                _ => self.field(class, attr, &mut result),
+                _ => {
+                    let mut field = Resolved::default();
+                    self.field(class, attr, annotation, expanded, &mut field);
+                    result.mapped_attributes.remove(&attr.name);
+                    if !field.columns.is_empty()
+                        && field.unknown.is_empty()
+                        && !field.identity_unknown
+                    {
+                        result.mapped_attributes.insert(attr.name.clone());
+                    }
+                    result.columns.extend(field.columns);
+                    result.unknown.extend(field.unknown);
+                    result.primary_key |= field.primary_key;
+                    result.identity_unknown |= field.identity_unknown;
+                    result.eager_unknown |= field.eager_unknown;
+                }
             }
         }
         if class.orm == ModelOrm::Tortoise {
@@ -1507,6 +2979,7 @@ impl Sources {
             }
         }
         if class.unsupported {
+            result.eager_unknown = true;
             result.identity_unknown = true;
             result.unknown.push(format!(
                 "{}: unsupported class-body construct or decorator",
@@ -1518,6 +2991,19 @@ impl Sources {
             result.abstract_model = true;
         }
         visiting.remove(&key);
+        if result.unknown.is_empty()
+            && result.references.unknown.is_empty()
+            && !result.identity_unknown
+            && !result.eager_unknown
+        {
+            let cost = result.copy_cost();
+            if cost < self.proof_work.get() {
+                self.proof_work.set(self.proof_work.get() - cost);
+                self.resolved_classes
+                    .borrow_mut()
+                    .insert(cache_key, result.clone());
+            }
+        }
         result
     }
     fn unknown_type(&self, value: &Expr, module: &str, nested: bool) -> bool {
@@ -1585,10 +3071,17 @@ impl Sources {
             _ => true,
         }
     }
-    fn field(&self, class: &Class, attr: &Attribute, result: &mut Resolved) {
-        let annotation = self.expand(&attr.annotation, &class.module, 0);
+    fn field(
+        &self,
+        class: &Class,
+        attr: &Attribute,
+        annotation: Expr,
+        mut value: Expr,
+        result: &mut Resolved,
+    ) {
         if contains_limit(&annotation) {
             result.identity_unknown = true;
+            result.eager_unknown = true;
             result.unknown.push(format!(
                 "{}: annotation expansion limit exceeded",
                 attr.location
@@ -1603,12 +3096,22 @@ impl Sources {
             _ => false,
         };
         if classvar {
+            if !matches!(&annotation, Expr::Name(name) if name == "typing.ClassVar")
+                && !self.data_type(&annotation, &mut HashSet::new())
+            {
+                result.identity_unknown = true;
+                result.eager_unknown = true;
+                result.unknown.push(format!(
+                    "{}: ClassVar annotation is not proven inert",
+                    attr.location
+                ));
+                return;
+            }
             if attr.name == "registry" {
-                let registry = self.expand(&attr.value, &class.module, 0);
-                if self.dynamic_global(&registry, &class.module)
-                    || !matches!(&registry, Expr::Call(function, args, kwargs) if self.symbol(function, &class.module, 0).as_deref() == Some("sqlalchemy.orm.registry") && args.is_empty() && kwargs.keys().all(|key| key == "type_annotation_map"))
-                {
+                let registry = &value;
+                if !self.registry(registry, &class.module) {
                     result.identity_unknown = true;
+                    result.eager_unknown = true;
                     result.unknown.push(format!(
                         "{}: unsupported registry may alter table identity",
                         attr.location
@@ -1616,14 +3119,17 @@ impl Sources {
                 }
                 return;
             }
-            if !matches!(
-                self.expand(&attr.value, &class.module, 0),
-                Expr::Call(_, _, _)
-            ) {
+            if !matches!(&value, Expr::Call(function, _, _)
+                if matches!(self.symbol(function, &class.module, 0).as_deref(), Some("sqlalchemy.orm.mapped_column" | "sqlalchemy.Column" | "sqlalchemy.schema.Column")))
+            {
+                result.eager_unknown = true;
+                result.unknown.push(format!(
+                    "{}: class metadata is not proven inert",
+                    attr.location
+                ));
                 return;
             }
         }
-        let mut value = self.expand(&attr.value, &class.module, 0);
         let mut annotated_column = None;
         if class.orm == ModelOrm::Sqlalchemy {
             if let Expr::Subscript(wrapper, args) = &annotation {
@@ -1712,6 +3218,7 @@ impl Sources {
         }
         if contains_limit(&value) {
             result.identity_unknown = true;
+            result.eager_unknown = true;
             result
                 .unknown
                 .push(format!("{}: field expansion limit exceeded", attr.location));
@@ -1752,6 +3259,7 @@ impl Sources {
                         return;
                     } else {
                         result.identity_unknown = true;
+                        result.eager_unknown = true;
                         result.unknown.push(format!(
                             "{}: unsupported field expression {name}",
                             attr.location
@@ -1782,6 +3290,7 @@ impl Sources {
                                 matches!(field, "ForeignKeyField" | "OneToOneField"),
                             ));
                         } else {
+                            result.eager_unknown = true;
                             result.unknown.push(format!(
                                 "{}: unsupported Tortoise field {field}",
                                 attr.location
@@ -1790,6 +3299,7 @@ impl Sources {
                         }
                     } else {
                         result.identity_unknown = true;
+                        result.eager_unknown = true;
                         result
                             .unknown
                             .push(format!("{}: unresolved custom field", attr.location));
@@ -1859,7 +3369,6 @@ impl Sources {
             return;
         }
         if class.orm == ModelOrm::Sqlalchemy {
-            let annotation = self.expand(&attr.annotation, &class.module, 0);
             if let Expr::Subscript(wrapper, _) = &annotation {
                 let name = self.symbol(wrapper, &class.module, 0).unwrap_or_default();
                 if name == "sqlalchemy.orm.Mapped" {
@@ -1874,6 +3383,7 @@ impl Sources {
             }
         }
         // Literals are plain application constants; unknown descriptors are not.
+        result.eager_unknown |= self.dynamic_mapping_value(&value, &class.module);
         if !matches!(
             value,
             Expr::String(_) | Expr::Bool(_) | Expr::Literal | Expr::None
@@ -2086,7 +3596,7 @@ mod tests {
             "len = register_models\nLENGTH = len('prefix')",
             "len = len\nLENGTH = len('prefix')",
         ] {
-            let source = format!("import string\nfrom sqlalchemy.orm import DeclarativeBase\nclass Base(DeclarativeBase):\n    pass\nclass Job(Base):\n    __tablename__ = 'jobs'\nLENGTH = {expression}\n");
+            let source = format!("import string\nfrom sqlalchemy.orm import DeclarativeBase, mapped_column\nfrom sqlalchemy import String\nLENGTH = {expression}\nclass Base(DeclarativeBase):\n    pass\nclass Job(Base):\n    __tablename__ = 'jobs'\n    value = mapped_column(String(LENGTH))\n");
             assert!(
                 index(ModelOrm::Sqlalchemy, &source)
                     .column_absence(
@@ -2119,8 +3629,6 @@ mod tests {
         let base = "from sqlalchemy.orm import DeclarativeBase, Mapped\nclass Base(DeclarativeBase):\n    pass\nclass Job(Base):\n    __tablename__ = 'jobs'\n";
         for dynamic in [
             "Other = type('Other', (Base,), {})\n",
-            "Other = create_model()\n",
-            "True and register_models()\n",
             "while ready():\n    register_models()\n",
             "class Other(Base):\n    __annotations__ = {'signed_manifest': Mapped[bytes]}\n",
             "class Hook(Base):\n    def __init_subclass__(cls):\n        cls.signed_manifest = field()\n",
@@ -2178,10 +3686,8 @@ mod tests {
     #[test]
     fn shadowed_constructor_and_module_decorator_fail_closed() {
         let base = "from sqlalchemy.orm import DeclarativeBase, mapped_column\nclass Base(DeclarativeBase):\n    pass\n";
-        for dynamic in [
-            "def mapped_column(*args):\n    return renamed_column(*args)\n",
-            "@register_mapping\ndef helper():\n    pass\n",
-        ] {
+        {
+            let dynamic = "def mapped_column(*args):\n    return renamed_column(*args)\n";
             let source = format!(
                 "{base}{dynamic}class Job(Base):\n    __tablename__ = 'jobs'\n    manifest = mapped_column()\n"
             );
@@ -2406,6 +3912,155 @@ mod tests {
                 "signed_manifest"
             )
             .is_err());
+    }
+    #[test]
+    fn overlapping_orm_sources_cannot_silently_discard_one_interpretation() {
+        let files = [ModelOrm::Sqlalchemy, ModelOrm::Tortoise]
+            .into_iter()
+            .map(|orm| ModelFile {
+                path: "models.py".into(),
+                orm,
+                source: "class Plain: pass\n".into(),
+            })
+            .collect();
+        let reason = ModelIndex::build(files)
+            .table_absence(&table("retired"))
+            .unwrap_err();
+        assert!(
+            reason.contains("ambiguous module/package source"),
+            "{reason}"
+        );
+    }
+    #[test]
+    fn cached_ancestry_preserves_depth_and_copy_bounds() {
+        let mut source = String::from(
+            "from sqlalchemy.orm import DeclarativeBase\nclass C0(DeclarativeBase):\n    pass\n",
+        );
+        for n in 1..=128 {
+            source.push_str(&format!("class C{n}(C{}):\n    pass\n", n - 1));
+        }
+        for warm in [false, true] {
+            let mut sources = Sources {
+                proof_work: Cell::new(4096),
+                ..Sources::default()
+            };
+            sources.read(
+                ModelFile {
+                    path: "app/models.py".into(),
+                    orm: ModelOrm::Sqlalchemy,
+                    source: source.clone(),
+                },
+                None,
+            );
+            sources.cache_symbols = true;
+            if warm {
+                let valid = sources.resolve_class(
+                    &sources.classes["app.models.C127"],
+                    &mut HashSet::new(),
+                    true,
+                );
+                assert!(valid.unknown.is_empty(), "{:?}", valid.unknown);
+            }
+            let invalid = sources.resolve_class(
+                &sources.classes["app.models.C128"],
+                &mut HashSet::new(),
+                true,
+            );
+            assert!(
+                invalid
+                    .unknown
+                    .iter()
+                    .any(|reason| reason.contains("cyclic inheritance")),
+                "{:?}",
+                invalid.unknown
+            );
+            assert!(sources.proof_work.get() > 0);
+            if !warm {
+                let valid = sources.resolve_class(
+                    &sources.classes["app.models.C127"],
+                    &mut HashSet::new(),
+                    true,
+                );
+                assert!(valid.unknown.is_empty(), "{:?}", valid.unknown);
+            }
+        }
+        let mut sources = Sources {
+            proof_work: Cell::new(4096),
+            ..Sources::default()
+        };
+        sources.read(ModelFile { path: "app/models.py".into(), orm: ModelOrm::Sqlalchemy, source: "from sqlalchemy.orm import DeclarativeBase, mapped_column\nclass Wide(DeclarativeBase):\n    __tablename__ = 'wide'\n".to_owned() + &(0..64).map(|n| format!("    value{n} = mapped_column()\n")).collect::<String>() }, None);
+        sources.cache_symbols = true;
+        let class = &sources.classes["app.models.Wide"];
+        assert!(sources
+            .resolve_class(class, &mut HashSet::new(), true)
+            .unknown
+            .is_empty());
+        let result = (0..32)
+            .find_map(|_| {
+                let result = sources.resolve_class(class, &mut HashSet::new(), true);
+                (!result.unknown.is_empty()).then_some(result)
+            })
+            .unwrap();
+        assert!(result
+            .unknown
+            .iter()
+            .any(|reason| reason.contains("work limit exceeded")));
+        assert_eq!(sources.proof_work.get(), 0);
+    }
+
+    #[test]
+    fn cached_record_shapes_preserve_depth_and_argument_checks() {
+        let mut source =
+            String::from("from typing import NamedTuple\nclass R0(NamedTuple):\n    text: str\n");
+        for n in 1..=32 {
+            source.push_str(&format!("class R{n}(NamedTuple):\n    child: R{}\n", n - 1));
+        }
+        for warm in [false, true] {
+            let mut sources = Sources {
+                proof_work: Cell::new(4096),
+                ..Sources::default()
+            };
+            sources.read(
+                ModelFile {
+                    path: "app/records.py".into(),
+                    orm: ModelOrm::Sqlalchemy,
+                    source: source.clone(),
+                },
+                None,
+            );
+            sources.cache_symbols = true;
+            if warm {
+                assert!(
+                    sources.data_class(&sources.classes["app.records.R31"], &mut HashSet::new())
+                );
+            }
+            assert!(!sources.data_class(&sources.classes["app.records.R32"], &mut HashSet::new()));
+            assert!(sources.proof_work.get() > 0);
+            assert!(sources.data_class(&sources.classes["app.records.R0"], &mut HashSet::new()));
+            assert!(!sources.inert_value(
+                &Expr::Call(
+                    Box::new(Expr::Name("app.records.R0".into())),
+                    vec![Expr::Other],
+                    HashMap::new()
+                ),
+                "",
+                &mut HashSet::new()
+            ));
+        }
+    }
+
+    #[test]
+    fn independent_declarations_share_the_resolution_budget() {
+        let mut source = String::from("from sqlalchemy.orm import DeclarativeBase, Mapped\nclass Base(DeclarativeBase):\n    pass\n");
+        for n in 0..4097 {
+            source.push_str(&format!(
+                "class Item{n}(Base):\n    __tablename__ = 'item{n}'\n    id: Mapped[int]\n"
+            ));
+        }
+        let reason = index(ModelOrm::Sqlalchemy, &source)
+            .table_absence(&table("retired"))
+            .unwrap_err();
+        assert!(reason.contains("work limit exceeded"), "{reason}");
     }
     #[test]
     fn ordinary_builtin_optional_annotations_are_supported() {

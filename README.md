@@ -109,6 +109,34 @@ coverage already configured at the merge-base is used, for both snapshots;
 changing coverage in the contraction PR cannot grant permission to drop a column.
 Model-source settings are read from the repository root, not nested configs.
 
+SQLAlchemy `ClassVar` metadata supports literals, containers and statically
+resolved `NamedTuple` records. Required declarations and package bindings are
+read from the same immutable snapshot. Reserved ORM names remain mapping inputs,
+including Tortoise `Meta`. A zero-parameter lambda is supported only as `default=`
+on a supported SQLAlchemy column constructor; its body is deferred until DML.
+
+The native guarantee covers supported static mappings and references in the
+explicitly audited inventory, which must include every model, mixin, reference and
+mapping registration location relevant to the checked tables. Ordinary function bodies and their decorators, logging,
+translation and unrelated initializer calls are not certified for runtime effects.
+Unsupported explicit ORM declarations and mapping/namespace mutations remain
+blocking, including inside deferred bodies. The audit assumes the documented
+behavior of supported external libraries and that import hooks, external code and
+hidden helper effects preserve the statically resolved module, class and field
+bindings and do not inject mappings. ZDM does not establish those runtime
+assumptions or prove arbitrary Python execution safe. Supporting definition reads
+do not expand audited mapping coverage. Unknown relevant declarations, ambiguous
+modules and unresolved package bindings remain blocking.
+
+Resolution and proof share one fixed 4096-step budget per snapshot; exhaustion
+blocks both column and table retirement, even for otherwise simple large sources.
+
+Table-reference evidence also resolves validated registry type maps, concrete
+PostgreSQL JSONB types and static scalar column options. Inferred
+`Mapped[list[Concrete]]` relationships require unique audited target/secondary
+mappings and, when present, literal `lazy="raise"`, `viewonly=True` and a mapped
+ordering column on that same target. Dynamic or unsupported options remain unknown.
+
 Then remove the ORM field and its application usage in a compatibility PR, leaving
 the database column in place. In a later migration-only PR, use the ordinary drop:
 

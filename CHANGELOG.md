@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.1 - 2026-11-11
+
+- Update rustix to 1.1.6 for RUSTSEC-2026-0486.
+
+- Resolve supported static metadata records, registry type maps, scalar column lengths and inferred relationship references from immutable repository sources.
+- Check required declarations and package bindings throughout the audited inventory, including explicit mutations in deferred syntax, without certifying unrelated runtime effects. Support zero-parameter column-default lambdas under this contract.
+- Bound reusable model summaries and record-shape checks without increasing evidence, inheritance, alias or work limits.
+
 ## 0.10.0 - 2026-11-10
 
 - Add native R019 table-retirement proof for Alembic and Aerich using a base-configured immutable ancestor, historical mapping, and complete merge-base/HEAD or index absence.
