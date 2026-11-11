@@ -93,6 +93,7 @@ fn repo(orm: Orm, model: &str) -> TempDir {
     git(dir.path(), &["config", "user.name", "ZDM Test"]);
     git(dir.path(), &["config", "user.email", "zdm@example.com"]);
     write(dir.path(), "pyproject.toml", &config(orm, "'app'"));
+    write(dir.path(), "app/__init__.py", "");
     write(dir.path(), "app/models.py", model);
     commit(dir.path());
     git(dir.path(), &["branch", "origin/main"]);
@@ -147,6 +148,40 @@ fn earlier_compatibility_removal_allows_later_drop_for_both_orms() {
         add_drop(&dir, orm, "signed_manifest");
         commit(dir.path());
         check(&dir, &["--diff", "origin/main"], true);
+    }
+}
+
+#[test]
+fn audited_cross_module_bases_preserve_orm_and_require_regular_packages() {
+    for orm in [Orm::SqlAlchemy, Orm::Tortoise] {
+        for package in [true, false] {
+            let (base, current) = match orm {
+                Orm::SqlAlchemy => (
+                    "from sqlalchemy.orm import DeclarativeBase\nclass Base(DeclarativeBase):\n    pass\n",
+                    orm.model("").replace("class Base(DeclarativeBase):\n    pass", "from .base import Base"),
+                ),
+                Orm::Tortoise => (
+                    "from tortoise import models\nclass Base(models.Model):\n    class Meta:\n        abstract = True\n",
+                    orm.model("").replace("class Job(models.Model):", "from .base import Base\nclass Job(Base):"),
+                ),
+            };
+            let dir = repo(orm, &current);
+            write(dir.path(), "app/base.py", base);
+            if !package {
+                std::fs::remove_file(dir.path().join("app/__init__.py")).unwrap();
+            }
+            commit(dir.path());
+            git(dir.path(), &["branch", "-f", "origin/main", "HEAD"]);
+            add_drop(&dir, orm, "signed_manifest");
+            commit(dir.path());
+            let result = check(&dir, &["--diff", "origin/main"], package);
+            if !package {
+                assert!(
+                    result.to_string().contains("missing dependency context"),
+                    "{result}"
+                );
+            }
+        }
     }
 }
 
@@ -411,6 +446,8 @@ fn model_paths_normalize_current_directory_components() {
     for paths in ["'.'", "'./app'", "'.', './app'"] {
         let dir = repo(orm, &orm.model(""));
         write(dir.path(), "pyproject.toml", &config(orm, paths));
+        write(dir.path(), "alembic/__init__.py", "");
+        write(dir.path(), "alembic/versions/__init__.py", "");
         commit(dir.path());
         git(dir.path(), &["branch", "-f", "origin/main", "HEAD"]);
         add_drop(&dir, orm, "signed_manifest");
@@ -662,6 +699,16 @@ fn gateway_repo(earlier_removal: bool) -> TempDir {
         GATEWAY_OPERATIONS,
         include_str!("fixtures/models/gateway/module_operations.py"),
     );
+    for package in [
+        "app",
+        "app/persistence",
+        "app/ai_tools",
+        "app/ai_tools/persistence",
+        "app/ai_generators",
+        "app/ai_generators/persistence",
+    ] {
+        write(dir.path(), &format!("{package}/__init__.py"), "");
+    }
     write(dir.path(), GATEWAY_MODEL, &gateway_mapped());
     commit(dir.path());
     if earlier_removal {
@@ -751,15 +798,18 @@ fn gateway_reintroduction_duplicate_and_missing_dependency_cannot_authorize_drop
             gateway_drop(&dir, "migrations/beta_versions");
             let result = gateway_check(&dir, staged, false);
             if scenario == "reintroduce" || scenario == "duplicate" {
-                assert!(result
-                    .to_string()
-                    .contains("checked revision: column signed_manifest is still mapped"));
+                assert!(
+                    result
+                        .to_string()
+                        .contains("checked revision: column signed_manifest is still mapped"),
+                    "{scenario}: {result}"
+                );
             }
         }
     }
 }
 
-fn table_check(dir: &TempDir, args: &[&str], allowed: bool) {
+fn table_check(dir: &TempDir, args: &[&str], allowed: bool) -> Value {
     let output = cargo_bin_cmd!("zdm")
         .current_dir(dir.path())
         .args(args)
@@ -775,6 +825,7 @@ fn table_check(dir: &TempDir, args: &[&str], allowed: bool) {
     );
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["diagnostics"].as_array().unwrap().is_empty(), allowed);
+    json
 }
 
 fn table_retirement(orm: Orm) -> TempDir {
@@ -961,5 +1012,757 @@ fn table_retirement_proof_rejects_schema_ambiguity_and_unresolved_relations() {
         write(dir.path(), "app/models.py", model);
         commit(dir.path());
         table_check(&dir, &["--diff", "origin/main"], allowed);
+    }
+}
+
+const RECORD_CONTEXT: &str = r#"from typing import Any, ClassVar, NamedTuple, Self
+from dataclasses import dataclass
+import re
+from .faults import ServiceError
+PATTERN = re.compile(pattern())
+logger = logging.get_logger(__name__)
+message = translate("title")
+adapter = TypeAdapter(Sequence[Unknown])
+@decorate()
+def unrelated(value=initialize()) -> Unknown:
+    pass
+class Field(NamedTuple):
+    text: str
+    description: str
+class RecordError(ServiceError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+@dataclass(frozen=True, slots=True)
+class Key:
+    name: str
+    value: Any
+    namespace: str = "example"
+    def __str__(self) -> str:
+        return self.name
+    @classmethod
+    def parse(cls, raw: str = initialize()) -> Self | None:
+        return cls(raw, None)
+@dataclass(frozen=True, slots=True)
+class Entry:
+    key: Key
+    text: str
+"#;
+
+fn metadata_retirement(context: &str, metadata: &str, dependency: &str) -> TempDir {
+    metadata_retirement_scoped(
+        context,
+        metadata,
+        dependency,
+        "'app/models.py', 'app/records.py'",
+    )
+}
+
+fn metadata_retirement_scoped(
+    context: &str,
+    metadata: &str,
+    dependency: &str,
+    paths: &str,
+) -> TempDir {
+    let orm = Orm::SqlAlchemy;
+    let current = format!("from typing import Annotated, ClassVar\nfrom sqlalchemy import ForeignKey\nfrom .records import Field\n{}\nJobRef = Annotated[int, mapped_column(ForeignKey('jobs.id'))]\nclass Other(Base):\n    __tablename__ = 'other'\n    id: Mapped[int] = mapped_column(primary_key=True)\n    {}\n", orm.model(""), metadata);
+    let dir = repo(orm, &current);
+    write(dir.path(), "app/__init__.py", "");
+    write(dir.path(), "app/records.py", context);
+    write(
+        dir.path(),
+        "app/faults/__init__.py",
+        "from .base import ServiceError\n",
+    );
+    write(dir.path(), "app/faults/base.py", dependency);
+    write(dir.path(), "pyproject.toml", &config(orm, paths));
+    commit(dir.path());
+    let prior = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    write(
+        dir.path(),
+        "zero-downtime-migrations.toml",
+        &format!(
+            "model-retirement-ref = '{}'\n",
+            String::from_utf8(prior.stdout).unwrap().trim()
+        ),
+    );
+    write(
+        dir.path(),
+        "app/models.py",
+        &current.replace("__tablename__ = 'jobs'", "__tablename__ = 'retained'"),
+    );
+    commit(dir.path());
+    git(dir.path(), &["branch", "-f", "origin/main", "HEAD"]);
+    write(
+        dir.path(),
+        orm.migration(),
+        "from alembic import op\ndef upgrade():\n    op.drop_table('jobs')\n",
+    );
+    dir
+}
+
+#[test]
+fn tortoise_meta_objects_cannot_authorize_table_retirement() {
+    for (staged, metadata) in [
+        (false, "Meta: ClassVar[MetaRecord] = MetaRecord('jobs')"),
+        (true, "Meta: ClassVar[MetaRecord] = MetaRecord('jobs')"),
+        (false, "Meta: ClassVar = MetaConfig"),
+        (
+            false,
+            "class Meta:\n        abstract = True\n    Meta: ClassVar = MetaConfig",
+        ),
+    ] {
+        let dir = table_retirement(Orm::Tortoise);
+        fs::remove_file(dir.path().join(Orm::Tortoise.migration())).unwrap();
+        let source = format!("from typing import ClassVar, NamedTuple\nfrom tortoise import models, fields\nclass MetaRecord(NamedTuple):\n    table: str\nclass MetaConfig:\n    table = 'jobs'\nclass Job(models.Model):\n    id = fields.IntField(primary_key=True)\n    {metadata}\n");
+        write(dir.path(), "app/models.py", &source);
+        commit(dir.path());
+        git(dir.path(), &["branch", "-f", "origin/main", "HEAD"]);
+        write(
+            dir.path(),
+            Orm::Tortoise.migration(),
+            "async def upgrade(db):\n    return 'DROP TABLE jobs;'\n",
+        );
+        if staged {
+            git(dir.path(), &["add", "."]);
+        } else {
+            commit(dir.path());
+        }
+        let mode = if staged { "--diff-staged" } else { "--diff" };
+        let result = table_check(&dir, &[mode, "origin/main"], false);
+        assert!(result.to_string().contains("(Meta)"), "{result}");
+        assert!(
+            !result.to_string().contains("work limit exceeded"),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn audited_static_metadata_uses_complete_immutable_constructor_context() {
+    let metadata = "public_id: Mapped[str] = mapped_column(default=lambda: make_id())\n    def helper(self, value=initialize()):\n        pass\n    __labels__: ClassVar[dict[str, Field]] = {'title': Field('translated', description='Display text')}\n    __lookup__: ClassVar[str] = 'key'\n    __strict__: ClassVar[bool] = True\n    __bare__: ClassVar = 'literal'";
+    let dependency = "class ServiceError(Exception):\n    def __init__(self, message: str) -> None:\n        self.message = message\n";
+    for (staged, paths) in [
+        (false, "'app/models.py', 'app/records.py'"),
+        (true, "'app/models.py'"),
+    ] {
+        let context = RECORD_CONTEXT.replace(
+            "class Field(NamedTuple):",
+            "class OptionalValue(NamedTuple):\n    text: str\nclass Field(NamedTuple):",
+        );
+        let context = context.replace(
+            "    description: str",
+            "    description: str\n    value: OptionalValue | None = None",
+        );
+        let context = if staged {
+            format!("{context}\nclass Unrelated:\n    class Nested: pass\ndef duplicate(): pass\ndef duplicate(): pass\n")
+        } else {
+            context
+        };
+        let dir = metadata_retirement_scoped(&context, metadata, dependency, paths);
+        if staged {
+            git(dir.path(), &["add", "."]);
+        } else {
+            commit(dir.path());
+        }
+        table_check(
+            &dir,
+            &[
+                if staged { "--diff-staged" } else { "--diff" },
+                "origin/main",
+            ],
+            true,
+        );
+        // The selected dependency comes from the snapshot, never the dirty worktree.
+        write(
+            dir.path(),
+            "app/records.py",
+            "class Field(dynamic_base()):\n    pass\n",
+        );
+        table_check(
+            &dir,
+            &[
+                if staged { "--diff-staged" } else { "--diff" },
+                "origin/main",
+            ],
+            true,
+        );
+        git(dir.path(), &["add", "."]);
+        table_check(&dir, &["--diff-staged", "origin/main"], false);
+    }
+    for (name, context, value, base) in [
+        (
+            "audited-class-decorator",
+            format!("{RECORD_CONTEXT}\n@unknown_decorator\nclass Sibling: pass\n"),
+            metadata.into(),
+            dependency.to_owned(),
+        ),
+        (
+            "ancestor-class-decorator",
+            RECORD_CONTEXT.to_owned(),
+            metadata.into(),
+            format!("@unknown_decorator\n{dependency}"),
+        ),
+        (
+            "mapped-value",
+            RECORD_CONTEXT.to_owned(),
+            metadata.replace(
+                "Field('translated', description='Display text')",
+                "mapped_column()",
+            ),
+            dependency.to_owned(),
+        ),
+        (
+            "duplicate-dict-value",
+            RECORD_CONTEXT.to_owned(),
+            metadata.replace(
+                "{'title': Field",
+                "{'title': mapped_column(ForeignKey('jobs.id')), 'title': Field",
+            ),
+            dependency.to_owned(),
+        ),
+        (
+            "annotations-protocol",
+            RECORD_CONTEXT.to_owned(),
+            "__annotations__: ClassVar[dict[str, str]] = {'job_id': 'Mapped[JobRef]'}".into(),
+            dependency.to_owned(),
+        ),
+        (
+            "allow-unmapped-protocol",
+            RECORD_CONTEXT.to_owned(),
+            "__allow_unmapped__: ClassVar[str] = 'metadata'".into(),
+            dependency.to_owned(),
+        ),
+        (
+            "type-annotation-map-protocol",
+            RECORD_CONTEXT.to_owned(),
+            "type_annotation_map: ClassVar[dict[str, str]] = {}".into(),
+            dependency.to_owned(),
+        ),
+        (
+            "class-namespace-hook",
+            RECORD_CONTEXT.to_owned(),
+            "__module__: ClassVar[str] = 'replacement'".into(),
+            dependency.to_owned(),
+        ),
+        (
+            "dataclass-mapping-hook",
+            RECORD_CONTEXT.to_owned(),
+            "__sa_dataclass_metadata_key__: ClassVar[str] = 'metadata'".into(),
+            dependency.to_owned(),
+        ),
+        (
+            "mapping-hook",
+            RECORD_CONTEXT.to_owned(),
+            "__table_cls__: ClassVar[str] = 'key'".into(),
+            dependency.to_owned(),
+        ),
+        (
+            "mapper-lifecycle-hook",
+            RECORD_CONTEXT.to_owned(),
+            "def __declare_last__():\n        register_mapping()".into(),
+            dependency.to_owned(),
+        ),
+        (
+            "constructor-hook",
+            RECORD_CONTEXT.replace(
+                "class Field(NamedTuple):",
+                "class Field(NamedTuple):\n    def __new__(cls):\n        pass",
+            ),
+            metadata.into(),
+            dependency.to_owned(),
+        ),
+        (
+            "dataclass-factory",
+            RECORD_CONTEXT.replace(
+                "namespace: str = \"example\"",
+                "namespace: str = mapped_column()",
+            ),
+            metadata.into(),
+            dependency.to_owned(),
+        ),
+        (
+            "unresolved-base",
+            RECORD_CONTEXT.to_owned(),
+            metadata.into(),
+            dependency.replace("Exception", "Missing"),
+        ),
+        (
+            "rebound-base",
+            RECORD_CONTEXT.to_owned(),
+            metadata.into(),
+            format!("{dependency}\nServiceError = factory()\n"),
+        ),
+        (
+            "mutated-module",
+            format!("{RECORD_CONTEXT}\nField.text = mapped_column()\n"),
+            metadata.into(),
+            dependency.to_owned(),
+        ),
+    ] {
+        let dir = metadata_retirement(&context, &value, &base);
+        commit(dir.path());
+        let result = table_check(&dir, &["--diff", "origin/main"], false);
+        let reason = match name {
+            "audited-class-decorator" | "ancestor-class-decorator" => "unresolved class decorator",
+            "mapped-value" => "unsupported mapping hook",
+            "duplicate-dict-value" => "eager attribute expression",
+            "annotations-protocol" => "unsupported mapping hook",
+            "class-namespace-hook" => "unsupported mapping hook",
+            "dataclass-mapping-hook" => "unsupported mapping hook",
+            "mapping-hook" => "unsupported mapping hook",
+            "mapper-lifecycle-hook" => "unsupported class-body construct or decorator",
+            "constructor-hook" => "mapping annotation is not proven inert",
+            "dataclass-factory" => "eager class expression",
+            "unresolved-base" => "unresolved base",
+            "rebound-base" => "unresolved base",
+            "mutated-module" => "mapping annotation is not proven inert",
+            "allow-unmapped-protocol" => "unsupported mapping hook",
+            "type-annotation-map-protocol" => "unsupported mapping metadata",
+            _ => unreachable!(),
+        };
+        assert!(result.to_string().contains(reason), "{name}: {result}");
+        assert!(
+            !result.to_string().contains("work limit exceeded"),
+            "{name}: {result}"
+        );
+    }
+    for declaration in [
+        "public_id: Mapped[str] = mapped_column(default=lambda value: value)",
+        "public_id: Mapped[str] = mapped_column(default=lambda value=make_id(): value)",
+        "public_id: Mapped[str] = mapped_column(default=(lambda: make_id())())",
+        "public_id: Mapped[str] = mapped_column(default=make_id())",
+        "public_id: Mapped[str] = mapped_column(default=lambda: mapped_column())",
+        "public_id: Mapped[str] = mapped_column(default=lambda: ForeignKey('jobs.id'))",
+        "public_id: Mapped[str] = mapped_column(onupdate=lambda: make_id())",
+        "__labels__: ClassVar = lambda: make_id()",
+        "registry: ClassVar = lambda: make_id()",
+        "__table_args__: ClassVar = lambda: make_id()",
+        "public_id: Mapped[str] = mapped_column(default=app.records.DEFAULT)",
+    ] {
+        let dir = metadata_retirement(
+            &format!("{RECORD_CONTEXT}\nDEFAULT = lambda: make_id()\n"),
+            declaration,
+            dependency,
+        );
+        commit(dir.path());
+        let result = table_check(&dir, &["--diff", "origin/main"], false);
+        let reason = if declaration.contains("lambda: mapped_column")
+            || declaration.contains("lambda: ForeignKey")
+        {
+            "unsupported explicit ORM declaration"
+        } else {
+            "eager attribute expression is unresolved"
+        };
+        assert!(
+            result.to_string().contains(reason),
+            "{declaration}: {result}"
+        );
+        assert!(
+            !result.to_string().contains("work limit exceeded"),
+            "{declaration}: {result}"
+        );
+    }
+}
+
+#[test]
+fn audited_root_requires_its_parent_binding_even_without_local_imports() {
+    for (parent, allowed) in [
+        ("initialize()\ndef __getattr__(name):\n    globals()['catalog'] = construct()\n    return globals()['catalog']\n", true),
+        ("models, other = replacement, 0\n", false),
+        ("from provider import (__path__, other)\n", false),
+        ("__path__, other = replacement, 0\n", false),
+    ] {
+        let dir = repo(Orm::SqlAlchemy, &Orm::SqlAlchemy.model(""));
+        write(dir.path(), "pyproject.toml", &config(Orm::SqlAlchemy, "'app/models.py'"));
+        write(dir.path(), "app/__init__.py", parent);
+        commit(dir.path());
+        git(dir.path(), &["branch", "-f", "origin/main", "HEAD"]);
+        add_drop(&dir, Orm::SqlAlchemy, "retired");
+        commit(dir.path());
+        let result = check(&dir, &["--diff", "origin/main"], allowed);
+        if !allowed { assert!(result.to_string().contains("package"), "{result}"); }
+    }
+}
+
+#[test]
+fn audited_constructor_imports_still_require_exact_package_context() {
+    let context = "from typing import NamedTuple\nclass Field(NamedTuple):\n    text: str\n    description: str\n";
+    for (path, content) in [
+        ("app/__init__.py", "__package__ = 'plugins'\nfrom .records import Field\n"),
+        ("app/__init__.py", "(__package__ := 'plugins')\nfrom .records import Field\n"),
+        ("app/__init__.py", "original_import = __import__\ndef hook(name, globals, locals, fromlist, level):\n    register_mapping()\n    return original_import(name, globals, locals, fromlist, level)\n__builtins__ = {'__import__': hook}\nfrom .records import Field\n"),
+        ("app/__init__.py", "from re import compile as __getattr__\n"),
+        ("app/__init__.py", "import typing as __builtins__\n"),
+        ("app/records.py", "from typing import NamedTuple\nimport typing as __package__\nclass Field(NamedTuple):\n    text: str\n    description: str\n"),
+        ("re.py", "# repository-local module shadows stdlib\n"),
+        ("re.cpython-312-x86_64-linux-gnu.so", "opaque extension"),
+        ("tortoise.pyc", "opaque bytecode"),
+        ("app/records.cpython-312-x86_64-linux-gnu.so", "opaque extension"),
+        ("app/records/__init__.pyd", "opaque package extension"),
+        ("app/__init__.pyd", "opaque parent package extension"),
+        ("app/models.abi3.so", "opaque audited model extension"),
+        ("app/records.pyx", "compiled source"),
+        ("functools.py", "# repository-local module shadows trusted decorator\n"),
+        ("dataclasses/__init__.py", "# repository-local package shadows stdlib\n"),
+        ("app/records.py", "from typing import NamedTuple\nclass Field(NamedTuple):\n    text: str\n    description: str\ndef replacement(cls, text, description):\n    return tuple.__new__(cls, (text, description))\nf\"{setattr(Field, '__new__', replacement)}\"\n"),
+        ("app/records/__init__.py", "# module/package collision\n"),
+    ] {
+        let dir = metadata_retirement(
+            context,
+            "__labels__: ClassVar[dict[str, Field]] = {'title': Field('Title', 'Text')}",
+            "",
+        );
+        write(dir.path(), path, content);
+        commit(dir.path());
+        table_check(&dir, &["--diff", "origin/main"], false);
+    }
+}
+
+#[test]
+fn dependency_resolution_rejects_missing_ambiguous_or_dynamic_bindings() {
+    let metadata =
+        "__labels__: ClassVar[dict[str, Field]] = {'title': Field('translation', 'Title')}";
+    let dependency = "class ServiceError(Exception):\n    pass\n";
+    for (path, content) in [
+        ("app/faults/base.py", "# missing definition\n"),
+        ("app/faults/base/__init__.py", dependency),
+        ("app/faults.py", "from .faults.base import ServiceError\n"),
+        ("app/faults/__init__.py", "from .base import *\n"),
+        (
+            "app/faults/__init__.py",
+            "if condition:\n    from .base import ServiceError\n",
+        ),
+        (
+            "app/faults/base.py",
+            "Exception = factory()\nclass ServiceError(Exception):\n    pass\n",
+        ),
+        ("app/records.py", "from typing import NamedTuple\nclass Field(NamedTuple):\n    text: str\n    description: str\ndef replacement(cls, text, description):\n    return tuple.__new__(cls, (text, description))\nmarker: setattr(Field, '__new__', replacement) = 0\n"),
+        ("app/records.py", "from typing import NamedTuple\nclass Field(NamedTuple):\n    text: str\n    description: str\ndef replacement(cls, text, description):\n    return tuple.__new__(cls, (text, description))\nmarker: setattr(Field, '__new__', replacement)\n"),
+        ("app/records.py", "from typing import NamedTuple\ndef install_mapping():\n    return str\nclass Field(NamedTuple):\n    text: str\n    description: str\n    'doc', install_mapping()\n"),
+        ("app/records.py", "from typing import NamedTuple\nclass Field(NamedTuple):\n    text: str\n    description: str\ndef replacement(cls, *args):\n    return tuple.__new__(cls, args)\n'doc', setattr(Field, '__new__', replacement)\n"),
+        ("app/records.py", "from typing import NamedTuple\nclass Field(NamedTuple):\n    text: str\n    description: str\nclass Mutator:\n    Field.__new__ = factory()\n"),
+        ("app/records.py", "from typing import NamedTuple\nclass Field(NamedTuple):\n    text: str\n    description: str\ndef install(value=setattr(Field, '__new__', factory())):\n    pass\n"),
+        ("app/records.py", "from typing import NamedTuple\nif True:\n    NamedTuple = factory()\nclass Field(NamedTuple):\n    text: str\n    description: str\n"),
+        ("app/records.py", "from sqlalchemy.orm import DeclarativeBase, Mapped\nclass Field(DeclarativeBase):\n    __tablename__ = 'jobs'\n    id: Mapped[int]\n"),
+        (
+            "app/__init__.py",
+            "import sys\nsys.modules['app.faults'] = replacement\n",
+        ),
+
+    ] {
+        let paths = if path.starts_with("app/faults") { "'app/models.py', 'app/records.py'" } else { "'app/models.py'" };
+        let context = if paths == "'app/models.py'" {
+            format!("{RECORD_CONTEXT}\nclass Unrelated:\n    class Nested:\n        pass\ndef duplicate(): pass\ndef duplicate(): pass\n")
+        } else { RECORD_CONTEXT.to_owned() };
+        let dir = metadata_retirement_scoped(&context, metadata, dependency, paths);
+        write(dir.path(), path, content);
+        commit(dir.path());
+        let result = table_check(&dir, &["--diff", "origin/main"], false);
+        assert!(!result.to_string().contains("work limit exceeded"), "{path}: {result}");
+    }
+}
+
+const REFERENCE_MODELS: &str = r#"from typing import ClassVar
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, registry, relationship
+from sqlalchemy import DateTime, String
+from sqlalchemy.dialects.postgresql import JSONB
+from datetime import datetime
+PREFIX = "item"
+SUFFIX = 21
+LENGTH = len(PREFIX) + 1 + SUFFIX
+orm = registry(type_annotation_map={datetime: DateTime(timezone=True), dict: JSONB(none_as_null=True)})
+class Base(DeclarativeBase):
+    registry: ClassVar = orm
+class Label(Base):
+    __tablename__ = 'labels'
+    id: Mapped[int]
+    key: Mapped[str]
+class Link(Base):
+    __tablename__ = 'links'
+    id: Mapped[int]
+class Other(Base):
+    __tablename__ = 'other'
+    id: Mapped[int]
+    public_id: Mapped[str] = mapped_column(String(LENGTH))
+    data: Mapped[dict] = mapped_column(JSONB)
+    labels: Mapped[list[Label]] = relationship(secondary="links", lazy="raise", viewonly=True, order_by=Label.key)
+"#;
+
+#[test]
+fn table_references_resolve_registry_scalars_and_inferred_relationships() {
+    let dir = table_retirement(Orm::SqlAlchemy);
+    write(dir.path(), "app/models.py", REFERENCE_MODELS);
+    commit(dir.path());
+    table_check(&dir, &["--diff", "origin/main"], true);
+    write(
+        dir.path(),
+        "app/models.py",
+        &REFERENCE_MODELS
+            .replace(
+                "key: Mapped[str]",
+                "aliased_key: Mapped[str] = mapped_column('key')",
+            )
+            .replace("order_by=Label.key", "order_by=Label.aliased_key"),
+    );
+    commit(dir.path());
+    table_check(&dir, &["--diff", "origin/main"], true);
+    for (name, source, reason) in [
+        (
+            "target",
+            REFERENCE_MODELS.replace("'labels'", "'jobs'"),
+            "still",
+        ),
+        (
+            "secondary",
+            REFERENCE_MODELS
+                .replace("'links'", "'jobs'")
+                .replace("secondary=\"links\"", "secondary=\"jobs\""),
+            "still",
+        ),
+        (
+            "missing-secondary",
+            REFERENCE_MODELS.replace("secondary=\"links\"", "secondary=\"missing\""),
+            "relationship",
+        ),
+        (
+            "unknown-option",
+            REFERENCE_MODELS.replace("lazy=\"raise\"", "lazy=choose()"),
+            "eager attribute expression",
+        ),
+        (
+            "callback",
+            REFERENCE_MODELS.replace("order_by=Label.key", "order_by=lambda: Label.key"),
+            "eager attribute expression",
+        ),
+        (
+            "third-owner",
+            REFERENCE_MODELS.replace("order_by=Label.key", "order_by=Link.id"),
+            "relationship",
+        ),
+        (
+            "missing-column",
+            REFERENCE_MODELS.replace("order_by=Label.key", "order_by=Label.unknown"),
+            "relationship",
+        ),
+        (
+            "physical-name-collision",
+            REFERENCE_MODELS.replace("key: Mapped[str]", "aliased_key: Mapped[str] = mapped_column('key')\n    key: ClassVar[str] = 'plain metadata'"),
+            "relationship",
+        ),
+        (
+            "unknown-target",
+            REFERENCE_MODELS.replace("list[Label]", "list[Missing]"),
+            "relationship",
+        ),
+        (
+            "nested-registry-fk",
+            REFERENCE_MODELS
+                .replace("JSONB(none_as_null=True)", "ForeignKey('jobs.id')")
+                .replace("DateTime, String", "DateTime, String, ForeignKey"),
+            "unresolved",
+        ),
+        (
+            "registry-annotation",
+            REFERENCE_MODELS.replace("registry: ClassVar = orm", "registry: install_mapping() = orm"),
+            "unresolved",
+        ),
+        (
+            "dynamic-scalar",
+            REFERENCE_MODELS.replace("String(LENGTH)", "String(len(factory()))"),
+            "eager attribute expression",
+        ),
+    ] {
+        write(dir.path(), "app/models.py", &source);
+        commit(dir.path());
+        let result = table_check(&dir, &["--diff", "origin/main"], false);
+        assert!(result.to_string().contains(reason), "{name}: {result}");
+    }
+}
+
+#[test]
+fn unresolved_endpoint_relationship_does_not_block_unrelated_column_evidence() {
+    let source = REFERENCE_MODELS.replace(
+        "secondary=\"links\", lazy=\"raise\", viewonly=True, order_by=Label.key",
+        "'Label', back_populates='other'",
+    );
+    let dir = repo(Orm::SqlAlchemy, &source);
+    write(
+        dir.path(),
+        Orm::SqlAlchemy.migration(),
+        "from alembic import op\ndef upgrade():\n    op.drop_column('other', 'retired')\n",
+    );
+    commit(dir.path());
+    check(&dir, &["--diff", "origin/main"], true);
+}
+
+#[test]
+fn eager_class_annotations_cannot_authorize_column_retirement() {
+    let prefix = "from typing import ClassVar\nfrom sqlalchemy.orm import registry, relationship, column_property\nfrom sqlalchemy import Column, Integer, String\norm = registry()\ndef install_mapping():\n    return str\n";
+    let control = format!("{prefix}{}\nclass Other(Base):\n    __tablename__ = 'other'\n    __allow_unmapped__ = True\n    label: str = 'literal'\n    id: Mapped[int] = mapped_column(primary_key=True)\n", Orm::SqlAlchemy.model(""));
+    let dir = repo(Orm::SqlAlchemy, &control);
+    add_drop(&dir, Orm::SqlAlchemy, "retired");
+    commit(dir.path());
+    check(&dir, &["--diff", "origin/main"], true);
+    for (body, reason) in [
+        ("Alias = Job\n    Alias.__table__.name = 'retired'", "required class binding is mutated"),
+        ("table = Job.__table__\n    table.name = 'retired'", "required class binding is mutated"),
+        ("Job .__table__.name = 'retired'", "required class binding is mutated"),
+        ("(Job).__table__.name = 'retired'", "required class binding is mutated"),
+        ("(Job.__table__).name = 'retired'", "required class binding is mutated"),
+        ("(Job.__tablename__, other) = ('retired', 0)", "required class binding is mutated"),
+        ("globals ()['Job'].__table__.name = 'retired'", "dynamic module namespace"),
+        ("from builtins import setattr as set_attribute\n    set_attribute(Job.__table__, 'name', 'retired')", "unsupported explicit ORM declaration"),
+        ("setter = setattr\n    setter(Job.__table__, 'name', 'retired')", "explicit namespace mutation"),
+        ("from sqlalchemy import Table as HiddenTable\n    HiddenTable('jobs', metadata)", "unsupported explicit ORM declaration"),
+        ("orm.map_imperatively(Job, table)", "unsupported explicit ORM declaration"),
+    ] {
+        let source = format!("{control}\ndef helper():\n    {body}\n");
+        let dir = repo(Orm::SqlAlchemy, &source);
+        add_drop(&dir, Orm::SqlAlchemy, "retired");
+        commit(dir.path());
+        let result = check(&dir, &["--diff", "origin/main"], false);
+        assert!(result.to_string().contains(reason), "{result}");
+    }
+    let source = format!("{control}\nsetter = setattr\nclass Deferred(Base):\n    __tablename__ = 'deferred'\n    id: Mapped[int] = mapped_column(default=lambda: setter(Job.__table__, 'name', 'retired'))\n");
+    let dir = repo(Orm::SqlAlchemy, &source);
+    add_drop(&dir, Orm::SqlAlchemy, "retired");
+    commit(dir.path());
+    let result = check(&dir, &["--diff", "origin/main"], false);
+    assert!(
+        result
+            .to_string()
+            .contains("unsupported explicit ORM declaration"),
+        "{result}"
+    );
+    for owner in [
+        "class Other(Base):",
+        "class Other(Base):\n    __abstract__ = True",
+        "class Other:",
+    ] {
+        for declaration in [
+            "registry: ClassVar[install_mapping()] = orm",
+            "value: ClassVar[install_mapping()] = mapped_column()",
+            "__tablename__: ClassVar[install_mapping()] = 'other'",
+            "__allow_unmapped__ = True\n    value: install_mapping() = 0",
+            "registry: ClassVar = install_mapping()",
+            "value: ClassVar[int] = install_mapping()",
+            "value = install_mapping()",
+            "'doc', install_mapping()",
+            "__labels__: ClassVar[int] = install_mapping()",
+            "value: Mapped[int] = mapped_column(default=install_mapping())",
+            "value: Mapped[int] = mapped_column(String(install_mapping()))",
+            "value = mapped_column(CustomType)",
+            "__doc__ = install_mapping()",
+            "__table_args__ = {'comment': install_mapping()}",
+            "__table_args__ = (install_mapping(),)",
+            "__abstract__ = install_mapping()",
+            "value = relationship(install_mapping())",
+            "value = column_property(install_mapping())",
+            "value: Alias34 = 0",
+            "__allow_unmapped__ = True\n    value: \"install_mapping()\" = 0",
+            "value: Mapped[\"install_mapping()\"]",
+            "__allow_unmapped__ = True\n    value: Forward = 0",
+            "value: Mapped[Forward]",
+            "class Meta:\n        ordering = install_mapping()",
+            "class Meta:\n        ordering: install_mapping() = []",
+            "class Meta:\n        class Inner:\n            value = install_mapping()",
+        ] {
+            let aliases = if declaration.contains("Forward") {
+                String::from("Forward = \"install_mapping()\"\n")
+            } else if declaration.contains("Alias34") {
+                (1..=34).fold(String::from("Alias0 = int\n"), |mut source, n| {
+                    source.push_str(&format!("Alias{n} = Alias{}\n", n - 1));
+                    source
+                })
+            } else {
+                String::new()
+            };
+            let custom_type = if declaration == "value = mapped_column(CustomType)" {
+                "from sqlalchemy.types import TypeDecorator\nclass CustomType(TypeDecorator):\n    impl = Integer\n    def __init__(self):\n        install_mapping()\n        super().__init__()\n"
+            } else {
+                ""
+            };
+            let source = format!("{prefix}{aliases}{custom_type}{}\n{owner}\n    __tablename__ = 'other'\n    id: Mapped[int] = mapped_column(primary_key=True)\n    {declaration}\n", Orm::SqlAlchemy.model(""));
+            let dir = repo(Orm::SqlAlchemy, &source);
+            add_drop(&dir, Orm::SqlAlchemy, "retired");
+            commit(dir.path());
+            let result = check(&dir, &["--diff", "origin/main"], false);
+            assert!(
+                result
+                    .to_string()
+                    .contains(if declaration.starts_with("'doc',") {
+                        "unsupported class-body construct or decorator"
+                    } else if declaration.contains("Forward") {
+                        "executable forward annotation is unresolved"
+                    } else if declaration.contains("class Inner") {
+                        "dynamic nested Meta class"
+                    } else if declaration.contains("def ordering") {
+                        "executable function signature"
+                    } else {
+                        "eager class expression is unresolved"
+                    }),
+                "{owner} {declaration}: {result}"
+            );
+            assert!(
+                !result.to_string().contains("work limit exceeded"),
+                "{owner} {declaration}: {result}"
+            );
+        }
+    }
+    for binding in [
+        "__path__ = []",
+        "__path__: list = []",
+        "__getattr__ = str",
+        "__getattr__: object = str",
+    ] {
+        let source = format!("{binding}\n{}", Orm::SqlAlchemy.model(""));
+        let dir = repo(Orm::SqlAlchemy, &source);
+        add_drop(&dir, Orm::SqlAlchemy, "retired");
+        commit(dir.path());
+        let result = check(&dir, &["--diff", "origin/main"], false);
+        assert!(
+            result.to_string().contains("dynamic module namespace"),
+            "{binding}: {result}"
+        );
+    }
+    for base in [
+        "Base, install_mapping()",
+        "Base, metaclass=install_mapping()",
+        "Base, flag=install_mapping()",
+    ] {
+        let source = format!(
+            "{prefix}{}\nclass Other({base}):\n    __tablename__ = 'other'\n    id: Mapped[int]\n",
+            Orm::SqlAlchemy.model("")
+        );
+        let dir = repo(Orm::SqlAlchemy, &source);
+        add_drop(&dir, Orm::SqlAlchemy, "retired");
+        commit(dir.path());
+        let result = check(&dir, &["--diff", "origin/main"], false);
+        assert!(
+            result.to_string().contains("eager base expression"),
+            "{base}: {result}"
+        );
+        assert!(
+            !result.to_string().contains("work limit exceeded"),
+            "{base}: {result}"
+        );
+    }
+    for declaration in [
+        "ordering = install_mapping()",
+        "ordering: install_mapping() = []",
+    ] {
+        let source = format!("from tortoise import models, fields\ndef install_mapping():\n    return type('Hidden', (models.Model,), {{'retired': fields.IntField()}})\nclass Job(models.Model):\n    class Meta:\n        table = 'jobs'\nclass Abstract(models.Model):\n    class Meta:\n        abstract = True\n        {declaration}\n");
+        let dir = repo(Orm::Tortoise, &source);
+        add_drop(&dir, Orm::Tortoise, "retired");
+        commit(dir.path());
+        let result = check(&dir, &["--diff", "origin/main"], false);
+        assert!(
+            result.to_string().contains("eager Meta expression"),
+            "{result}"
+        );
     }
 }

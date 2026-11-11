@@ -1,12 +1,12 @@
 //! Historical ORM evidence for R005 and R019. Never imports or executes application code.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::ast::TableIdentity;
 use crate::config::{FileConfig, ModelSource};
 use crate::discovery::MigrationFramework;
 use crate::git::{DiffSource, GitRepo, GitSnapshot};
-use crate::models::{ModelFile, ModelIndex};
+use crate::models::{check_package, ModelFile, ModelIndex, TRUSTED_ROOTS};
 
 /// Evidence built once from immutable Git objects, using base-established scopes.
 pub struct ModelEvidence {
@@ -141,11 +141,41 @@ fn model_sources(
     Ok((scopes, witness))
 }
 
+fn opaque_context(module: &Path, opaque: &HashSet<PathBuf>) -> bool {
+    module
+        .ancestors()
+        .filter(|path| !path.as_os_str().is_empty())
+        .any(|path| opaque.contains(path) || opaque.contains(&path.join("__init__")))
+}
+
 fn build_index(
     repo: &GitRepo,
     snapshot: &GitSnapshot,
     scopes: &[ModelSource],
 ) -> Result<ModelIndex, String> {
+    let opaque: HashSet<_> = snapshot
+        .entries
+        .keys()
+        .filter_map(|path| {
+            let filename = path.file_name()?.to_str()?;
+            let (stem, suffix) = filename.split_once('.')?;
+            let extension = suffix.rsplit('.').next()?.to_ascii_lowercase();
+            (!stem.is_empty() && matches!(extension.as_str(), "so" | "pyd" | "pyc" | "pyx" | "pyw"))
+                .then(|| path.with_file_name(stem))
+        })
+        .collect();
+    for name in TRUSTED_ROOTS {
+        if [
+            PathBuf::from(format!("{name}.py")),
+            PathBuf::from(format!("{name}/__init__.py")),
+        ]
+        .iter()
+        .any(|path| snapshot.entries.contains_key(path))
+            || opaque_context(Path::new(name), &opaque)
+        {
+            return Err(format!("{name}: repository shadows a supported library"));
+        }
+    }
     let mut files = Vec::new();
     let mut seen = HashSet::new();
     let mut bytes = 0usize;
@@ -175,6 +205,12 @@ fn build_index(
                     continue;
                 }
                 found = true;
+                if opaque_context(&path.with_extension(""), &opaque) {
+                    return Err(format!(
+                        "{}: opaque model source context is unresolved",
+                        path.display()
+                    ));
+                }
                 if !seen.insert((scope.orm, path.clone())) {
                     continue;
                 }
@@ -203,5 +239,89 @@ fn build_index(
             }
         }
     }
-    Ok(ModelIndex::build(files))
+    let audited_paths: HashSet<_> = files.iter().map(|file| file.path.clone()).collect();
+    let mut dependency_modules = HashSet::new();
+    let mut checked_packages = HashSet::new();
+    let mut package_parses = HashMap::new();
+    let mut dependency = |symbol: &str| {
+        let Some((module, _)) = symbol.rsplit_once('.') else {
+            return Ok(None);
+        };
+        if module.split('.').any(|part| {
+            part.is_empty() || !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }) {
+            return Err("invalid dependency module path".into());
+        }
+        let path = PathBuf::from(module.replace('.', "/"));
+        if opaque_context(&path, &opaque) {
+            return Err(format!("{module}: opaque module dependency is unresolved"));
+        }
+        let candidates = [path.with_extension("py"), path.join("__init__.py")];
+        let found: Vec<_> = candidates
+            .iter()
+            .filter(|path| snapshot.entries.contains_key(*path))
+            .collect();
+        if found.is_empty() {
+            return Ok(None);
+        }
+        if found.len() != 1 {
+            return Err(format!("{module}: ambiguous module/package dependency"));
+        }
+        let mut read = |path: &Path| -> Result<ModelFile, String> {
+            let source = repo
+                .read_snapshot_file(snapshot, path)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("missing dependency context '{}'", path.display()))?;
+            if seen.insert((crate::config::ModelOrm::Sqlalchemy, path.to_path_buf())) {
+                bytes += source.len();
+                if seen.len() > 10_000 || bytes > 100 * 1024 * 1024 {
+                    return Err("model sources and dependencies exceed evidence limits".into());
+                }
+            }
+            Ok(ModelFile {
+                path: path.to_path_buf(),
+                orm: crate::config::ModelOrm::Sqlalchemy,
+                source,
+            })
+        };
+        let parts: Vec<_> = module.split('.').collect();
+        for level in 1..parts.len() {
+            if snapshot
+                .entries
+                .contains_key(&PathBuf::from(parts[..level].join("/")).with_extension("py"))
+            {
+                return Err(format!(
+                    "{module}: ambiguous parent module/package dependency"
+                ));
+            }
+            let parent = PathBuf::from(parts[..level].join("/")).join("__init__.py");
+            if checked_packages.insert((parent.clone(), parts[level].to_owned(), symbol.to_owned()))
+            {
+                let parsed = package_parses.entry(parent.clone()).or_insert_with(|| {
+                    crate::parser::ParsedMigration::parse(read(&parent)?.source)
+                        .map_err(|error| error.to_string())
+                });
+                check_package(
+                    &parent,
+                    parsed.as_ref().map_err(Clone::clone)?,
+                    parts[level],
+                    symbol,
+                )?;
+            }
+        }
+        if !dependency_modules.insert(module.to_owned()) || audited_paths.contains(found[0]) {
+            return Ok(None);
+        }
+        Ok(Some(read(found[0])?))
+    };
+    for file in &files {
+        let module = file
+            .path
+            .with_extension("")
+            .to_string_lossy()
+            .replace(['/', '\\'], ".");
+        let module = module.strip_suffix(".__init__").unwrap_or(&module);
+        dependency(&format!("{module}.__audited_root__"))?;
+    }
+    Ok(ModelIndex::build_with_dependencies(files, dependency))
 }

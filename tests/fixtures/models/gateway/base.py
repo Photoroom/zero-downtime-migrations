@@ -50,5 +50,3 @@ class SoftDeleteMixin:
     """Adds an opt-in timezone-aware deletion timestamp."""
 
     deleted_at: Mapped[datetime | None]
-
-
