@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.2 - 2026-11-11
+
+- Recognize literal boolean `eager_defaults` mapper metadata, trusted string-choice `Literal` annotations and nullable scalar relationship targets in audited SQLAlchemy declarations.
+- Avoid redundant relationship endpoint copies and nonmatching mapping resolution while preserving full audited-root validation and fixed proof limits; traverse audited roots in stable order.
+
 ## 0.10.1 - 2026-11-11
 
 - Update rustix to 1.1.6 for RUSTSEC-2026-0486.
